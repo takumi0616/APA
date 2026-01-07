@@ -1,0 +1,52 @@
+# タスク（プロンプト）を行う前に必ず以下の資料を読んでください
+
+この資料は環境がどう構築されたかを記しておりコマンド実行などの際は必ず参考にしてください
+@/git_installation_guide.md
+@/miniconda_installation_guide.md
+
+自分の大まかな目標ややっていることの概要については以下を確認してください
+@/APA\document\plan\claude_plan.md
+@/APA\document\plan\gpt_plan.md
+内容は参考程度にしてください
+
+タスクを行った際は、タスク成功後に、行ったことをマークダウン記法でまとめたものを@/APA\document\report の中にファイルを作成してください
+ファイル名のルール：番号_年月日_行ったことを日本語.md（例：1_20260106_環境構築）
+番号は@/APA\document\report の中を精査して確認してください
+これまでのreportも読み込んでからタスクを行ってください
+---
+# プロンプト
+
+次の作業として、test_recovery_paper.pyを作成してください
+要件としては、
+```
+A. OpenCV findHomography + warpPerspective（最有力・まずこれ）
+用途: QR四隅・マーカー角点・紙四隅などの対応点から ホモグラフィ（射影変換） を推定し、テンプレ座標へ warpPerspective。
+強み:
+実運用で枯れている（ドキュメントスキャン/AR/パノラマ等で定番）
+RANSAC/LMEDS等のロバスト推定が選べ、外れ値混入に耐性
+推定後に（手法により）LM（Levenberg–Marquardt）で再投影誤差を詰める説明があり、初期点→洗練の流れが作りやすい (docs.opencv.org)
+関連API:
+cv2.findHomography(src_pts, dst_pts, method=..., ransacReprojThreshold=...) (docs.opencv.org)
+cv2.warpPerspective(img, H, (W,H)) (docs.opencv.org)
+実装上のコツ:
+対応点が「QR四隅の4点だけ」なら getPerspectiveTransform でも良いですが、ノイズがあるなら追加特徴点を増やして findHomography + RANSAC/USAC の方が安定しやすいです。
+warpPerspective は 補間方式（INTER_LINEAR/NEAREST） と 境界処理 が画質に効きます (docs.opencv.org)
+B. OpenCV “USAC（新しめRANSAC群）”でホモグラフィを強化
+用途: 対応点に外れ値が混ざるとき、RANSACより強い/速い設定が欲しい場合。
+ポイント: OpenCVのUSACフレームワークには PROSAC / MAGSAC++ などが含まれ、スコアリングやサンプリングが改良されています (docs.opencv.org)
+補足: Pythonの cv2.findHomography() でもビルド/バージョンによってUSAC系フラグが使えることがあります（要バージョン確認） (forum.opencv.org)
+```
+この技術を使って、品質の悪い書類を修正する処理を行うプログラムを作成してほしいです
+まずは以下のプログラムを読み込んでください
+@/APA\test_capture_formA.py
+@/APA\test_capture_formB.py
+フォームAの様式を識別するプログラムとフォームBの様式を識別するプログラムです
+フォームAの正解（APA\image\A）フォームBの正解（APA\image\B）のデータを少し改悪（マーカーやQRは識別に必要なのであまり汚さないように、それ以外の場所で改善の余地が発生するような状態を悪くさせる処理を複数回行い同じ画像でいろんな改悪を行う）したもの
+上記のプログラムとデータを使って、改善を行うことが目的のプログラムを作成してほしいです
+とりあえず最初は、どんなプログラムを作ろうとしているかの詳細な設計書を日本語で作成してください
+その後その設計書を私が添削するので、私が許可を出したらファイルにプログラムを作る、という流れにしたいです
+その後はプログラムの実行が成功するまで試行錯誤という感じです
+
+上記の要件でテストプログラムファイルを作成
+成功するまで試行錯誤を行ってください
+日本語で解説
