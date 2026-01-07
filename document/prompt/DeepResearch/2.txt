@@ -1,0 +1,2977 @@
+現在以下のシステムを開発中です
+
+```
+# 改訂版 memo（整理・清書）
+
+目的：
+カメラ映像から紙フォームを検出し、フォーム種別（A/B/その他）を判定したうえで、テンプレートに対して自動補正しリアルタイム表示する。
+
+前提：
+・リアルタイム処理はCPU中心（軽量優先）
+
+--------------------------------------------
+1. 入力（リアルタイム）
+--------------------------------------------
+- カメラからフレームを連続取得
+- 事前にレンズ歪み補正（undistort）を適用（精度・見栄え向上）
+
+
+--------------------------------------------
+2. 検出フェーズ（軽量・頑健）
+--------------------------------------------
+(2-1) 紙検出（優先）
+- 輪郭検出・直線検出などで「紙らしい四角形」を推定
+- 紙候補を得る
+
+(2-2)  紙検出部分からQR / マーカー検出（A or B or etc...）
+- QRコードやマーカーを高速に探索
+- 検出を判定
+
+（理由）
+カメラ全画面からQRやマーカーを認識するのは非常に誤検出のリスクがある
+また、用紙のフォーム別検出に関する豊富なデータや先行研究モデルもないことから、背景込みから特定の模様や特徴を探すのは困難と判断
+しかし、紙の検出であれば先行研究モデルが存在している
+
+
+--------------------------------------------
+3. フォーム種別判定（A/B/その他：ここは追加可能なようにモジュール実装）
+--------------------------------------------
+- フォームA：マーカー（例：正方形マーカー）で識別
+- フォームB：QRコードで識別
+- その他：必要に応じた識別方法（ロゴ等）
+
+※基本方針：
+フォームの変更は絶対に不可
+「識別できた特徴点（QR四隅／マーカー角点など）を、整列用の対応点として使える形で保持する」
+
+
+--------------------------------------------
+4. 補正画像の生成
+--------------------------------------------
+- 1フレームの画像、それに対して
+  - 紙検出時の四角形ボックス
+  - モジュールの抽出された特徴点情報
+が得られるので...
+
+(4-1) 位置合わせ（Homography）
+- フレームで Homography を推定
+  - もしくは「追跡」で更新し、安定なワープを得る
+- テンプレ座標系へ warp（透視変換）した画像を蓄積する
+- 紙のたわみや角度的なずれをここで改善
+
+(4-2) 画像の品質改善
+- ブラー（ピンぼけ/手ブレ）改善
+- ノイズ除去
+- 文字化け改善（2値化等）
+- 影の改善（照明ムラ補正）
+- 汚れ・しみ補正
+etc...
+
+完璧にきれいにする
+
+
+--------------------------------------------
+5. 表示
+--------------------------------------------
+- 補正された画像を標準形式でリアルタイム表示
+- メタ情報も表示（フォームID、スコア、検出成功率、処理時間など）
+
+↓
+
+OCR作業へ（担当外）
+
+```
+
+テスト用にプログラムも作成しています
+
+C:\Users\takumi\develop\APA\test_docaligner_camera_v2.py
+```
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+DocAligner Real-time Document Detection v2
+==========================================
+
+改善版: 手による精度低下を軽減する機能を追加
+
+Features:
+1. 時間的平滑化（複数フレームの結果を平均化）
+2. モデル選択機能（軽量/高精度）
+3. 安定性フィルタ（異常値除去）
+4. ROI安定化
+
+Controls:
+- 'q' or ESC: 終了
+- 's': 画像保存
+- 'p': 透視変換プレビュー
+- 'm': モデル切り替え（heatmap/point）
+- '1': lcnet050 (Point, 最軽量)
+- '2': lcnet100 (Heatmap, バランス)
+- '3': fastvit_t8 (Heatmap, 軽量)
+- '4': fastvit_sa24 (Heatmap, 最高精度)
+
+Created: January 6, 2026
+"""
+
+import cv2
+import numpy as np
+import sys
+import os
+import warnings
+from datetime import datetime
+from collections import deque
+
+# Fix encoding for Windows
+sys.stdout.reconfigure(encoding='utf-8')
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
+
+# Import DocAligner
+from docaligner import DocAligner, ModelType
+import capybara as cb
+
+
+class PolygonSmoother:
+    """
+    時間的平滑化クラス
+    複数フレームの結果を平均化して安定性を向上
+    """
+    def __init__(self, buffer_size=3, outlier_threshold=100):
+        self.buffer = deque(maxlen=buffer_size)
+        self.outlier_threshold = outlier_threshold
+        self.last_valid_polygon = None
+        self.no_detect_count = 0
+        self.max_no_detect = 10  # この回数検出なしで前回結果をクリア
+    
+    def update(self, polygon, use_filter=True):
+        """新しいポリゴンを追加して平滑化"""
+        if polygon is None or len(polygon) < 4:
+            self.no_detect_count += 1
+            # 一定回数検出なしでリセット
+            if self.no_detect_count > self.max_no_detect:
+                self.last_valid_polygon = None
+                self.buffer.clear()
+            elif self.last_valid_polygon is not None:
+                return self.last_valid_polygon
+            return None
+        
+        self.no_detect_count = 0
+        
+        # フィルタが無効の場合は直接返す
+        if not use_filter:
+            self.last_valid_polygon = polygon
+            return polygon
+        
+        # 異常値チェック（閾値を大きくして手の動きに対応）
+        if self.last_valid_polygon is not None:
+            diff = np.abs(polygon - self.last_valid_polygon).max()
+            if diff > self.outlier_threshold:
+                # 大きな変化でも受け入れる（手の位置が変わった可能性）
+                self.buffer.clear()  # バッファをクリアして新しい位置に追従
+        
+        self.buffer.append(polygon.copy())
+        self.last_valid_polygon = polygon
+        
+        if len(self.buffer) < 2:
+            return polygon
+        
+        # 中央値を使用（外れ値に強い）
+        stacked = np.stack(list(self.buffer))
+        smoothed = np.median(stacked, axis=0)
+        
+        return smoothed
+    
+    def reset(self):
+        """バッファをリセット"""
+        self.buffer.clear()
+        self.last_valid_polygon = None
+        self.no_detect_count = 0
+
+
+def set_camera_resolution(cap, width, height, fps):
+    """カメラ解像度とFPSを設定"""
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS, fps)
+    
+    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    
+    return actual_width, actual_height, actual_fps
+
+
+def save_frame(frame, save_dir="docaligner_captures_v2"):
+    """フレームを保存"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    full_path = os.path.join(script_dir, save_dir)
+    if not os.path.exists(full_path):
+        os.makedirs(full_path)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"doc_{timestamp}.jpg"
+    filepath = os.path.join(full_path, filename)
+    
+    cv2.imwrite(filepath, frame)
+    return filepath
+
+
+def expand_polygon(polygon, margin=20):
+    """
+    ポリゴンを外側に拡大する
+    
+    Args:
+        polygon: 4点のポリゴン
+        margin: 拡大するピクセル数
+    
+    Returns:
+        拡大されたポリゴン
+    """
+    if polygon is None or len(polygon) < 4:
+        return polygon
+    
+    # 中心点を計算
+    center = polygon.mean(axis=0)
+    
+    # 各点を中心から外側に移動
+    expanded = []
+    for pt in polygon:
+        direction = pt - center
+        # 方向を正規化して拡大
+        length = np.linalg.norm(direction)
+        if length > 0:
+            unit_direction = direction / length
+            new_pt = pt + unit_direction * margin
+        else:
+            new_pt = pt
+        expanded.append(new_pt)
+    
+    return np.array(expanded)
+
+
+def draw_polygon(frame, polygon, color=(0, 255, 0), thickness=3, expand_margin=0):
+    """ポリゴンを描画"""
+    if polygon is None or len(polygon) < 4:
+        return frame
+    
+    # マージンが指定されている場合は拡大
+    if expand_margin > 0:
+        polygon = expand_polygon(polygon, expand_margin)
+    
+    result = frame.copy()
+    pts = polygon.astype(np.int32)
+    
+    # 半透明の塗りつぶし
+    overlay = frame.copy()
+    cv2.fillPoly(overlay, [pts], color)
+    cv2.addWeighted(overlay, 0.2, result, 0.8, 0, result)
+    
+    # アウトライン
+    cv2.polylines(result, [pts], True, color, thickness)
+    
+    # コーナーポイント
+    for i, pt in enumerate(pts):
+        cv2.circle(result, tuple(pt), 8, (0, 0, 255), -1)
+        cv2.circle(result, tuple(pt), 10, (255, 255, 255), 2)
+        labels = ['TL', 'TR', 'BR', 'BL']
+        cv2.putText(result, labels[i], (pt[0] + 15, pt[1] + 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    return result
+
+
+def draw_info_panel(frame, fps, doc_detected, model_name, smoothing_enabled):
+    """情報パネルを描画"""
+    result = frame.copy()
+    
+    # 背景パネル
+    cv2.rectangle(result, (5, 5), (400, 130), (0, 0, 0), -1)
+    cv2.rectangle(result, (5, 5), (400, 130), (0, 255, 0), 1)
+    
+    # FPS
+    cv2.putText(result, f"FPS: {fps:.1f}", (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+    
+    # 検出状態
+    status_color = (0, 255, 0) if doc_detected else (0, 0, 255)
+    status_text = "Document: DETECTED" if doc_detected else "Document: NOT FOUND"
+    cv2.putText(result, status_text, (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 1)
+    
+    # モデル情報
+    cv2.putText(result, f"Model: {model_name}", (10, 75),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    
+    # 平滑化状態
+    smooth_text = "Smoothing: ON" if smoothing_enabled else "Smoothing: OFF"
+    smooth_color = (0, 255, 0) if smoothing_enabled else (100, 100, 100)
+    cv2.putText(result, smooth_text, (10, 95),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, smooth_color, 1)
+    
+    # キー操作ガイド
+    cv2.putText(result, "Keys: q=Exit s=Save m=Model 1-4=Select", (10, 115),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+    
+    return result
+
+
+def get_perspective_transform(frame, polygon, output_size=(800, 600)):
+    """透視変換を適用"""
+    if polygon is None or len(polygon) < 4:
+        return None
+    
+    dst = np.array([
+        [0, 0],
+        [output_size[0] - 1, 0],
+        [output_size[0] - 1, output_size[1] - 1],
+        [0, output_size[1] - 1]
+    ], dtype="float32")
+    
+    M = cv2.getPerspectiveTransform(polygon.astype(np.float32), dst)
+    warped = cv2.warpPerspective(frame, M, output_size)
+    
+    return warped
+
+
+# 利用可能なモデル設定
+MODEL_CONFIGS = {
+    '1': {'type': ModelType.point, 'cfg': 'lcnet050', 'name': 'lcnet050 (Point, 最軽量)'},
+    '2': {'type': ModelType.heatmap, 'cfg': 'lcnet100', 'name': 'lcnet100 (Heatmap, バランス)'},
+    '3': {'type': ModelType.heatmap, 'cfg': 'fastvit_t8', 'name': 'fastvit_t8 (Heatmap, 軽量)'},
+    '4': {'type': ModelType.heatmap, 'cfg': 'fastvit_sa24', 'name': 'fastvit_sa24 (Heatmap, 最高精度)'},
+}
+
+
+def load_model(key='4'):
+    """モデルをロード"""
+    config = MODEL_CONFIGS.get(key, MODEL_CONFIGS['4'])
+    print(f"Loading model: {config['name']}...")
+    model = DocAligner(
+        model_type=config['type'],
+        model_cfg=config['cfg']
+    )
+    print(f"[OK] Model loaded: {config['name']}")
+    return model, config['name']
+
+
+def main():
+    """メイン関数: リアルタイム書類検出（改善版）"""
+    print()
+    print("=" * 60)
+    print("DocAligner Real-time Document Detection v2")
+    print("改善版: 時間的平滑化 + モデル選択")
+    print("=" * 60)
+    print()
+    print(f"OpenCV Version: {cv2.__version__}")
+    print()
+    
+    # 利用可能なモデル表示
+    print("利用可能なモデル:")
+    for key, config in MODEL_CONFIGS.items():
+        print(f"  [{key}] {config['name']}")
+    print()
+    
+    # デフォルトモデルをロード（最高精度）
+    current_model_key = '4'
+    model, model_name = load_model(current_model_key)
+    print()
+    
+    # カメラを開く
+    print("Opening camera...")
+    cap = cv2.VideoCapture(0)
+    
+    if not cap.isOpened():
+        print("Error: Could not open camera")
+        return 1
+    
+    width, height, fps = set_camera_resolution(cap, 1280, 720, 30)
+    print(f"[OK] Camera opened: {width}x{height} @ {fps:.1f}fps")
+    print()
+    
+    print("=" * 60)
+    print("操作方法:")
+    print("  'q' or ESC: 終了")
+    print("  's': 画像保存")
+    print("  'p': 透視変換プレビュー")
+    print("  't': 平滑化のON/OFF切り替え")
+    print("  '1'-'4': モデル切り替え")
+    print("  '+'/'-': ボックスマージン調整")
+    print("=" * 60)
+    print()
+    
+    # 状態変数
+    show_perspective = False
+    smoothing_enabled = True
+    smoother = PolygonSmoother(buffer_size=5, outlier_threshold=50)
+    box_margin = 30  # デフォルトマージン（ピクセル）
+    
+    prev_time = cv2.getTickCount()
+    fps_display = 0.0
+    frame_count = 0
+    
+    main_window = "DocAligner v2 - Document Detection"
+    perspective_window = "Perspective Correction"
+    
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Warning: Failed to get frame")
+                break
+            
+            # FPS計算
+            current_time = cv2.getTickCount()
+            time_diff = (current_time - prev_time) / cv2.getTickFrequency()
+            if time_diff >= 1.0:
+                fps_display = frame_count / time_diff
+                frame_count = 0
+                prev_time = current_time
+            frame_count += 1
+            
+            # パディング追加
+            padded_frame = cb.pad(frame, 100)
+            
+            # DocAlignerで検出
+            polygon = model(
+                img=padded_frame,
+                do_center_crop=False
+            )
+            
+            # パディング分を引く
+            if polygon is not None:
+                polygon = polygon - 100
+            
+            # 平滑化適用
+            if smoothing_enabled:
+                polygon = smoother.update(polygon)
+            
+            doc_detected = polygon is not None and len(polygon) >= 4
+            
+            # 結果を描画（マージン付き）
+            result = frame.copy()
+            if doc_detected:
+                result = draw_polygon(result, polygon, expand_margin=box_margin)
+            
+            result = draw_info_panel(result, fps_display, doc_detected, 
+                                     model_name, smoothing_enabled)
+            
+            # マージン表示
+            cv2.putText(result, f"Margin: {box_margin}px (+/-)", (width - 200, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            
+            cv2.imshow(main_window, result)
+            
+            # 透視変換ウィンドウ
+            if show_perspective and doc_detected:
+                warped = get_perspective_transform(frame, polygon)
+                if warped is not None:
+                    cv2.imshow(perspective_window, warped)
+            else:
+                try:
+                    cv2.destroyWindow(perspective_window)
+                except:
+                    pass
+            
+            # キー処理
+            key = cv2.waitKey(1) & 0xFF
+            
+            if key == ord('q') or key == 27:
+                print("\n終了します...")
+                break
+            elif key == ord('s'):
+                filepath = save_frame(result)
+                print(f"保存しました: {filepath}")
+                if doc_detected:
+                    warped = get_perspective_transform(frame, polygon)
+                    if warped is not None:
+                        warped_path = filepath.replace('.jpg', '_corrected.jpg')
+                        cv2.imwrite(warped_path, warped)
+                        print(f"補正画像を保存: {warped_path}")
+            elif key == ord('p'):
+                show_perspective = not show_perspective
+                print(f"透視変換プレビュー: {'ON' if show_perspective else 'OFF'}")
+            elif key == ord('t'):
+                smoothing_enabled = not smoothing_enabled
+                if not smoothing_enabled:
+                    smoother.reset()
+                print(f"平滑化: {'ON' if smoothing_enabled else 'OFF'}")
+            elif key == ord('+') or key == ord('='):
+                box_margin = min(100, box_margin + 10)
+                print(f"マージン: {box_margin}px")
+            elif key == ord('-') or key == ord('_'):
+                box_margin = max(0, box_margin - 10)
+                print(f"マージン: {box_margin}px")
+            elif chr(key) in MODEL_CONFIGS:
+                new_key = chr(key)
+                if new_key != current_model_key:
+                    current_model_key = new_key
+                    model, model_name = load_model(current_model_key)
+                    smoother.reset()
+    
+    except KeyboardInterrupt:
+        print("\n\nCtrl+Cで終了...")
+    
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+    
+    print()
+    print("=" * 60)
+    print("DocAligner Document Detection v2 Complete")
+    print("=" * 60)
+    
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
+
+
+C:\Users\takumi\develop\APA\test_capture_formA.py
+```
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+フォームA画像の3点マーク検出テストプログラム（改善版）
+
+目的:
+- image/Aディレクトリの画像から3点マーク（黒い四角形）を検出
+- 上左、上右、下左の3箇所にあるマーカーを検出
+- 検出部分にボックスを描画
+
+改善点:
+- 複数の二値化方法を試行（適応的閾値、Otsu法など）
+- 閾値を緩和して色違いの画像にも対応
+- 描画線を太くする
+"""
+
+import cv2
+import numpy as np
+import os
+import sys
+import time
+
+# Windows環境でUTF-8を強制
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+if sys.stdout:
+    sys.stdout.reconfigure(encoding='utf-8')
+
+
+def detect_filled_square_markers(image, target_corners=['top_left', 'top_right', 'bottom_left']):
+    """
+    塗りつぶしの四角マーカー（3点マーク）を検出する（改善版）
+    
+    Args:
+        image: OpenCV画像（BGR形式）
+        target_corners: 検出対象のコーナー
+    
+    Returns:
+        list: 検出された四角マーカーの情報リスト
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    image_height, image_width = image.shape[:2]
+    
+    markers = []
+    
+    # 複数の二値化方法を試行
+    binary_images = []
+    
+    # 方法1: 固定閾値（低め - 薄いマーカー用）
+    _, binary1 = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY_INV)
+    binary_images.append(('固定閾値50', binary1))
+    
+    # 方法2: 固定閾値（中程度）
+    _, binary2 = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
+    binary_images.append(('固定閾値80', binary2))
+    
+    # 方法3: 固定閾値（高め）
+    _, binary3 = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY_INV)
+    binary_images.append(('固定閾値120', binary3))
+    
+    # 方法4: Otsu法
+    _, binary4 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    binary_images.append(('Otsu', binary4))
+    
+    # 方法5: 適応的閾値（ブロックサイズ小）
+    binary5 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                     cv2.THRESH_BINARY_INV, 21, 8)
+    binary_images.append(('適応的21', binary5))
+    
+    # 方法6: 適応的閾値（ブロックサイズ大）
+    binary6 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                     cv2.THRESH_BINARY_INV, 51, 10)
+    binary_images.append(('適応的51', binary6))
+    
+    # 画像の4隅の領域を定義（画像端から15%の範囲）
+    corner_margin_x = int(image_width * 0.15)
+    corner_margin_y = int(image_height * 0.15)
+    
+    corners = {
+        'top_left': (0, 0, corner_margin_x, corner_margin_y),
+        'top_right': (image_width - corner_margin_x, 0, image_width, corner_margin_y),
+        'bottom_left': (0, image_height - corner_margin_y, corner_margin_x, image_height),
+        'bottom_right': (image_width - corner_margin_x, image_height - corner_margin_y, image_width, image_height)
+    }
+    
+    # マーカーサイズの範囲（画像サイズに基づく）
+    min_size = min(image_width, image_height) * 0.005
+    max_size = min(image_width, image_height) * 0.08
+    min_area = min_size ** 2
+    max_area = max_size ** 2
+    
+    found_corners = {}  # コーナーごとに最良のマーカーを保持
+    
+    for method_name, binary in binary_images:
+        # モルフォロジー演算
+        kernel = np.ones((3, 3), np.uint8)
+        binary_clean = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        binary_clean = cv2.morphologyEx(binary_clean, cv2.MORPH_OPEN, kernel)
+        
+        contours, _ = cv2.findContours(binary_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            area = w * h
+            contour_area = cv2.contourArea(contour)
+            
+            if min_area < contour_area < max_area:
+                aspect_ratio = float(w) / h if h > 0 else 0
+                # アスペクト比を緩和（0.4〜2.5）
+                if 0.4 < aspect_ratio < 2.5:
+                    cx = x + w // 2
+                    cy = y + h // 2
+                    
+                    corner_name = None
+                    for name, (x1, y1, x2, y2) in corners.items():
+                        if x1 <= cx <= x2 and y1 <= cy <= y2:
+                            corner_name = name
+                            break
+                    
+                    if corner_name in target_corners:
+                        fill_ratio = contour_area / area if area > 0 else 0
+                        
+                        # 塗りつぶし率を緩和（0.4以上）
+                        if fill_ratio > 0.4:
+                            mask = np.zeros(gray.shape, dtype=np.uint8)
+                            cv2.drawContours(mask, [contour], 0, 255, -1)
+                            mean_val = cv2.mean(gray, mask=mask)[0]
+                            
+                            # 輝度閾値を緩和（180未満）
+                            if mean_val < 180:
+                                epsilon = 0.05 * cv2.arcLength(contour, True)
+                                approx = cv2.approxPolyDP(contour, epsilon, True)
+                                
+                                # スコア計算
+                                aspect_score = 1.0 - abs(aspect_ratio - 1.0) * 0.5
+                                fill_score = fill_ratio
+                                intensity_score = (180 - mean_val) / 180.0
+                                score = aspect_score * 0.25 + fill_score * 0.35 + intensity_score * 0.4
+                                
+                                marker_info = {
+                                    'contour': contour,
+                                    'approx': approx,
+                                    'area': contour_area,
+                                    'center': (cx, cy),
+                                    'bbox': (x, y, w, h),
+                                    'corner': corner_name,
+                                    'aspect_ratio': aspect_ratio,
+                                    'fill_ratio': fill_ratio,
+                                    'mean_intensity': mean_val,
+                                    'vertices': len(approx),
+                                    'score': score,
+                                    'method': method_name
+                                }
+                                
+                                # 既存のマーカーよりスコアが高ければ更新
+                                if corner_name not in found_corners or score > found_corners[corner_name]['score']:
+                                    found_corners[corner_name] = marker_info
+    
+    # 見つかったマーカーをリストに変換
+    markers = list(found_corners.values())
+    return markers
+
+
+def draw_detections(image, markers):
+    """
+    検出結果を画像に描画する（線を太くする）
+    """
+    result = image.copy()
+    
+    height, width = image.shape[:2]
+    scale = min(width, height) / 1000.0
+    font_scale = max(0.8, scale * 1.0)
+    # 線の太さを大幅に増加
+    thickness = max(8, int(scale * 10))
+    font_thickness = max(3, int(scale * 4))
+    
+    # マーカーの描画（赤色、太い線）
+    for i, marker in enumerate(markers):
+        x, y, w, h = marker['bbox']
+        cv2.rectangle(result, (x, y), (x + w, y + h), (0, 0, 255), thickness)
+        
+        corner = marker['corner'] if marker['corner'] else 'unknown'
+        label = f"M{i+1}:{corner}"
+        label_y = max(y - 20, 50)
+        cv2.putText(result, label, (x, label_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), font_thickness)
+    
+    return result
+
+
+def process_image(image_path, output_dir=None):
+    """
+    画像を処理してマーカーを検出する
+    """
+    start_time = time.time()
+    
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"  [エラー] 画像を読み込めませんでした: {image_path}")
+        return None
+    
+    height, width = image.shape[:2]
+    
+    # 3点マーカー検出（上左、上右、下左）
+    expected_corners = ['top_left', 'top_right', 'bottom_left']
+    markers = detect_filled_square_markers(image, expected_corners)
+    
+    process_time = time.time() - start_time
+    
+    result_image = draw_detections(image, markers)
+    
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        filename = os.path.basename(image_path)
+        output_path = os.path.join(output_dir, f"detected_{filename}")
+        cv2.imwrite(output_path, result_image)
+    
+    return {
+        'image_path': image_path,
+        'size': (width, height),
+        'markers': markers,
+        'process_time': process_time,
+        'result_image': result_image
+    }
+
+
+def main():
+    """メイン関数"""
+    print("="*70)
+    print("フォームA画像 - 3点マーク検出テスト（改善版）")
+    print("="*70)
+    
+    # image/Aディレクトリのみをテスト
+    base_dir = os.path.dirname(__file__)
+    image_dir = os.path.join(base_dir, "image", "A")
+    output_dir = os.path.join(base_dir, "output", "formA_test")
+    
+    # 画像ファイルを取得
+    all_files = []
+    for i in range(1, 7):
+        image_path = os.path.join(image_dir, f"{i}.jpg")
+        if os.path.exists(image_path):
+            all_files.append(image_path)
+    
+    if not all_files:
+        print(f"\n[エラー] 画像が見つかりません: {image_dir}")
+        return
+    
+    print(f"\n検出対象: image/A ディレクトリ（3点マーク検出）")
+    print(f"画像数: {len(all_files)}枚")
+    print("-"*70)
+    
+    results = []
+    total_start = time.time()
+    
+    for image_path in all_files:
+        filename = os.path.basename(image_path)
+        
+        result = process_image(image_path, output_dir)
+        if result:
+            results.append(result)
+            
+            marker_count = len(result['markers'])
+            status = "✓" if marker_count == 3 else f"✗({marker_count}/3)"
+            markers_str = ", ".join([m['corner'] for m in result['markers']])
+            
+            print(f"  {filename}: {result['size'][0]}x{result['size'][1]}, "
+                  f"マーカー: {status} [{markers_str}], "
+                  f"時間: {result['process_time']*1000:.0f}ms")
+    
+    total_time = time.time() - total_start
+    
+    # 結果サマリー
+    print("\n" + "="*70)
+    print("検出結果サマリー")
+    print("="*70)
+    
+    success_count = sum(1 for r in results if len(r['markers']) == 3)
+    avg_time = sum(r['process_time'] for r in results) / len(results) if results else 0
+    
+    print(f"\n成功: {success_count}/{len(results)} ({success_count/len(results)*100:.1f}%)")
+    print(f"平均処理時間: {avg_time*1000:.0f}ms/枚")
+    print(f"総処理時間: {total_time:.1f}秒")
+    print(f"出力先: {output_dir}")
+    
+    # 詳細表示
+    print("\n【詳細】")
+    for result in results:
+        filename = os.path.basename(result['image_path'])
+        marker_count = len(result['markers'])
+        status = "✓ 成功" if marker_count == 3 else f"✗ 失敗({marker_count}/3)"
+        markers_str = ", ".join([f"{m['corner']}({m['method']})" for m in result['markers']])
+        print(f"  {filename}: {status}")
+        if result['markers']:
+            print(f"    検出: [{markers_str}]")
+    
+    print("\n" + "="*70)
+    print("テスト完了")
+    print("="*70)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+
+C:\Users\takumi\develop\APA\test_capture_formB.py
+```
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+フォームB画像のQRコード検出テストプログラム（改善版）
+
+目的:
+- image/Bディレクトリの画像からQRコードを検出
+- 検出部分にボックスを描画
+
+改善点:
+- OpenCV QRCodeDetectorのマルチスケール検出
+- 様々な解像度で検出を試みる
+- 描画線を太くする
+"""
+
+import cv2
+import numpy as np
+import os
+import sys
+import time
+
+# Windows環境でUTF-8を強制
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+if sys.stdout:
+    sys.stdout.reconfigure(encoding='utf-8')
+
+
+def detect_qr_codes(image):
+    """
+    QRコードを検出する（OpenCVマルチスケール）
+    
+    Args:
+        image: OpenCV画像（BGR形式）
+    
+    Returns:
+        list: 検出されたQRコードの情報リスト
+    """
+    qr_results = []
+    qr_detector = cv2.QRCodeDetector()
+    height, width = image.shape[:2]
+    
+    # 複数のスケールで検出を試みる
+    scales = [0.5, 0.25, 1.0, 0.125, 0.75]
+    
+    for scale in scales:
+        if scale == 1.0:
+            test_image = image
+        else:
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            if new_width < 100 or new_height < 100:
+                continue
+            test_image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+        
+        try:
+            data, points, straight_qrcode = qr_detector.detectAndDecode(test_image)
+            if data and points is not None:
+                pts = points[0]
+                if scale != 1.0:
+                    pts = pts / scale
+                pts_int = pts.astype(np.int32)
+                qr_results.append({
+                    'data': data,
+                    'points': pts_int,
+                    'rect': cv2.boundingRect(pts_int),
+                    'scale': scale
+                })
+                break
+        except:
+            pass
+    
+    return qr_results
+
+
+def draw_detections(image, qr_codes):
+    """
+    検出結果を画像に描画する（線を太くする）
+    """
+    result = image.copy()
+    
+    height, width = image.shape[:2]
+    scale = min(width, height) / 1000.0
+    font_scale = max(1.0, scale * 1.2)
+    # 線の太さを大幅に増加
+    thickness = max(10, int(scale * 15))
+    font_thickness = max(4, int(scale * 5))
+    
+    # QRコードの描画（緑色、太い線）
+    for qr in qr_codes:
+        pts = qr['points'].reshape((-1, 1, 2))
+        cv2.polylines(result, [pts], True, (0, 255, 0), thickness)
+        
+        # バウンディングボックスも描画
+        x, y, w, h = qr['rect']
+        cv2.rectangle(result, (x, y), (x + w, y + h), (0, 255, 0), thickness)
+        
+        # ラベル
+        data_display = qr['data'][:25] + '...' if len(qr['data']) > 25 else qr['data']
+        label_y = max(y - 30, 80)
+        cv2.putText(result, f"QR: {data_display}", (x, label_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
+    
+    return result
+
+
+def process_image(image_path, output_dir=None):
+    """
+    画像を処理してQRコードを検出する
+    """
+    start_time = time.time()
+    
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"  [エラー] 画像を読み込めませんでした: {image_path}")
+        return None
+    
+    height, width = image.shape[:2]
+    
+    # QRコード検出
+    qr_codes = detect_qr_codes(image)
+    
+    process_time = time.time() - start_time
+    
+    result_image = draw_detections(image, qr_codes)
+    
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        filename = os.path.basename(image_path)
+        output_path = os.path.join(output_dir, f"detected_{filename}")
+        cv2.imwrite(output_path, result_image)
+    
+    return {
+        'image_path': image_path,
+        'size': (width, height),
+        'qr_codes': qr_codes,
+        'process_time': process_time,
+        'result_image': result_image
+    }
+
+
+def main():
+    """メイン関数"""
+    print("="*70)
+    print("フォームB画像 - QRコード検出テスト（改善版）")
+    print("="*70)
+    print("QR検出: OpenCV QRCodeDetector（マルチスケール）")
+    
+    # image/Bディレクトリのみをテスト
+    base_dir = os.path.dirname(__file__)
+    image_dir = os.path.join(base_dir, "image", "B")
+    output_dir = os.path.join(base_dir, "output", "formB_test")
+    
+    # 画像ファイルを取得
+    all_files = []
+    for i in range(1, 7):
+        image_path = os.path.join(image_dir, f"{i}.jpg")
+        if os.path.exists(image_path):
+            all_files.append(image_path)
+    
+    if not all_files:
+        print(f"\n[エラー] 画像が見つかりません: {image_dir}")
+        return
+    
+    print(f"\n検出対象: image/B ディレクトリ（QRコード検出）")
+    print(f"画像数: {len(all_files)}枚")
+    print("-"*70)
+    
+    results = []
+    total_start = time.time()
+    
+    for image_path in all_files:
+        filename = os.path.basename(image_path)
+        
+        result = process_image(image_path, output_dir)
+        if result:
+            results.append(result)
+            
+            qr_count = len(result['qr_codes'])
+            qr_status = "✓" if qr_count >= 1 else "✗"
+            qr_data = result['qr_codes'][0]['data'] if result['qr_codes'] else '-'
+            
+            print(f"  {filename}: {result['size'][0]}x{result['size'][1]}, "
+                  f"QR: {qr_status} ({qr_data}), "
+                  f"時間: {result['process_time']*1000:.0f}ms")
+    
+    total_time = time.time() - total_start
+    
+    # 結果サマリー
+    print("\n" + "="*70)
+    print("検出結果サマリー")
+    print("="*70)
+    
+    qr_success = sum(1 for r in results if len(r['qr_codes']) >= 1)
+    avg_time = sum(r['process_time'] for r in results) / len(results) if results else 0
+    
+    print(f"\nQR検出成功: {qr_success}/{len(results)} ({qr_success/len(results)*100:.1f}%)")
+    print(f"平均処理時間: {avg_time*1000:.0f}ms/枚")
+    print(f"総処理時間: {total_time:.1f}秒")
+    print(f"出力先: {output_dir}")
+    
+    # 詳細表示
+    print("\n【詳細】")
+    for result in results:
+        filename = os.path.basename(result['image_path'])
+        qr_count = len(result['qr_codes'])
+        
+        if qr_count >= 1:
+            status = "✓ 成功"
+        else:
+            status = "✗ 失敗"
+        
+        qr_data = result['qr_codes'][0]['data'] if result['qr_codes'] else 'なし'
+        
+        print(f"  {filename}: {status}")
+        print(f"    QR: {qr_data}")
+    
+    print("\n" + "="*70)
+    print("テスト完了")
+    print("="*70)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+今後、myplanの補正画像の生成のシステムづくりのフェーズになっていきます
+どのような技術、戦略、研究、ライブラリを使えばいいでしょうか？
+調査して日本語で分かりやすく考察してください
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+現在以下のシステムを開発中です
+
+```
+# 改訂版 memo（整理・清書）
+
+目的：
+カメラ映像から紙フォームを検出し、フォーム種別（A/B/その他）を判定したうえで、テンプレートに対して自動補正しリアルタイム表示する。
+
+前提：
+・リアルタイム処理はCPU中心（軽量優先）
+
+--------------------------------------------
+1. 入力（リアルタイム）
+--------------------------------------------
+- カメラからフレームを連続取得
+- 事前にレンズ歪み補正（undistort）を適用（精度・見栄え向上）
+
+
+--------------------------------------------
+2. 検出フェーズ（軽量・頑健）
+--------------------------------------------
+(2-1) 紙検出（優先）
+- 輪郭検出・直線検出などで「紙らしい四角形」を推定
+- 紙候補を得る
+
+(2-2)  紙検出部分からQR / マーカー検出（A or B or etc...）
+- QRコードやマーカーを高速に探索
+- 検出を判定
+
+（理由）
+カメラ全画面からQRやマーカーを認識するのは非常に誤検出のリスクがある
+また、用紙のフォーム別検出に関する豊富なデータや先行研究モデルもないことから、背景込みから特定の模様や特徴を探すのは困難と判断
+しかし、紙の検出であれば先行研究モデルが存在している
+
+
+--------------------------------------------
+3. フォーム種別判定（A/B/その他：ここは追加可能なようにモジュール実装）
+--------------------------------------------
+- フォームA：マーカー（例：正方形マーカー）で識別
+- フォームB：QRコードで識別
+- その他：必要に応じた識別方法（ロゴ等）
+
+※基本方針：
+フォームの変更は絶対に不可
+「識別できた特徴点（QR四隅／マーカー角点など）を、整列用の対応点として使える形で保持する」
+
+
+--------------------------------------------
+4. 補正画像の生成
+--------------------------------------------
+- 1フレームの画像、それに対して
+  - 紙検出時の四角形ボックス
+  - モジュールの抽出された特徴点情報
+が得られるので...
+
+(4-1) 位置合わせ（Homography）
+- フレームで Homography を推定
+  - もしくは「追跡」で更新し、安定なワープを得る
+- テンプレ座標系へ warp（透視変換）した画像を蓄積する
+- 紙のたわみや角度的なずれをここで改善
+
+(4-2) 画像の品質改善
+- ブラー（ピンぼけ/手ブレ）改善
+- ノイズ除去
+- 文字化け改善（2値化等）
+- 影の改善（照明ムラ補正）
+- 汚れ・しみ補正
+etc...
+
+完璧にきれいにする
+
+
+--------------------------------------------
+5. 表示
+--------------------------------------------
+- 補正された画像を標準形式でリアルタイム表示
+- メタ情報も表示（フォームID、スコア、検出成功率、処理時間など）
+
+↓
+
+OCR作業へ（担当外）
+
+```
+
+テスト用にプログラムも作成しています
+
+C:\Users\takumi\develop\APA\test_docaligner_camera_v2.py
+```
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+DocAligner Real-time Document Detection v2
+==========================================
+
+改善版: 手による精度低下を軽減する機能を追加
+
+Features:
+1. 時間的平滑化（複数フレームの結果を平均化）
+2. モデル選択機能（軽量/高精度）
+3. 安定性フィルタ（異常値除去）
+4. ROI安定化
+
+Controls:
+- 'q' or ESC: 終了
+- 's': 画像保存
+- 'p': 透視変換プレビュー
+- 'm': モデル切り替え（heatmap/point）
+- '1': lcnet050 (Point, 最軽量)
+- '2': lcnet100 (Heatmap, バランス)
+- '3': fastvit_t8 (Heatmap, 軽量)
+- '4': fastvit_sa24 (Heatmap, 最高精度)
+
+Created: January 6, 2026
+"""
+
+import cv2
+import numpy as np
+import sys
+import os
+import warnings
+from datetime import datetime
+from collections import deque
+
+# Fix encoding for Windows
+sys.stdout.reconfigure(encoding='utf-8')
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
+
+# Import DocAligner
+from docaligner import DocAligner, ModelType
+import capybara as cb
+
+
+class PolygonSmoother:
+    """
+    時間的平滑化クラス
+    複数フレームの結果を平均化して安定性を向上
+    """
+    def __init__(self, buffer_size=3, outlier_threshold=100):
+        self.buffer = deque(maxlen=buffer_size)
+        self.outlier_threshold = outlier_threshold
+        self.last_valid_polygon = None
+        self.no_detect_count = 0
+        self.max_no_detect = 10  # この回数検出なしで前回結果をクリア
+    
+    def update(self, polygon, use_filter=True):
+        """新しいポリゴンを追加して平滑化"""
+        if polygon is None or len(polygon) < 4:
+            self.no_detect_count += 1
+            # 一定回数検出なしでリセット
+            if self.no_detect_count > self.max_no_detect:
+                self.last_valid_polygon = None
+                self.buffer.clear()
+            elif self.last_valid_polygon is not None:
+                return self.last_valid_polygon
+            return None
+        
+        self.no_detect_count = 0
+        
+        # フィルタが無効の場合は直接返す
+        if not use_filter:
+            self.last_valid_polygon = polygon
+            return polygon
+        
+        # 異常値チェック（閾値を大きくして手の動きに対応）
+        if self.last_valid_polygon is not None:
+            diff = np.abs(polygon - self.last_valid_polygon).max()
+            if diff > self.outlier_threshold:
+                # 大きな変化でも受け入れる（手の位置が変わった可能性）
+                self.buffer.clear()  # バッファをクリアして新しい位置に追従
+        
+        self.buffer.append(polygon.copy())
+        self.last_valid_polygon = polygon
+        
+        if len(self.buffer) < 2:
+            return polygon
+        
+        # 中央値を使用（外れ値に強い）
+        stacked = np.stack(list(self.buffer))
+        smoothed = np.median(stacked, axis=0)
+        
+        return smoothed
+    
+    def reset(self):
+        """バッファをリセット"""
+        self.buffer.clear()
+        self.last_valid_polygon = None
+        self.no_detect_count = 0
+
+
+def set_camera_resolution(cap, width, height, fps):
+    """カメラ解像度とFPSを設定"""
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS, fps)
+    
+    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    
+    return actual_width, actual_height, actual_fps
+
+
+def save_frame(frame, save_dir="docaligner_captures_v2"):
+    """フレームを保存"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    full_path = os.path.join(script_dir, save_dir)
+    if not os.path.exists(full_path):
+        os.makedirs(full_path)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"doc_{timestamp}.jpg"
+    filepath = os.path.join(full_path, filename)
+    
+    cv2.imwrite(filepath, frame)
+    return filepath
+
+
+def expand_polygon(polygon, margin=20):
+    """
+    ポリゴンを外側に拡大する
+    
+    Args:
+        polygon: 4点のポリゴン
+        margin: 拡大するピクセル数
+    
+    Returns:
+        拡大されたポリゴン
+    """
+    if polygon is None or len(polygon) < 4:
+        return polygon
+    
+    # 中心点を計算
+    center = polygon.mean(axis=0)
+    
+    # 各点を中心から外側に移動
+    expanded = []
+    for pt in polygon:
+        direction = pt - center
+        # 方向を正規化して拡大
+        length = np.linalg.norm(direction)
+        if length > 0:
+            unit_direction = direction / length
+            new_pt = pt + unit_direction * margin
+        else:
+            new_pt = pt
+        expanded.append(new_pt)
+    
+    return np.array(expanded)
+
+
+def draw_polygon(frame, polygon, color=(0, 255, 0), thickness=3, expand_margin=0):
+    """ポリゴンを描画"""
+    if polygon is None or len(polygon) < 4:
+        return frame
+    
+    # マージンが指定されている場合は拡大
+    if expand_margin > 0:
+        polygon = expand_polygon(polygon, expand_margin)
+    
+    result = frame.copy()
+    pts = polygon.astype(np.int32)
+    
+    # 半透明の塗りつぶし
+    overlay = frame.copy()
+    cv2.fillPoly(overlay, [pts], color)
+    cv2.addWeighted(overlay, 0.2, result, 0.8, 0, result)
+    
+    # アウトライン
+    cv2.polylines(result, [pts], True, color, thickness)
+    
+    # コーナーポイント
+    for i, pt in enumerate(pts):
+        cv2.circle(result, tuple(pt), 8, (0, 0, 255), -1)
+        cv2.circle(result, tuple(pt), 10, (255, 255, 255), 2)
+        labels = ['TL', 'TR', 'BR', 'BL']
+        cv2.putText(result, labels[i], (pt[0] + 15, pt[1] + 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    return result
+
+
+def draw_info_panel(frame, fps, doc_detected, model_name, smoothing_enabled):
+    """情報パネルを描画"""
+    result = frame.copy()
+    
+    # 背景パネル
+    cv2.rectangle(result, (5, 5), (400, 130), (0, 0, 0), -1)
+    cv2.rectangle(result, (5, 5), (400, 130), (0, 255, 0), 1)
+    
+    # FPS
+    cv2.putText(result, f"FPS: {fps:.1f}", (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+    
+    # 検出状態
+    status_color = (0, 255, 0) if doc_detected else (0, 0, 255)
+    status_text = "Document: DETECTED" if doc_detected else "Document: NOT FOUND"
+    cv2.putText(result, status_text, (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 1)
+    
+    # モデル情報
+    cv2.putText(result, f"Model: {model_name}", (10, 75),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    
+    # 平滑化状態
+    smooth_text = "Smoothing: ON" if smoothing_enabled else "Smoothing: OFF"
+    smooth_color = (0, 255, 0) if smoothing_enabled else (100, 100, 100)
+    cv2.putText(result, smooth_text, (10, 95),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, smooth_color, 1)
+    
+    # キー操作ガイド
+    cv2.putText(result, "Keys: q=Exit s=Save m=Model 1-4=Select", (10, 115),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+    
+    return result
+
+
+def get_perspective_transform(frame, polygon, output_size=(800, 600)):
+    """透視変換を適用"""
+    if polygon is None or len(polygon) < 4:
+        return None
+    
+    dst = np.array([
+        [0, 0],
+        [output_size[0] - 1, 0],
+        [output_size[0] - 1, output_size[1] - 1],
+        [0, output_size[1] - 1]
+    ], dtype="float32")
+    
+    M = cv2.getPerspectiveTransform(polygon.astype(np.float32), dst)
+    warped = cv2.warpPerspective(frame, M, output_size)
+    
+    return warped
+
+
+# 利用可能なモデル設定
+MODEL_CONFIGS = {
+    '1': {'type': ModelType.point, 'cfg': 'lcnet050', 'name': 'lcnet050 (Point, 最軽量)'},
+    '2': {'type': ModelType.heatmap, 'cfg': 'lcnet100', 'name': 'lcnet100 (Heatmap, バランス)'},
+    '3': {'type': ModelType.heatmap, 'cfg': 'fastvit_t8', 'name': 'fastvit_t8 (Heatmap, 軽量)'},
+    '4': {'type': ModelType.heatmap, 'cfg': 'fastvit_sa24', 'name': 'fastvit_sa24 (Heatmap, 最高精度)'},
+}
+
+
+def load_model(key='4'):
+    """モデルをロード"""
+    config = MODEL_CONFIGS.get(key, MODEL_CONFIGS['4'])
+    print(f"Loading model: {config['name']}...")
+    model = DocAligner(
+        model_type=config['type'],
+        model_cfg=config['cfg']
+    )
+    print(f"[OK] Model loaded: {config['name']}")
+    return model, config['name']
+
+
+def main():
+    """メイン関数: リアルタイム書類検出（改善版）"""
+    print()
+    print("=" * 60)
+    print("DocAligner Real-time Document Detection v2")
+    print("改善版: 時間的平滑化 + モデル選択")
+    print("=" * 60)
+    print()
+    print(f"OpenCV Version: {cv2.__version__}")
+    print()
+    
+    # 利用可能なモデル表示
+    print("利用可能なモデル:")
+    for key, config in MODEL_CONFIGS.items():
+        print(f"  [{key}] {config['name']}")
+    print()
+    
+    # デフォルトモデルをロード（最高精度）
+    current_model_key = '4'
+    model, model_name = load_model(current_model_key)
+    print()
+    
+    # カメラを開く
+    print("Opening camera...")
+    cap = cv2.VideoCapture(0)
+    
+    if not cap.isOpened():
+        print("Error: Could not open camera")
+        return 1
+    
+    width, height, fps = set_camera_resolution(cap, 1280, 720, 30)
+    print(f"[OK] Camera opened: {width}x{height} @ {fps:.1f}fps")
+    print()
+    
+    print("=" * 60)
+    print("操作方法:")
+    print("  'q' or ESC: 終了")
+    print("  's': 画像保存")
+    print("  'p': 透視変換プレビュー")
+    print("  't': 平滑化のON/OFF切り替え")
+    print("  '1'-'4': モデル切り替え")
+    print("  '+'/'-': ボックスマージン調整")
+    print("=" * 60)
+    print()
+    
+    # 状態変数
+    show_perspective = False
+    smoothing_enabled = True
+    smoother = PolygonSmoother(buffer_size=5, outlier_threshold=50)
+    box_margin = 30  # デフォルトマージン（ピクセル）
+    
+    prev_time = cv2.getTickCount()
+    fps_display = 0.0
+    frame_count = 0
+    
+    main_window = "DocAligner v2 - Document Detection"
+    perspective_window = "Perspective Correction"
+    
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Warning: Failed to get frame")
+                break
+            
+            # FPS計算
+            current_time = cv2.getTickCount()
+            time_diff = (current_time - prev_time) / cv2.getTickFrequency()
+            if time_diff >= 1.0:
+                fps_display = frame_count / time_diff
+                frame_count = 0
+                prev_time = current_time
+            frame_count += 1
+            
+            # パディング追加
+            padded_frame = cb.pad(frame, 100)
+            
+            # DocAlignerで検出
+            polygon = model(
+                img=padded_frame,
+                do_center_crop=False
+            )
+            
+            # パディング分を引く
+            if polygon is not None:
+                polygon = polygon - 100
+            
+            # 平滑化適用
+            if smoothing_enabled:
+                polygon = smoother.update(polygon)
+            
+            doc_detected = polygon is not None and len(polygon) >= 4
+            
+            # 結果を描画（マージン付き）
+            result = frame.copy()
+            if doc_detected:
+                result = draw_polygon(result, polygon, expand_margin=box_margin)
+            
+            result = draw_info_panel(result, fps_display, doc_detected, 
+                                     model_name, smoothing_enabled)
+            
+            # マージン表示
+            cv2.putText(result, f"Margin: {box_margin}px (+/-)", (width - 200, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            
+            cv2.imshow(main_window, result)
+            
+            # 透視変換ウィンドウ
+            if show_perspective and doc_detected:
+                warped = get_perspective_transform(frame, polygon)
+                if warped is not None:
+                    cv2.imshow(perspective_window, warped)
+            else:
+                try:
+                    cv2.destroyWindow(perspective_window)
+                except:
+                    pass
+            
+            # キー処理
+            key = cv2.waitKey(1) & 0xFF
+            
+            if key == ord('q') or key == 27:
+                print("\n終了します...")
+                break
+            elif key == ord('s'):
+                filepath = save_frame(result)
+                print(f"保存しました: {filepath}")
+                if doc_detected:
+                    warped = get_perspective_transform(frame, polygon)
+                    if warped is not None:
+                        warped_path = filepath.replace('.jpg', '_corrected.jpg')
+                        cv2.imwrite(warped_path, warped)
+                        print(f"補正画像を保存: {warped_path}")
+            elif key == ord('p'):
+                show_perspective = not show_perspective
+                print(f"透視変換プレビュー: {'ON' if show_perspective else 'OFF'}")
+            elif key == ord('t'):
+                smoothing_enabled = not smoothing_enabled
+                if not smoothing_enabled:
+                    smoother.reset()
+                print(f"平滑化: {'ON' if smoothing_enabled else 'OFF'}")
+            elif key == ord('+') or key == ord('='):
+                box_margin = min(100, box_margin + 10)
+                print(f"マージン: {box_margin}px")
+            elif key == ord('-') or key == ord('_'):
+                box_margin = max(0, box_margin - 10)
+                print(f"マージン: {box_margin}px")
+            elif chr(key) in MODEL_CONFIGS:
+                new_key = chr(key)
+                if new_key != current_model_key:
+                    current_model_key = new_key
+                    model, model_name = load_model(current_model_key)
+                    smoother.reset()
+    
+    except KeyboardInterrupt:
+        print("\n\nCtrl+Cで終了...")
+    
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+    
+    print()
+    print("=" * 60)
+    print("DocAligner Document Detection v2 Complete")
+    print("=" * 60)
+    
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
+
+
+C:\Users\takumi\develop\APA\test_capture_formA.py
+```
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+フォームA画像の3点マーク検出テストプログラム（改善版）
+
+目的:
+- image/Aディレクトリの画像から3点マーク（黒い四角形）を検出
+- 上左、上右、下左の3箇所にあるマーカーを検出
+- 検出部分にボックスを描画
+
+改善点:
+- 複数の二値化方法を試行（適応的閾値、Otsu法など）
+- 閾値を緩和して色違いの画像にも対応
+- 描画線を太くする
+"""
+
+import cv2
+import numpy as np
+import os
+import sys
+import time
+
+# Windows環境でUTF-8を強制
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+if sys.stdout:
+    sys.stdout.reconfigure(encoding='utf-8')
+
+
+def detect_filled_square_markers(image, target_corners=['top_left', 'top_right', 'bottom_left']):
+    """
+    塗りつぶしの四角マーカー（3点マーク）を検出する（改善版）
+    
+    Args:
+        image: OpenCV画像（BGR形式）
+        target_corners: 検出対象のコーナー
+    
+    Returns:
+        list: 検出された四角マーカーの情報リスト
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    image_height, image_width = image.shape[:2]
+    
+    markers = []
+    
+    # 複数の二値化方法を試行
+    binary_images = []
+    
+    # 方法1: 固定閾値（低め - 薄いマーカー用）
+    _, binary1 = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY_INV)
+    binary_images.append(('固定閾値50', binary1))
+    
+    # 方法2: 固定閾値（中程度）
+    _, binary2 = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
+    binary_images.append(('固定閾値80', binary2))
+    
+    # 方法3: 固定閾値（高め）
+    _, binary3 = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY_INV)
+    binary_images.append(('固定閾値120', binary3))
+    
+    # 方法4: Otsu法
+    _, binary4 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    binary_images.append(('Otsu', binary4))
+    
+    # 方法5: 適応的閾値（ブロックサイズ小）
+    binary5 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                     cv2.THRESH_BINARY_INV, 21, 8)
+    binary_images.append(('適応的21', binary5))
+    
+    # 方法6: 適応的閾値（ブロックサイズ大）
+    binary6 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                     cv2.THRESH_BINARY_INV, 51, 10)
+    binary_images.append(('適応的51', binary6))
+    
+    # 画像の4隅の領域を定義（画像端から15%の範囲）
+    corner_margin_x = int(image_width * 0.15)
+    corner_margin_y = int(image_height * 0.15)
+    
+    corners = {
+        'top_left': (0, 0, corner_margin_x, corner_margin_y),
+        'top_right': (image_width - corner_margin_x, 0, image_width, corner_margin_y),
+        'bottom_left': (0, image_height - corner_margin_y, corner_margin_x, image_height),
+        'bottom_right': (image_width - corner_margin_x, image_height - corner_margin_y, image_width, image_height)
+    }
+    
+    # マーカーサイズの範囲（画像サイズに基づく）
+    min_size = min(image_width, image_height) * 0.005
+    max_size = min(image_width, image_height) * 0.08
+    min_area = min_size ** 2
+    max_area = max_size ** 2
+    
+    found_corners = {}  # コーナーごとに最良のマーカーを保持
+    
+    for method_name, binary in binary_images:
+        # モルフォロジー演算
+        kernel = np.ones((3, 3), np.uint8)
+        binary_clean = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        binary_clean = cv2.morphologyEx(binary_clean, cv2.MORPH_OPEN, kernel)
+        
+        contours, _ = cv2.findContours(binary_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            area = w * h
+            contour_area = cv2.contourArea(contour)
+            
+            if min_area < contour_area < max_area:
+                aspect_ratio = float(w) / h if h > 0 else 0
+                # アスペクト比を緩和（0.4〜2.5）
+                if 0.4 < aspect_ratio < 2.5:
+                    cx = x + w // 2
+                    cy = y + h // 2
+                    
+                    corner_name = None
+                    for name, (x1, y1, x2, y2) in corners.items():
+                        if x1 <= cx <= x2 and y1 <= cy <= y2:
+                            corner_name = name
+                            break
+                    
+                    if corner_name in target_corners:
+                        fill_ratio = contour_area / area if area > 0 else 0
+                        
+                        # 塗りつぶし率を緩和（0.4以上）
+                        if fill_ratio > 0.4:
+                            mask = np.zeros(gray.shape, dtype=np.uint8)
+                            cv2.drawContours(mask, [contour], 0, 255, -1)
+                            mean_val = cv2.mean(gray, mask=mask)[0]
+                            
+                            # 輝度閾値を緩和（180未満）
+                            if mean_val < 180:
+                                epsilon = 0.05 * cv2.arcLength(contour, True)
+                                approx = cv2.approxPolyDP(contour, epsilon, True)
+                                
+                                # スコア計算
+                                aspect_score = 1.0 - abs(aspect_ratio - 1.0) * 0.5
+                                fill_score = fill_ratio
+                                intensity_score = (180 - mean_val) / 180.0
+                                score = aspect_score * 0.25 + fill_score * 0.35 + intensity_score * 0.4
+                                
+                                marker_info = {
+                                    'contour': contour,
+                                    'approx': approx,
+                                    'area': contour_area,
+                                    'center': (cx, cy),
+                                    'bbox': (x, y, w, h),
+                                    'corner': corner_name,
+                                    'aspect_ratio': aspect_ratio,
+                                    'fill_ratio': fill_ratio,
+                                    'mean_intensity': mean_val,
+                                    'vertices': len(approx),
+                                    'score': score,
+                                    'method': method_name
+                                }
+                                
+                                # 既存のマーカーよりスコアが高ければ更新
+                                if corner_name not in found_corners or score > found_corners[corner_name]['score']:
+                                    found_corners[corner_name] = marker_info
+    
+    # 見つかったマーカーをリストに変換
+    markers = list(found_corners.values())
+    return markers
+
+
+def draw_detections(image, markers):
+    """
+    検出結果を画像に描画する（線を太くする）
+    """
+    result = image.copy()
+    
+    height, width = image.shape[:2]
+    scale = min(width, height) / 1000.0
+    font_scale = max(0.8, scale * 1.0)
+    # 線の太さを大幅に増加
+    thickness = max(8, int(scale * 10))
+    font_thickness = max(3, int(scale * 4))
+    
+    # マーカーの描画（赤色、太い線）
+    for i, marker in enumerate(markers):
+        x, y, w, h = marker['bbox']
+        cv2.rectangle(result, (x, y), (x + w, y + h), (0, 0, 255), thickness)
+        
+        corner = marker['corner'] if marker['corner'] else 'unknown'
+        label = f"M{i+1}:{corner}"
+        label_y = max(y - 20, 50)
+        cv2.putText(result, label, (x, label_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), font_thickness)
+    
+    return result
+
+
+def process_image(image_path, output_dir=None):
+    """
+    画像を処理してマーカーを検出する
+    """
+    start_time = time.time()
+    
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"  [エラー] 画像を読み込めませんでした: {image_path}")
+        return None
+    
+    height, width = image.shape[:2]
+    
+    # 3点マーカー検出（上左、上右、下左）
+    expected_corners = ['top_left', 'top_right', 'bottom_left']
+    markers = detect_filled_square_markers(image, expected_corners)
+    
+    process_time = time.time() - start_time
+    
+    result_image = draw_detections(image, markers)
+    
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        filename = os.path.basename(image_path)
+        output_path = os.path.join(output_dir, f"detected_{filename}")
+        cv2.imwrite(output_path, result_image)
+    
+    return {
+        'image_path': image_path,
+        'size': (width, height),
+        'markers': markers,
+        'process_time': process_time,
+        'result_image': result_image
+    }
+
+
+def main():
+    """メイン関数"""
+    print("="*70)
+    print("フォームA画像 - 3点マーク検出テスト（改善版）")
+    print("="*70)
+    
+    # image/Aディレクトリのみをテスト
+    base_dir = os.path.dirname(__file__)
+    image_dir = os.path.join(base_dir, "image", "A")
+    output_dir = os.path.join(base_dir, "output", "formA_test")
+    
+    # 画像ファイルを取得
+    all_files = []
+    for i in range(1, 7):
+        image_path = os.path.join(image_dir, f"{i}.jpg")
+        if os.path.exists(image_path):
+            all_files.append(image_path)
+    
+    if not all_files:
+        print(f"\n[エラー] 画像が見つかりません: {image_dir}")
+        return
+    
+    print(f"\n検出対象: image/A ディレクトリ（3点マーク検出）")
+    print(f"画像数: {len(all_files)}枚")
+    print("-"*70)
+    
+    results = []
+    total_start = time.time()
+    
+    for image_path in all_files:
+        filename = os.path.basename(image_path)
+        
+        result = process_image(image_path, output_dir)
+        if result:
+            results.append(result)
+            
+            marker_count = len(result['markers'])
+            status = "✓" if marker_count == 3 else f"✗({marker_count}/3)"
+            markers_str = ", ".join([m['corner'] for m in result['markers']])
+            
+            print(f"  {filename}: {result['size'][0]}x{result['size'][1]}, "
+                  f"マーカー: {status} [{markers_str}], "
+                  f"時間: {result['process_time']*1000:.0f}ms")
+    
+    total_time = time.time() - total_start
+    
+    # 結果サマリー
+    print("\n" + "="*70)
+    print("検出結果サマリー")
+    print("="*70)
+    
+    success_count = sum(1 for r in results if len(r['markers']) == 3)
+    avg_time = sum(r['process_time'] for r in results) / len(results) if results else 0
+    
+    print(f"\n成功: {success_count}/{len(results)} ({success_count/len(results)*100:.1f}%)")
+    print(f"平均処理時間: {avg_time*1000:.0f}ms/枚")
+    print(f"総処理時間: {total_time:.1f}秒")
+    print(f"出力先: {output_dir}")
+    
+    # 詳細表示
+    print("\n【詳細】")
+    for result in results:
+        filename = os.path.basename(result['image_path'])
+        marker_count = len(result['markers'])
+        status = "✓ 成功" if marker_count == 3 else f"✗ 失敗({marker_count}/3)"
+        markers_str = ", ".join([f"{m['corner']}({m['method']})" for m in result['markers']])
+        print(f"  {filename}: {status}")
+        if result['markers']:
+            print(f"    検出: [{markers_str}]")
+    
+    print("\n" + "="*70)
+    print("テスト完了")
+    print("="*70)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+
+C:\Users\takumi\develop\APA\test_capture_formB.py
+```
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+フォームB画像のQRコード検出テストプログラム（改善版）
+
+目的:
+- image/Bディレクトリの画像からQRコードを検出
+- 検出部分にボックスを描画
+
+改善点:
+- OpenCV QRCodeDetectorのマルチスケール検出
+- 様々な解像度で検出を試みる
+- 描画線を太くする
+"""
+
+import cv2
+import numpy as np
+import os
+import sys
+import time
+
+# Windows環境でUTF-8を強制
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+if sys.stdout:
+    sys.stdout.reconfigure(encoding='utf-8')
+
+
+def detect_qr_codes(image):
+    """
+    QRコードを検出する（OpenCVマルチスケール）
+    
+    Args:
+        image: OpenCV画像（BGR形式）
+    
+    Returns:
+        list: 検出されたQRコードの情報リスト
+    """
+    qr_results = []
+    qr_detector = cv2.QRCodeDetector()
+    height, width = image.shape[:2]
+    
+    # 複数のスケールで検出を試みる
+    scales = [0.5, 0.25, 1.0, 0.125, 0.75]
+    
+    for scale in scales:
+        if scale == 1.0:
+            test_image = image
+        else:
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            if new_width < 100 or new_height < 100:
+                continue
+            test_image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+        
+        try:
+            data, points, straight_qrcode = qr_detector.detectAndDecode(test_image)
+            if data and points is not None:
+                pts = points[0]
+                if scale != 1.0:
+                    pts = pts / scale
+                pts_int = pts.astype(np.int32)
+                qr_results.append({
+                    'data': data,
+                    'points': pts_int,
+                    'rect': cv2.boundingRect(pts_int),
+                    'scale': scale
+                })
+                break
+        except:
+            pass
+    
+    return qr_results
+
+
+def draw_detections(image, qr_codes):
+    """
+    検出結果を画像に描画する（線を太くする）
+    """
+    result = image.copy()
+    
+    height, width = image.shape[:2]
+    scale = min(width, height) / 1000.0
+    font_scale = max(1.0, scale * 1.2)
+    # 線の太さを大幅に増加
+    thickness = max(10, int(scale * 15))
+    font_thickness = max(4, int(scale * 5))
+    
+    # QRコードの描画（緑色、太い線）
+    for qr in qr_codes:
+        pts = qr['points'].reshape((-1, 1, 2))
+        cv2.polylines(result, [pts], True, (0, 255, 0), thickness)
+        
+        # バウンディングボックスも描画
+        x, y, w, h = qr['rect']
+        cv2.rectangle(result, (x, y), (x + w, y + h), (0, 255, 0), thickness)
+        
+        # ラベル
+        data_display = qr['data'][:25] + '...' if len(qr['data']) > 25 else qr['data']
+        label_y = max(y - 30, 80)
+        cv2.putText(result, f"QR: {data_display}", (x, label_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
+    
+    return result
+
+
+def process_image(image_path, output_dir=None):
+    """
+    画像を処理してQRコードを検出する
+    """
+    start_time = time.time()
+    
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"  [エラー] 画像を読み込めませんでした: {image_path}")
+        return None
+    
+    height, width = image.shape[:2]
+    
+    # QRコード検出
+    qr_codes = detect_qr_codes(image)
+    
+    process_time = time.time() - start_time
+    
+    result_image = draw_detections(image, qr_codes)
+    
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        filename = os.path.basename(image_path)
+        output_path = os.path.join(output_dir, f"detected_{filename}")
+        cv2.imwrite(output_path, result_image)
+    
+    return {
+        'image_path': image_path,
+        'size': (width, height),
+        'qr_codes': qr_codes,
+        'process_time': process_time,
+        'result_image': result_image
+    }
+
+
+def main():
+    """メイン関数"""
+    print("="*70)
+    print("フォームB画像 - QRコード検出テスト（改善版）")
+    print("="*70)
+    print("QR検出: OpenCV QRCodeDetector（マルチスケール）")
+    
+    # image/Bディレクトリのみをテスト
+    base_dir = os.path.dirname(__file__)
+    image_dir = os.path.join(base_dir, "image", "B")
+    output_dir = os.path.join(base_dir, "output", "formB_test")
+    
+    # 画像ファイルを取得
+    all_files = []
+    for i in range(1, 7):
+        image_path = os.path.join(image_dir, f"{i}.jpg")
+        if os.path.exists(image_path):
+            all_files.append(image_path)
+    
+    if not all_files:
+        print(f"\n[エラー] 画像が見つかりません: {image_dir}")
+        return
+    
+    print(f"\n検出対象: image/B ディレクトリ（QRコード検出）")
+    print(f"画像数: {len(all_files)}枚")
+    print("-"*70)
+    
+    results = []
+    total_start = time.time()
+    
+    for image_path in all_files:
+        filename = os.path.basename(image_path)
+        
+        result = process_image(image_path, output_dir)
+        if result:
+            results.append(result)
+            
+            qr_count = len(result['qr_codes'])
+            qr_status = "✓" if qr_count >= 1 else "✗"
+            qr_data = result['qr_codes'][0]['data'] if result['qr_codes'] else '-'
+            
+            print(f"  {filename}: {result['size'][0]}x{result['size'][1]}, "
+                  f"QR: {qr_status} ({qr_data}), "
+                  f"時間: {result['process_time']*1000:.0f}ms")
+    
+    total_time = time.time() - total_start
+    
+    # 結果サマリー
+    print("\n" + "="*70)
+    print("検出結果サマリー")
+    print("="*70)
+    
+    qr_success = sum(1 for r in results if len(r['qr_codes']) >= 1)
+    avg_time = sum(r['process_time'] for r in results) / len(results) if results else 0
+    
+    print(f"\nQR検出成功: {qr_success}/{len(results)} ({qr_success/len(results)*100:.1f}%)")
+    print(f"平均処理時間: {avg_time*1000:.0f}ms/枚")
+    print(f"総処理時間: {total_time:.1f}秒")
+    print(f"出力先: {output_dir}")
+    
+    # 詳細表示
+    print("\n【詳細】")
+    for result in results:
+        filename = os.path.basename(result['image_path'])
+        qr_count = len(result['qr_codes'])
+        
+        if qr_count >= 1:
+            status = "✓ 成功"
+        else:
+            status = "✗ 失敗"
+        
+        qr_data = result['qr_codes'][0]['data'] if result['qr_codes'] else 'なし'
+        
+        print(f"  {filename}: {status}")
+        print(f"    QR: {qr_data}")
+    
+    print("\n" + "="*70)
+    print("テスト完了")
+    print("="*70)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+C:\Users\takumi\develop\APA\test_recovery_paper.py
+```
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""test_recovery_paper.py
+
+目的
+----
+フォームA/Bのテンプレ（正解）画像を基準にして、
+
+- テンプレから自動生成した改悪画像（回転/射影/背景合成など）
+
+を XFeat matching で位置合わせ（Homography 推定）できるかを評価する。
+
+重要な方針（ユーザー指示）
+--------------------------
+- bad/ は無視（改悪はテンプレから生成）
+- 品質改善（2値化/影補正など）は実装しない
+- XFeat matching による Homography 性能を見たい
+
+使い方（例）
+------------
+静止画像（テンプレ→改悪生成→評価）:
+
+  python APA/test_recovery_paper.py --mode images --form A
+  python APA/test_recovery_paper.py --mode images --form B
+
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import time
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+import cv2
+import numpy as np
+
+# XFeat deps
+import torch
+
+
+# ------------------------------------------------------------
+# Windows environment: keep stdout UTF-8 friendly
+# ------------------------------------------------------------
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+
+# ------------------------------------------------------------
+# Utilities
+# ------------------------------------------------------------
+
+
+def ensure_portable_git_on_path() -> None:
+    """torch.hub may try to call git; this PC uses portable Git not on PATH."""
+
+    portable_git_bin = r"C:\Users\takumi\develop\git\bin"
+    if os.path.exists(portable_git_bin):
+        os.environ["PATH"] = portable_git_bin + os.pathsep + os.environ.get("PATH", "")
+
+
+def now_run_id() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def mkdir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def to_uint8(img: np.ndarray) -> np.ndarray:
+    if img.dtype == np.uint8:
+        return img
+    img = np.clip(img, 0, 255)
+    return img.astype(np.uint8)
+
+
+def order_quad_tl_tr_br_bl(pts: np.ndarray) -> np.ndarray:
+    """Order 4 points to TL/TR/BR/BL."""
+
+    pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1).reshape(-1)
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    tr = pts[np.argmin(diff)]
+    bl = pts[np.argmax(diff)]
+    return np.stack([tl, tr, br, bl], axis=0)
+
+
+# ------------------------------------------------------------
+# Synthetic degradation generation
+# ------------------------------------------------------------
+
+
+def random_background(h: int, w: int, rng: random.Random) -> np.ndarray:
+    """Generate a simple random background (noise + gradients)."""
+
+    bg = np.zeros((h, w, 3), dtype=np.uint8)
+
+    # base color
+    base = np.array([rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255)], dtype=np.uint8)
+    bg[:, :] = base
+
+    # gradient overlay
+    gx = np.linspace(0, 1, w, dtype=np.float32)
+    gy = np.linspace(0, 1, h, dtype=np.float32)
+    g = (np.outer(gy, gx) * 255.0).astype(np.float32)
+    g3 = np.stack([g, g, g], axis=-1)
+    bg = to_uint8(0.6 * bg.astype(np.float32) + 0.4 * g3)
+
+    # noise (milder)
+    n = np.zeros((h, w, 3), dtype=np.float32)
+    n[:, :, 0] = np.random.normal(0, 8, size=(h, w))
+    n[:, :, 1] = np.random.normal(0, 8, size=(h, w))
+    n[:, :, 2] = np.random.normal(0, 8, size=(h, w))
+    bg = to_uint8(bg.astype(np.float32) + n)
+
+    # random lines (milder)
+    for _ in range(rng.randint(3, 10)):
+        x1, y1 = rng.randint(0, w - 1), rng.randint(0, h - 1)
+        x2, y2 = rng.randint(0, w - 1), rng.randint(0, h - 1)
+        color = (rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255))
+        cv2.line(bg, (x1, y1), (x2, y2), color, rng.randint(1, 2), lineType=cv2.LINE_AA)
+
+    return bg
+
+
+def warp_template_to_random_view(
+    template_bgr: np.ndarray,
+    out_size: tuple[int, int],
+    rng: random.Random,
+    max_rotation_deg: float = 12.0,
+    min_abs_rotation_deg: float = 0.0,
+    perspective_jitter: float = 0.08,
+    min_visible_area_ratio: float = 0.25,
+    max_attempts: int = 50,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Create a degraded image by warping template into a random quadrilateral on a random background.
+
+    Returns:
+        degraded_bgr, H_ref_to_deg
+    """
+
+    h, w = template_bgr.shape[:2]
+    out_w, out_h = out_size
+
+    # IMPORTANT:
+    # 以前は、回転後に頂点を単純クリップしていたため、
+    #   - 紙が画面外に逃げる
+    #   - 紙が極端に小さくなる
+    #   - マスクがほぼ0（紙が写っていない）
+    # のケースが出ていた。
+    #
+    # ここでは「紙が必ず画面内に十分写る」まで再生成する。
+
+    margin = int(min(out_w, out_h) * 0.08)
+    base_w_min = int(out_w * 0.70)
+    base_w_max = int(out_w * 0.92)
+    min_visible_area_px = int(out_w * out_h * float(min_visible_area_ratio))
+
+    dst_quad = None
+    base_w = 0
+    base_h = 0
+    angle = 0.0
+    for _attempt in range(max_attempts):
+        # destination quad center
+        cx = rng.randint(margin, out_w - margin)
+        cy = rng.randint(margin, out_h - margin)
+
+        # Make the paper occupy larger area so that it keeps enough resolution.
+        base_w = rng.randint(base_w_min, base_w_max)
+        base_h = int(base_w * (h / w))
+        base_h = max(120, min(base_h, int(out_h * 0.85)))
+
+        # start from axis-aligned rectangle
+        x1, y1 = cx - base_w // 2, cy - base_h // 2
+        x2, y2 = cx + base_w // 2, cy + base_h // 2
+        rect = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+
+        # rotation
+        if max_rotation_deg >= 180:
+            for _ in range(100):
+                angle = rng.uniform(0.0, 360.0)
+                dist0 = min(angle, 360.0 - angle)
+                if dist0 >= float(min_abs_rotation_deg):
+                    break
+            else:
+                angle = rng.uniform(0.0, 360.0)
+        else:
+            angle = rng.uniform(-max_rotation_deg, max_rotation_deg)
+
+        M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+        rect_rot = cv2.transform(rect.reshape(-1, 1, 2), M).reshape(4, 2)
+
+        # perspective jitter
+        jitter = perspective_jitter * min(base_w, base_h)
+        rect_rot += np.array(
+            [[rng.uniform(-jitter, jitter), rng.uniform(-jitter, jitter)] for _ in range(4)],
+            dtype=np.float32,
+        )
+
+        # accept only if all corners are inside the image with margin
+        if (
+            (rect_rot[:, 0].min() >= 0)
+            and (rect_rot[:, 1].min() >= 0)
+            and (rect_rot[:, 0].max() <= out_w - 1)
+            and (rect_rot[:, 1].max() <= out_h - 1)
+        ):
+            cand = order_quad_tl_tr_br_bl(rect_rot)
+            # quick visible-area check by warping a ones mask
+            tmp_mask = cv2.warpPerspective(
+                np.ones((h, w), dtype=np.uint8) * 255,
+                cv2.getPerspectiveTransform(
+                    np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32),
+                    cand,
+                ),
+                (out_w, out_h),
+            )
+            if int(cv2.countNonZero(tmp_mask)) >= min_visible_area_px:
+                dst_quad = cand
+                break
+
+    if dst_quad is None:
+        # 最後の手段: クリップして必ず返す（ただしログ的には不自然になる）
+        rect_rot[:, 0] = np.clip(rect_rot[:, 0], 0, out_w - 1)
+        rect_rot[:, 1] = np.clip(rect_rot[:, 1], 0, out_h - 1)
+        dst_quad = order_quad_tl_tr_br_bl(rect_rot)
+
+    src_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
+    H = cv2.getPerspectiveTransform(src_quad, dst_quad)
+
+    bg = random_background(out_h, out_w, rng)
+    warped = cv2.warpPerspective(template_bgr, H, (out_w, out_h))
+
+    # mask for blending
+    mask = cv2.warpPerspective(np.ones((h, w), dtype=np.uint8) * 255, H, (out_w, out_h))
+    mask3 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    degraded = np.where(mask3 > 0, warped, bg)
+
+    # add *mild* blur/noise to simulate capturing conditions
+    if rng.random() < 0.35:
+        k = 3
+        degraded = cv2.GaussianBlur(degraded, (k, k), rng.uniform(0.4, 0.8))
+    if rng.random() < 0.35:
+        degraded = to_uint8(degraded.astype(np.float32) + np.random.normal(0, 4, size=degraded.shape))
+
+    meta = {
+        "angle_deg": float(angle),
+        "base_w": int(base_w),
+        "base_h": int(base_h),
+        "out_w": int(out_w),
+        "out_h": int(out_h),
+        "perspective_jitter": float(perspective_jitter),
+        "min_visible_area_ratio": float(min_visible_area_ratio),
+        "max_attempts": int(max_attempts),
+    }
+    return degraded, H, meta
+
+
+# ------------------------------------------------------------
+# Form feature detection (for debug/metadata only)
+# ------------------------------------------------------------
+
+
+def detect_qr_codes_multiscale(image_bgr: np.ndarray) -> list[dict[str, Any]]:
+    """フォームB想定: OpenCV QRCodeDetector のマルチスケール検出（test_capture_formB.py を踏襲）。"""
+
+    qr_results: list[dict[str, Any]] = []
+    qr_detector = cv2.QRCodeDetector()
+    height, width = image_bgr.shape[:2]
+
+    scales = [0.5, 0.25, 1.0, 0.125, 0.75]
+    for scale in scales:
+        if scale == 1.0:
+            test_image = image_bgr
+        else:
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            if new_width < 100 or new_height < 100:
+                continue
+            test_image = cv2.resize(image_bgr, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+        try:
+            data, points, _ = qr_detector.detectAndDecode(test_image)
+            if data and points is not None:
+                pts = points[0]
+                if scale != 1.0:
+                    pts = pts / scale
+                pts = pts.astype(np.float32)
+                qr_results.append(
+                    {
+                        "data": data,
+                        "points": pts.tolist(),
+                        "scale": scale,
+                    }
+                )
+                break
+        except Exception:
+            pass
+
+    return qr_results
+
+
+def detect_formA_marker_boxes(image_bgr: np.ndarray) -> list[dict[str, Any]]:
+    """フォームA想定: 3点マークを検出し、各マーカーの角点（矩形4隅 or approx）を返す。
+
+    注: ここでの角点は、まずは安定性優先で bbox の 4隅を採用する。
+        （輪郭近似で4点が取れた場合はそれを利用）
+
+    元実装: APA/test_capture_formA.py
+    """
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = image_bgr.shape[:2]
+
+    # corner regions (15%)
+    corner_margin_x = int(w * 0.15)
+    corner_margin_y = int(h * 0.15)
+    corners = {
+        "top_left": (0, 0, corner_margin_x, corner_margin_y),
+        "top_right": (w - corner_margin_x, 0, w, corner_margin_y),
+        "bottom_left": (0, h - corner_margin_y, corner_margin_x, h),
+        "bottom_right": (w - corner_margin_x, h - corner_margin_y, w, h),
+    }
+
+    # size range
+    min_size = min(w, h) * 0.005
+    max_size = min(w, h) * 0.08
+    min_area = min_size**2
+    max_area = max_size**2
+
+    # binarization trials
+    bin_list: list[tuple[str, np.ndarray]] = []
+    for th in (50, 80, 120):
+        _, b = cv2.threshold(gray, th, 255, cv2.THRESH_BINARY_INV)
+        bin_list.append((f"th_{th}", b))
+    _, b_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    bin_list.append(("otsu", b_otsu))
+
+    found: dict[str, dict[str, Any]] = {}
+    kernel = np.ones((3, 3), np.uint8)
+
+    for method, binary in bin_list:
+        binary_clean = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        binary_clean = cv2.morphologyEx(binary_clean, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(binary_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            x, y, ww, hh = cv2.boundingRect(contour)
+            area_rect = ww * hh
+            area_contour = float(cv2.contourArea(contour))
+            if not (min_area < area_contour < max_area):
+                continue
+            ar = float(ww) / float(hh) if hh else 0.0
+            if not (0.4 < ar < 2.5):
+                continue
+
+            cx, cy = x + ww // 2, y + hh // 2
+            corner_name = None
+            for name, (x1, y1, x2, y2) in corners.items():
+                if x1 <= cx <= x2 and y1 <= cy <= y2:
+                    corner_name = name
+                    break
+            if corner_name not in ("top_left", "top_right", "bottom_left"):
+                continue
+
+            fill_ratio = area_contour / float(area_rect) if area_rect else 0.0
+            if fill_ratio <= 0.4:
+                continue
+
+            mask = np.zeros(gray.shape, dtype=np.uint8)
+            cv2.drawContours(mask, [contour], 0, 255, -1)
+            mean_val = float(cv2.mean(gray, mask=mask)[0])
+            if mean_val >= 180:
+                continue
+
+            eps = 0.05 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, eps, True)
+
+            # score
+            aspect_score = 1.0 - abs(ar - 1.0) * 0.5
+            intensity_score = (180.0 - mean_val) / 180.0
+            score = aspect_score * 0.25 + fill_ratio * 0.35 + intensity_score * 0.4
+
+            # corners
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                pts = approx.reshape(4, 2).astype(np.float32)
+                pts = order_quad_tl_tr_br_bl(pts)
+            else:
+                pts = np.array(
+                    [[x, y], [x + ww - 1, y], [x + ww - 1, y + hh - 1], [x, y + hh - 1]],
+                    dtype=np.float32,
+                )
+
+            info = {
+                "corner": corner_name,
+                "bbox": [int(x), int(y), int(ww), int(hh)],
+                "points": pts.tolist(),
+                "score": float(score),
+                "method": method,
+            }
+
+            if corner_name not in found or score > float(found[corner_name]["score"]):
+                found[corner_name] = info
+
+    # keep TL/TR/BL
+    return [found[k] for k in ("top_left", "top_right", "bottom_left") if k in found]
+
+
+# ------------------------------------------------------------
+# XFeat matching / homography
+# ------------------------------------------------------------
+
+
+@dataclass
+class XFeatHomographyResult:
+    ok: bool
+    ref_kpts: int
+    tgt_kpts: int
+    matches: int
+    inliers: int
+    inlier_ratio: float
+    reproj_rms: Optional[float]
+    H_ref_to_tgt: Optional[list[list[float]]]
+
+
+def resize_keep_aspect(img: np.ndarray, max_side: int) -> tuple[np.ndarray, float]:
+    """Resize so that max(H,W) == max_side (if larger). Returns (resized, scale)."""
+
+    h, w = img.shape[:2]
+    m = max(h, w)
+    if m <= max_side:
+        return img, 1.0
+    s = float(max_side) / float(m)
+    new_w = max(1, int(round(w * s)))
+    new_h = max(1, int(round(h * s)))
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return resized, s
+
+
+def scale_matrix(s: float) -> np.ndarray:
+    return np.array([[s, 0, 0], [0, s, 0], [0, 0, 1]], dtype=np.float64)
+
+
+def compute_reproj_rms(H: np.ndarray, src_pts: np.ndarray, dst_pts: np.ndarray) -> float:
+    """Compute RMS reprojection error on matched points."""
+
+    src = src_pts.reshape(-1, 1, 2).astype(np.float32)
+    dst = dst_pts.reshape(-1, 1, 2).astype(np.float32)
+    proj = cv2.perspectiveTransform(src, H)
+    err = np.linalg.norm(proj - dst, axis=2).reshape(-1)
+    return float(np.sqrt(np.mean(err**2))) if len(err) else float("nan")
+
+
+class XFeatMatcher:
+    def __init__(self, top_k: int = 4096, device: str = "cpu", match_max_side: int = 1200):
+        ensure_portable_git_on_path()
+        self.device = device
+        self.top_k = top_k
+        self.match_max_side = match_max_side
+        self.xfeat = torch.hub.load(
+            "verlab/accelerated_features",
+            "XFeat",
+            pretrained=True,
+            top_k=top_k,
+        ).to(device)
+        self.xfeat.eval()
+
+    def match_and_estimate_h(self, ref_bgr: np.ndarray, tgt_bgr: np.ndarray) -> tuple[XFeatHomographyResult, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        """Return result + (H, mkpts0, mkpts1)"""
+
+        t0 = time.time()
+
+        # Resize for matching stability/speed (then scale H back)
+        ref_small, s_ref = resize_keep_aspect(ref_bgr, self.match_max_side)
+        tgt_small, s_tgt = resize_keep_aspect(tgt_bgr, self.match_max_side)
+
+        out0 = self.xfeat.detectAndCompute(ref_small, top_k=self.top_k)[0]
+        out1 = self.xfeat.detectAndCompute(tgt_small, top_k=self.top_k)[0]
+        # (Upstream requires image_size for some matchers; keep it)
+        out0.update({"image_size": (ref_small.shape[1], ref_small.shape[0])})
+        out1.update({"image_size": (tgt_small.shape[1], tgt_small.shape[0])})
+
+        matches = self.xfeat.match_lighterglue(out0, out1)
+        if isinstance(matches, (list, tuple)) and len(matches) >= 2:
+            mkpts0, mkpts1 = matches[0], matches[1]
+        elif isinstance(matches, dict) and "mkpts0" in matches and "mkpts1" in matches:
+            mkpts0, mkpts1 = matches["mkpts0"], matches["mkpts1"]
+        else:
+            return (
+                XFeatHomographyResult(False, 0, 0, 0, 0, 0.0, None, None),
+                None,
+                None,
+                None,
+            )
+
+        mkpts0 = np.asarray(mkpts0, dtype=np.float32)
+        mkpts1 = np.asarray(mkpts1, dtype=np.float32)
+
+        # These points are in "small" coordinate system.
+        ref_kpts = int(len(out0.get("keypoints", [])) or 0)
+        tgt_kpts = int(len(out1.get("keypoints", [])) or 0)
+
+        if len(mkpts0) < 4:
+            return (
+                XFeatHomographyResult(False, ref_kpts, tgt_kpts, int(len(mkpts0)), 0, 0.0, None, None),
+                None,
+                mkpts0,
+                mkpts1,
+            )
+
+        H, mask = cv2.findHomography(
+            mkpts0,
+            mkpts1,
+            cv2.USAC_MAGSAC,
+            3.5,
+            maxIters=1_000,
+            confidence=0.999,
+        )
+
+        if H is None or mask is None:
+            return (
+                XFeatHomographyResult(False, ref_kpts, tgt_kpts, int(len(mkpts0)), 0, 0.0, None, None),
+                None,
+                mkpts0,
+                mkpts1,
+            )
+
+        mask = mask.reshape(-1).astype(bool)
+        inliers = int(mask.sum())
+        matches_n = int(len(mask))
+        inlier_ratio = float(inliers) / float(matches_n) if matches_n else 0.0
+
+        reproj = None
+        if inliers >= 4:
+            reproj = compute_reproj_rms(H, mkpts0[mask], mkpts1[mask])
+
+        _ = time.time() - t0
+
+        # scale H back to full resolution: H_full = inv(S_tgt) * H_small * S_ref
+        S_ref = scale_matrix(s_ref)
+        S_tgt = scale_matrix(s_tgt)
+        H_full = np.linalg.inv(S_tgt) @ H @ S_ref
+
+        return (
+            XFeatHomographyResult(
+                ok=True,
+                ref_kpts=ref_kpts,
+                tgt_kpts=tgt_kpts,
+                matches=matches_n,
+                inliers=inliers,
+                inlier_ratio=inlier_ratio,
+                reproj_rms=reproj,
+                H_ref_to_tgt=H_full.astype(float).tolist(),
+            ),
+            H_full,
+            mkpts0,
+            mkpts1,
+        )
+
+
+# ------------------------------------------------------------
+# Visualization
+# ------------------------------------------------------------
+
+
+def draw_inlier_matches(
+    ref_bgr: np.ndarray,
+    tgt_bgr: np.ndarray,
+    mkpts0: np.ndarray,
+    mkpts1: np.ndarray,
+    match_max_side: int,
+) -> np.ndarray:
+    """Draw projected ref corners on tgt + inlier matches."""
+
+    # NOTE:
+    # mkpts0/mkpts1 are in the "matching" coordinate system (resized images).
+    # For visualization to look correct, we must draw on the SAME resized images.
+    # This prevents the left/right size mismatch and “not matching” appearance.
+
+    ref_vis, _ = resize_keep_aspect(ref_bgr, match_max_side)
+    tgt_vis, _ = resize_keep_aspect(tgt_bgr, match_max_side)
+
+    Hm, mask = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 3.5)
+    if Hm is None or mask is None:
+        return tgt_vis
+    mask = mask.reshape(-1).astype(bool)
+
+    h, w = ref_vis.shape[:2]
+    corners = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32).reshape(-1, 1, 2)
+    warped = cv2.perspectiveTransform(corners, Hm)
+
+    tgt2 = tgt_vis.copy()
+    for i in range(len(warped)):
+        p1 = tuple(warped[i - 1][0].astype(int))
+        p2 = tuple(warped[i][0].astype(int))
+        cv2.line(tgt2, p1, p2, (0, 255, 0), 4)
+
+    k0 = [cv2.KeyPoint(float(p[0]), float(p[1]), 5) for p in mkpts0]
+    k1 = [cv2.KeyPoint(float(p[0]), float(p[1]), 5) for p in mkpts1]
+    matches = [cv2.DMatch(i, i, 0) for i, m in enumerate(mask) if m]
+    canvas = cv2.drawMatches(ref_vis, k0, tgt2, k1, matches, None, matchColor=(0, 255, 0), flags=2)
+    return canvas
+
+
+# ------------------------------------------------------------
+# Image mode
+# ------------------------------------------------------------
+
+
+def load_templates(form: str) -> list[Path]:
+    base = Path(__file__).resolve().parent / "image" / form
+    paths = []
+    for i in range(1, 7):
+        p = base / f"{i}.jpg"
+        if p.exists():
+            paths.append(p)
+    return paths
+
+
+def run_images_mode(args: argparse.Namespace) -> int:
+    out_root = mkdir(Path(args.out) / f"run_{now_run_id()}_{args.form}_images")
+    debug_dir = mkdir(out_root / "debug")
+    warped_dir = mkdir(out_root / "warped")
+    degraded_dir = mkdir(out_root / "degraded")
+
+    # reproducibility
+    rng = random.Random(args.seed)
+    np.random.seed(args.seed)
+
+    templates = load_templates(args.form)
+    if not templates:
+        print(f"[ERROR] templates not found: APA/image/{args.form}/*.jpg")
+        return 1
+
+    device = "cuda" if args.device == "auto" and torch.cuda.is_available() else (args.device if args.device != "auto" else "cpu")
+    matcher = XFeatMatcher(top_k=args.top_k, device=device, match_max_side=args.match_max_side)
+
+    summary: list[dict[str, Any]] = []
+
+    for tp in templates:
+        template_bgr = cv2.imread(str(tp))
+        if template_bgr is None:
+            print(f"[WARN] failed to read: {tp}")
+            continue
+
+        template_features: dict[str, Any] = {}
+        if args.detect_features:
+            if args.form == "A":
+                template_features["markers"] = detect_formA_marker_boxes(template_bgr)
+            if args.form == "B":
+                template_features["qrs"] = detect_qr_codes_multiscale(template_bgr)
+
+        # generate N degraded variants
+        for k in range(args.degrade_n):
+            name = f"{tp.stem}_deg{k:02d}"
+            degraded_bgr, _H_gt, degrade_meta = warp_template_to_random_view(
+                template_bgr,
+                out_size=(args.degrade_w, args.degrade_h),
+                rng=rng,
+                max_rotation_deg=args.max_rot,
+                min_abs_rotation_deg=args.min_abs_rot,
+                perspective_jitter=args.perspective,
+            )
+            cv2.imwrite(str(degraded_dir / f"{name}.jpg"), degraded_bgr)
+
+            res, H, mk0, mk1 = matcher.match_and_estimate_h(template_bgr, degraded_bgr)
+            item: dict[str, Any] = {
+                "template": str(tp),
+                "case": name,
+                "ok": res.ok,
+                "degrade": degrade_meta,
+                **asdict(res),
+            }
+
+            if args.detect_features:
+                item["template_features"] = template_features
+                if args.form == "A":
+                    item["degraded_features"] = {"markers": detect_formA_marker_boxes(degraded_bgr)}
+                if args.form == "B":
+                    item["degraded_features"] = {"qrs": detect_qr_codes_multiscale(degraded_bgr)}
+            summary.append(item)
+
+            if not res.ok or H is None or mk0 is None or mk1 is None:
+                continue
+
+            # warp degraded back to template plane (inverse H)
+            H_inv = np.linalg.inv(H)
+            warped = cv2.warpPerspective(degraded_bgr, H_inv, (template_bgr.shape[1], template_bgr.shape[0]))
+            cv2.imwrite(str(warped_dir / f"{name}_warped.jpg"), warped)
+
+            # debug matches image
+            try:
+                dbg = draw_inlier_matches(
+                    template_bgr,
+                    degraded_bgr,
+                    mk0,
+                    mk1,
+                    args.match_max_side,
+                )
+                cv2.imwrite(str(debug_dir / f"{name}_matches.jpg"), dbg)
+            except Exception:
+                pass
+
+        print(f"[OK] processed template: {tp.name}")
+
+    # save summary
+    with open(out_root / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    # simple csv
+    csv_path = out_root / "summary.csv"
+    header = [
+        "template",
+        "case",
+        "ok",
+        "ref_kpts",
+        "tgt_kpts",
+        "matches",
+        "inliers",
+        "inlier_ratio",
+        "reproj_rms",
+    ]
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write(",".join(header) + "\n")
+        for it in summary:
+            row = [
+                str(it.get("template", "")),
+                str(it.get("case", "")),
+                str(it.get("ok", "")),
+                str(it.get("ref_kpts", "")),
+                str(it.get("tgt_kpts", "")),
+                str(it.get("matches", "")),
+                str(it.get("inliers", "")),
+                str(it.get("inlier_ratio", "")),
+                str(it.get("reproj_rms", "")),
+            ]
+            f.write(",".join(row) + "\n")
+
+    print(f"\n[DONE] outputs: {out_root}")
+    return 0
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["images"], required=True)
+    p.add_argument("--form", choices=["A", "B"], required=True)
+    p.add_argument("--out", type=str, default=str(Path(__file__).resolve().parent / "output_recovery"))
+
+    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    p.add_argument("--top-k", type=int, default=2048)
+    p.add_argument(
+        "--match-max-side",
+        type=int,
+        default=1200,
+        help="XFeat matching 用の最大辺（大きいほど精度↑/速度↓）",
+    )
+    p.add_argument(
+        "--detect-features",
+        action="store_true",
+        help="フォームA(マーカー)/B(QR)の検出も行い、summary.jsonに入れる（Homographyには未使用）",
+    )
+
+    # images mode options
+    p.add_argument("--degrade-n", type=int, default=5)
+    # 改悪画像が小さすぎると現実の撮影条件と乖離するため、デフォルトを少し大きめにする
+    p.add_argument("--degrade-w", type=int, default=2400)
+    p.add_argument("--degrade-h", type=int, default=1800)
+    # Make default degradation milder (user feedback)
+    p.add_argument("--max-rot", type=float, default=12.0)
+    p.add_argument(
+        "--min-abs-rot",
+        type=float,
+        default=0.0,
+        help=(
+            "フル回転モード（--max-rot>=180）時に、0度に近い回転を避けたい場合の下限（度）。"
+            " 例: --max-rot 180 --min-abs-rot 120 とすると、ほぼ上下逆/横向きが必ず混ざる。"
+        ),
+    )
+    p.add_argument("--perspective", type=float, default=0.08)
+    p.add_argument("--seed", type=int, default=42)
+
+    return p
+
+
+def main() -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    print("=" * 70)
+    print("test_recovery_paper")
+    print("=" * 70)
+    print(f"OpenCV: {cv2.__version__}")
+    print(f"torch: {torch.__version__}")
+    print(f"mode: {args.mode} / form: {args.form}")
+
+    if args.mode == "images":
+        return run_images_mode(args)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+```
+
+
+今後、myplanの補正画像の生成のシステムづくりのフェーズになっていきます
+しかし大きな問題があります大きな問題があります
+それはウェブカメラです
+720pなのですが、鮮明にするような処理があると嬉しいです
+どのような技術、戦略、研究、ライブラリを使えばいいでしょうか？
+調査して日本語で分かりやすく考察してください
