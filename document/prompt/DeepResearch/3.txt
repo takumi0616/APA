@@ -1,0 +1,2080 @@
+@/src/APA/document/paper/DocAligner.md
+```
+# DocAligner 論文まとめ（日本語・詳細解説）
+
+対象論文: **DocAligner: Annotating Real-world Photographic Document Images by Simply Taking Pictures**（arXiv:2306.05749v2, 2023/06/12）
+
+> この Markdown は、論文本文の内容を**日本語で詳細に要約し、背景・意義・設計意図が分かるように解説**したものです。
+> 原文の逐語訳や全文転載ではなく、要点を再構成して説明しています。
+
+---
+
+## 目次
+
+- [1. 研究の背景と課題](#1-研究の背景と課題)
+- [2. DocAligner の狙い（何を解決するのか）](#2-docalignerの狙い何を解決するのか)
+- [3. 手法の全体像](#3-手法の全体像)
+- [4. 提案手法の中身（3 つの工夫）](#4-提案手法の中身3つの工夫)
+  - [4.1 非剛体プリ・アラインメント（エッジ＋ TPS）](#41-非剛体プリアラインメントエッジtps)
+  - [4.2 階層アラインメント（Global→Local の相関＋粗密フロー）](#42-階層アラインメントgloballocalの相関粗密フロー)
+  - [4.3 詳細リカレント精錬（高解像度での ConvGRU）](#43-詳細リカレント精錬高解像度でのconvgru)
+  - [4.4 実データ自己教師（Sobel 勾配整合）](#44-実データ自己教師sobel勾配整合)
+- [5. データセット（DocAlign12K）合成](#5-データセットdocalign12k合成)
+- [6. 実験設定](#6-実験設定)
+- [7. 比較実験（SOTA との比較）](#7-比較実験sotaとの比較)
+- [8. 応用：撮るだけで「現実写真ドキュメント」の教師データが増える](#8-応用撮るだけで現実写真ドキュメントの教師データが増える)
+  - [8.1 レイアウト解析（DLA）への応用](#81-レイアウト解析dlaへの応用)
+  - [8.2 照明補正への応用](#82-照明補正への応用)
+  - [8.3 幾何補正（デワーピング）への応用](#83-幾何補正デワーピングへの応用)
+- [9. アブレーション（どの工夫が効いているか）](#9-アブレーションどの工夫が効いているか)
+- [10. 限界・失敗例](#10-限界失敗例)
+- [11. まとめ（この研究の価値）](#11-まとめこの研究の価値)
+
+---
+
+## 1. 研究の背景と課題
+
+近年のドキュメント AI（OCR、レイアウト解析、表検出、文書復元など）は、**スキャン画像や PDF 由来の「綺麗な文書」**に対して大きく進歩してきました。
+
+一方で実世界では、スマホ撮影の領収書・資料・掲示物・教科書など、**写真（photographic）文書画像**が大量に存在します。写真文書は次のような劣化を持ちます。
+
+- 視点変化（斜め撮り）による大域的なズレ
+- 紙の湾曲・折れ・たわみによる**非剛体変形**
+- 影、照明ムラ（シェーディング）、反射
+- 背景の写り込みや余白（机・床など）
+
+しかし、ここで大きな問題が発生します。
+
+### 問題：写真文書の「正解ラベル」が作れない
+
+写真文書でモデルを学習させるにはラベルが必要ですが、以下の理由で難しい。
+
+- **手作業のアノテーションが高コスト**（物体数が多い、変形が複雑、数分〜十数分/枚）
+- 照明補正や幾何補正は、画素単位での対応関係（フロー）など、**人手でほぼ不可能な超密なラベル**が必要
+- 既存の「クリーン文書用自動ラベリング」（PDF 解析など）は写真には適用できない
+
+---
+
+## 2. DocAligner の狙い（何を解決するのか）
+
+DocAligner の発想はシンプルです。
+
+> **「クリーンな文書画像（例：PDF から作れる）を印刷して写真を撮る」**
+> そのクリーン画像と撮影画像の間に、画素レベルの対応（dense correspondence / flow）を推定できれば、
+> **クリーン側に既にあるアノテーションを写真側に移し替えられる**。
+
+つまり、写真文書データセットの作り方を
+
+- 従来：写真を撮る → 1 枚ずつ手作業でラベル付け
+- 提案：クリーン画像（元データ）を用意 → 印刷して撮影 → **対応付けで自動ラベル転送**
+
+に変えることで、データ不足を根本から改善します。
+
+特に次の 2 種類のラベル獲得が可能になります。
+
+1. **既存タスクのラベル転送**：レイアウト解析、表検出など（bbox やマスク）
+2. **人手で付けられないラベルの自動生成**：照明補正の教師（補正後画像）、幾何補正の教師（密な対応・デワーピングマップ）
+
+---
+
+## 3. 手法の全体像
+
+DocAligner は、撮影画像（source）とクリーン画像（target）の間のフロー（各画素がどこへ対応するか）を推定します。
+
+- 入力: 写真文書 `I_s` と、対応するクリーン文書 `I_t`
+- 出力: フロー `f`（`I_t` の各画素が `I_s` のどの位置に対応するか）
+
+論文では主に次の流れです。
+
+```mermaid
+flowchart LR
+  A[写真文書 Is] --> B[エッジ抽出・角/辺点検出]
+  B --> C[TPSによる非剛体プリ・アラインメント]
+  C --> A2[Is'（事前整列済み）]
+  A2 --> D[特徴抽出（共有Backbone）]
+  E[クリーン文書 It] --> D
+  D --> F[階層アラインメント\nGlobal相関→Local相関]
+  F --> G[詳細リカレント精錬\n（ConvGRU, 高解像度）]
+  G --> H[最終フロー f（入力と同解像度）]
+```
+
+ポイントは、自然画像の dense correspondence 手法（DGC-Net, GLU-Net など）をそのまま使うのではなく、**文書ならではの性質**（繰り返しパターン、微細文字、非剛体変形）に合わせた設計をしている点です。
+
+---
+
+## 4. 提案手法の中身（3 つの工夫）
+
+論文の技術的貢献は大きく 4 つに整理できます。
+
+1. **非剛体プリ・アラインメント（TPS）**
+2. **階層アラインメント（Global→Local 相関）**
+3. **詳細リカレント精錬（ConvGRU で高解像度フロー）**
+4. **実データ自己教師（Sobel 勾配整合）**
+
+以下で順に解説します。
+
+---
+
+### 4.1 非剛体プリ・アラインメント（エッジ＋ TPS）
+
+#### なぜ必要？
+
+写真文書は、撮影角度の違いや紙のたわみで、**大域的に大きくズレる**ことが多いです。
+このズレがあると、相関（特徴の類似度）を取る段階で、繰り返しパターン（同じ文字や同じ行構造）に引っ張られて誤対応が起きやすくなります。
+
+自然画像では、RANSAC ＋ホモグラフィなどの剛体（あるいは準剛体）変換で粗合わせすることがありますが、文書では**非剛体変形（湾曲・折れ）**が強く、それだけでは足りません。
+
+#### 何をする？
+
+1. 文書領域のエッジをセグメンテーションで抽出
+2. エッジから 4 隅＋辺上の等間隔点を検出
+3. それらを「基準の四角形」上の参照点に対応付け
+4. 対応点対から **TPS（Thin Plate Spline）** で非剛体変換し、`I_s'`（プリ・アライン後の画像）を得る
+
+TPS は「薄い板を点で引っ張って変形させる」ような滑らかな非剛体変形を表現でき、紙のたわみに相性が良い設計です。
+
+---
+
+### 4.2 階層アラインメント（Global→Local の相関＋粗密フロー）
+
+#### 目的
+
+大きなズレから微細なズレまでを、
+
+- 低解像度で大きく合わせる（粗）
+- 高解像度で細部を詰める（密）
+
+という「粗 → 密」の戦略で推定します。
+
+#### 中身（直感）
+
+各レベル `l` でフロー `f^l` を更新します。
+
+1. いまのフローで source 特徴を target 側へワープしてズレを減らす
+2. 相関（correlation / cost volume）を計算して対応候補を集める
+3. 軽量デコーダでフロー残差を予測して更新
+
+#### Global correlation と Local correlation の使い分け
+
+- **Global correlation（全探索）**：
+
+  - 低解像度でのみ使う
+  - 大きなズレに強いが、計算量・メモリが二乗で増える
+
+- **Local correlation（近傍探索）**：
+  - 高解像度で使う
+  - 近傍 `R` の範囲だけを見るので効率的だが、大ズレには弱い
+
+DocAligner はこれを組み合わせて、
+
+- Level 1（最粗）: Global correlation
+- Level 2, 3（より細）: Local correlation（論文では `R=9`）
+
+としています。
+
+```mermaid
+flowchart TB
+  L1[Level1: 低解像度] -->|Global correlation| F1[粗いフロー]
+  F1 --> L2[Level2: 中解像度]
+  L2 -->|Local correlation| F2[より細かいフロー]
+  F2 --> L3[Level3: 高解像度]
+  L3 -->|Local correlation| F3[高精度フロー]
+```
+
+---
+
+### 4.3 詳細リカレント精錬（高解像度での ConvGRU）
+
+#### 背景：文書は「文字の境界」が命
+
+自然画像のオプティカルフローでは、最終出力フローが入力の 1/4 解像度でも十分なことが多いのに対し、文書は
+
+- 文字
+- 罫線
+- 表のセル境界
+
+など、**高周波の細部が認識の成否を左右**します。
+
+そのため DocAligner は、最終フローを**入力と同解像度**まで高精度にします。
+
+#### どうやって高解像度を扱う？（メモリ問題）
+
+高解像度で相関計算やデコーダを回すとメモリが爆発します。そこで論文は、
+
+- 高解像度空間での精錬を
+- **リカレント（反復）**に実行し
+- 状態を **ConvGRU** に保持する
+
+ことで、精度とメモリのバランスを取ります。
+
+直感的には「毎回ちょっとずつフローを修正し、過去の修正履歴を隠れ状態に蓄える」イメージです。
+
+また、残差フローのアップサンプリングに、単純な双線形補間ではなく「学習可能な重み（3×3 近傍の重み和）」を使っている点が特徴です。
+
+---
+
+### 4.4 実データ自己教師（Sobel 勾配整合）
+
+#### なぜ自己教師が必要？
+
+合成データで学習しても、実写には
+
+- 現実の影・反射
+- 紙質や印刷品質
+- 背景混入
+
+といった分布差があり、そのままだと性能が落ちます。
+
+しかし実写で GT フローを作るのは困難。
+そこで論文は、**自己教師（Self-supervised fine-tuning）**を提案します。
+
+#### アイデア
+
+フローでワープして一致させたいのは「見た目」ですが、照明差があると画素値一致は難しい。
+そこで、画像勾配（Sobel）を使います。
+
+- `G(·)`：Sobel で勾配画像を取る
+- `I_s'` をフロー `f` でワープして `\\tilde{G}(I_s')` を作る
+- `G(I_t)` と `\\tilde{G}(I_s')` の差を最小化
+
+この最適化を各サンプル単独ではなく、**テストセット全体をまとめて数 epoch 微調整してから推論**する運用にしています（論文中では SSFT10 など）。
+
+---
+
+## 5. データセット（DocAlign12K）合成
+
+学習用の教師ありデータが無いので、論文は **DocAlign12K（12K サンプル）** を合成します。
+
+### 合成の基本方針
+
+1. インターネットから PDF を収集
+2. PDF→ 画像変換でクリーン画像を作る（これが `I_t`）
+3. ランダムなフローを生成し、クリーン画像をワープして幾何歪みを作る（reflectance 相当）
+4. 実写背景を撮影して集めた**シェーディングマップ（500 枚）**を適用し、照明ムラを付与
+5. JPEG 圧縮、ノイズ、ブラー等も追加して現実っぽくする
+
+結果として、
+
+- (クリーン画像, 合成写真風画像, GT フロー)
+
+の三つ組を得ます。
+
+```mermaid
+flowchart LR
+  A[PDF収集] --> B[PDF→クリーン画像 It]
+  B --> C[ランダムフロー生成]
+  C --> D[幾何ワープ（歪み付与）]
+  E[実写シェーディング500枚] --> F[クロップ/回転/色変化]
+  D --> G[照明劣化 I = R ⊗ S]
+  F --> G
+  G --> H[JPEG/ノイズ/ブラー等]
+  H --> I[DocAlign12K (12K)]
+```
+
+分割は **学習 10K / テスト 2K**。
+
+---
+
+## 6. 実験設定
+
+- 実装: PyTorch
+- Backbone: ImageNet 事前学習の ResNet-18
+- 入力解像度: 1024×1024
+- 学習: Adam、初期 LR=1e-4、30epoch ごとに ×0.3、計 100epoch
+- GPU: NVIDIA 2080Ti ×2、batch size 4
+- 損失: 各階層レベル＋精錬反復のフローに対して **L1 loss**（合成データでは GT フローがある）
+
+---
+
+## 7. 比較実験（SOTA との比較）
+
+比較対象：
+
+- DGC-Net
+- GLU-Net
+- GLU-GOCor
+- DocAligner（提案）
+
+### 7.1 DocAlign12K 上の評価（AEPE / PCK）
+
+指標：
+
+- **AEPE**（Average Endpoint Error）: 予測フローと GT フローのユークリッド距離平均（小さいほど良い）
+- **PCK**（Percentage of Correct Keypoints）: 閾値以内（例 1px, 5px）に収まる割合（大きいほど良い）
+
+**表 1（論文の数値を整理）**
+
+| 手法           |   AEPE ↓ | PCK-1px (%) ↑ | PCK-5px (%) ↑ |
+| -------------- | -------: | ------------: | ------------: |
+| DGC-Net        |    47.39 |          6.98 |         15.67 |
+| GLU-Net        |     1.82 |         51.04 |         93.74 |
+| GLU-GOCor      |     1.54 |         62.15 |         94.49 |
+| **DocAligner** | **1.09** |     **76.63** |     **96.36** |
+
+解釈：
+
+- DGC-Net は入力解像度制約（240×240）の影響で文書の微細構造に弱い
+- DocAligner は PCK-1px が大きく改善し、**1 ピクセル精度の対応付け能力が高い**ことを示す
+
+### 7.2 DocUNet ベンチマーク（ワープ後の整合性）
+
+DocUNet は、クリーン（スキャン）と歪んだ写真文書のペア。
+予測フローで写真側をワープし、ターゲットへの整合性を測ります。
+
+指標：
+
+- **MS-SSIM** ↑: 知覚類似度（高いほど良い）
+- **AD** ↓: align distortion（低いほど良い）
+
+**表 2（論文の数値を整理）**
+
+| 手法                    |  MS-SSIM ↑ |       AD ↓ | Params (M) | Run-time (s) |
+| ----------------------- | ---------: | ---------: | ---------: | -----------: |
+| DGC-Net                 |     0.6177 |     0.3137 |      68.47 |         0.48 |
+| GLU-Net                 |     0.7728 |     0.1186 |      94.17 |         0.75 |
+| GLU-GOCor               |     0.7862 |     0.0938 |      94.17 |         0.85 |
+| **DocAligner**          | **0.8058** | **0.0486** |      103.8 |         0.93 |
+| **DocAligner + SSFT10** | **0.8232** | **0.0445** |      103.8 |         0.93 |
+
+解釈：
+
+- 自己教師微調整（SSFT10）でさらに改善 → 分布差の吸収に効いている
+
+### 7.3 自己教師のみでの比較（RANSAC-Flow と比較）
+
+合成データ学習なしで、実データ自己教師だけで訓練した場合。
+
+**表 3（論文の数値を整理）**
+
+| 手法                    |  MS-SSIM ↑ |       AD ↓ |
+| ----------------------- | ---------: | ---------: |
+| RANSAC-Flow             |     0.6746 |     0.4700 |
+| **DocAligner + SSFT10** | **0.7864** | **0.0918** |
+
+解釈：
+
+- RANSAC-Flow は剛体寄りの事前整列がボトルネックになりやすい
+- DocAligner は非剛体プリ・アラインが強く、自己教師も実装しやすい構成
+
+---
+
+## 8. 応用：撮るだけで「現実写真ドキュメント」の教師データが増える
+
+DocAligner の価値は、単にフロー精度が高いだけではなく、**現実写真の教師データを安価に増やすための基盤**になる点です。
+
+論文では 3 つの応用を示します。
+
+---
+
+### 8.1 レイアウト解析（DLA）への応用
+
+#### 何をする？
+
+1. PubLayNet（クリーン画像＋レイアウト注釈）のサンプルを選ぶ
+2. 印刷して写真撮影
+3. DocAligner でクリーン ↔ 写真を対応付け
+4. bbox/マスク座標をフローで変換して、写真側注釈を自動生成
+
+#### 効果（コスト）
+
+手作業だと 1 枚 5〜15 分程度かかるところ、
+提案では **約 0.15 分/枚**まで短縮（論文記述）。
+
+#### 学習効果（Mask R-CNN）
+
+論文の表 4 は、訓練データの作り方が性能に与える影響を示します。
+
+**表 4（論文の数値を整理）**
+
+| Training data             | Type      | Num. | mAP(@0.5-0.95) |
+| ------------------------- | --------- | ---: | -------------: |
+| Clean images              | -         |   2K |            8.0 |
+| Clean + S (Synthetic)     | Synthetic |   2K |           36.9 |
+| Clean + G (Synthetic)     | Synthetic |   2K |           21.5 |
+| Clean + G + S (Synthetic) | Synthetic |   2K |           49.7 |
+| Clean + G + S (Synthetic) | Synthetic |  20K |           61.9 |
+| **Data from DocAligner**  | Real      |   2K |       **68.0** |
+
+解釈：
+
+- 合成を大量（20K）作っても、DocAligner で得た実写 2K が上回る
+- 「現実の多様性」を取り込めるのが強い
+
+---
+
+### 8.2 照明補正への応用
+
+照明補正では「影や照明ムラを消した正解画像」が必要ですが、人手では作れません。
+
+DocAligner は、写真をフローでクリーンに揃えられるので、
+
+- 入力：歪んだ写真
+- 正解：クリーン画像に整列した結果（ある種の疑似 GT）
+
+というペアを作れます。
+
+論文では WarpDoc を DocAligner でアノテートし、800 ペアを得て illNet を学習。
+
+**表 5（論文の数値を整理：DocUNet 上の照明補正）**
+
+| Network     | Training data               | Num. |     SSIM ↑ |    PSNR ↑ |
+| ----------- | --------------------------- | ---: | ---------: | --------: |
+| -（未補正） | -                           |    - |     0.7065 |     12.90 |
+| illNet      | DocProj (synthetic)         |  500 |     0.7139 |     15.74 |
+| illNet      | **Dataset from DocAligner** |  800 | **0.7504** | **16.78** |
+
+解釈：
+
+- 実写由来データ（800）が、合成データ（500）より高い
+- 実データはサイズが小さくても「質」が勝ることを示唆
+
+---
+
+### 8.3 幾何補正（デワーピング）への応用
+
+幾何補正（曲がった紙を平らにする）は、対応関係（デワーピングマップ）が必要で、手作業は困難です。
+
+DocAligner でフローが得られれば、それ自体が教師信号になり、デワーピングモデルが学習できます。
+
+論文では複数データセットを混ぜて 2.5K の訓練ペアを作成し、Transformer ベースのデワーピングネットを学習。
+
+**表 6（論文の数値を整理）**
+
+| Model                                      | Training data | Type |      Num. |  MS-SSIM ↑ |   AD ↓ |
+| ------------------------------------------ | ------------- | ---- | --------: | ---------: | -----: |
+| DocUNet [25]                               | Ma et al.     | S    |      100K |     0.4157 | 0.4957 |
+| DocProj [22]                               | Li et al.     | S    |        1K |     0.2531 | 0.9278 |
+| DDCP [40]                                  | Xie et al.    | S    |       30K |     0.4189 | 0.5071 |
+| DewarpNet [5]                              | Doc3D         | S    |      100K |     0.4057 | 0.5187 |
+| DocTr [8]                                  | Doc3D         | S    |      100K |     0.4649 | 0.4708 |
+| PaperEdge [24]                             | DIW + Doc3D   | R+S  | 2.3K+100K |     0.4523 | 0.3901 |
+| **Transformer-based + DocAligner dataset** | -             | R    |      2.5K | **0.4897** | 0.4226 |
+
+解釈：
+
+- たった 2.5K の実写由来データでも、巨大合成 100K で鍛えたモデル群に匹敵/一部上回る
+- 「ラベル獲得のボトルネック」が解消されることのインパクトが大きい
+
+---
+
+## 9. アブレーション（どの工夫が効いているか）
+
+論文は 2 点の重要性を検証しています。
+
+### 9.1 非剛体プリ・アラインの有無
+
+非剛体プリ・アラインをホモグラフィ（RANSAC）に置き換えると性能が大きく落ちる。
+
+### 9.2 詳細リカレント精錬の有無
+
+精錬をやめて 1/4 解像度フローを双線形拡大すると性能が落ちる。
+
+**表 7（論文の数値を整理）**
+
+| 非剛体プリ・アライン | 詳細リカレント精錬 |  MS-SSIM ↑ |       AD ↓ |
+| -------------------- | ------------------ | ---------: | ---------: |
+| なし                 | あり               |     0.7578 |     0.1099 |
+| あり                 | なし               |     0.7910 |     0.0756 |
+| **あり**             | **あり**           | **0.8058** | **0.0486** |
+
+---
+
+## 10. 限界・失敗例
+
+論文の制限事項（Limitations）は実運用に重要なので、要点をまとめます。
+
+1. **向き（orientation）のズレに弱い**
+
+   - 非剛体プリ・アラインが「回転・上下反転を自動補正する設計ではない」
+   - 撮影時に向きを揃える、または撮影後に人手で回転補正が必要
+
+2. **文書が欠けている（incomplete）ケース**
+   - 片方にしか存在しない領域があり、ワープ結果に無効領域（ゼロ埋め）が出る
+   - 特に照明補正の教師としては不適になる
+
+---
+
+## 11. まとめ（この研究の価値）
+
+DocAligner は、文書 AI における「写真文書のラベル不足」という根本問題に対し、
+
+- **写真文書 ↔ クリーン文書** の高精度 dense correspondence（フロー）を推定することで、
+- **撮影するだけで教師データが増える**
+
+という実用的な解決策を提示しています。
+
+技術的には、文書の特性に合わせて
+
+- エッジを使った **TPS 非剛体プリ・アライン**
+- **Global→Local 相関**による階層推定
+- **ConvGRU**による高解像度の反復精錬
+- **Sobel 勾配**に基づく実データ自己教師
+
+を組み合わせ、既存手法より高い精度を実現しました。
+
+そして最も大きな意義は、レイアウト解析・照明補正・デワーピングといった複数タスクで、
+
+> **合成データよりも、少量の実写由来データが強い**
+
+ことを実験で示し、研究コミュニティに「データの作り方」の新しいルートを提示した点です。
+
+---
+
+## 参考（論文中で言及される主要な関連手法）
+
+- DGC-Net / GLU-Net / GLU-GOCor：自然画像の dense correspondence 系
+- DocUNet / WarpDoc：文書デワーピング系ベンチマーク
+- PubLayNet：クリーン文書のレイアウト解析データセット
+
+```
+
+
+@/src/APA/document/paper/XFeatMatching.md
+```
+# XFeat 論文まとめ（日本語・詳細解説）
+
+対象論文: **XFeat: Accelerated Features for Lightweight Image Matching**（arXiv:2404.19174v1, 2024/04/30, CVPR 2024 採録予定）
+
+> この Markdown は、論文本文の内容を**日本語で詳細に要約し、設計意図・背景・利点/限界が分かるように解説**したものです。  
+> 原文の逐語訳や全文転載ではなく、要点を再構成して説明しています。
+
+---
+
+## 目次
+
+- [1. 背景：なぜ「軽量で強い特徴点」が必要か](#1-背景なぜ軽量で強い特徴点が必要か)
+- [2. XFeat の狙いと貢献（何が新しい？）](#2-xfeat-の狙いと貢献何が新しい)
+- [3. 全体像：XFeat が出力するもの](#3-全体像xfeat-が出力するもの)
+- [4. 主要アイデア(1)：Featherweight Backbone（計算を支配する「高解像度 × チャンネル」をどう抑えるか）](#4-主要アイデア1featherweight-backbone計算を支配する高解像度チャンネルをどう抑えるか)
+- [5. 主要アイデア(2)：Descriptor Head（マルチスケール融合＋信頼度マップ）](#5-主要アイデア2descriptor-headマルチスケール融合信頼度マップ)
+- [6. 主要アイデア(3)：Keypoint Head（入力を 8×8 ブロックに畳み替えて 1×1 Conv で高速検出）](#6-主要アイデア3keypoint-head入力を-88-ブロックに畳み替えて-11-conv-で高速検出)
+- [7. 主要アイデア(4)：Semi-dense matching と Match Refinement（粗い特徴からピクセルオフセットを復元）](#7-主要アイデア4semi-dense-matching-と-match-refinement粗い特徴からピクセルオフセットを復元)
+- [8. 学習：損失設計（dual-softmax・信頼度・オフセット・蒸留）](#8-学習損失設計dual-softmax信頼度オフセット蒸留)
+- [9. 実験：相対姿勢推定 / ホモグラフィ / 画像ローカライゼーション](#9-実験相対姿勢推定--ホモグラフィ--画像ローカライゼーション)
+- [10. アブレーション：どの設計が効いているか](#10-アブレーションどの設計が効いているか)
+- [11. まとめ：XFeat の価値と使いどころ](#11-まとめxfeat-の価値と使いどころ)
+
+---
+
+## 1. 背景：なぜ「軽量で強い特徴点」が必要か
+
+画像間対応（image matching / correspondence）は、以下のような“上位タスク”の入り口（前処理）として必須です。
+
+- Visual SLAM / Visual Odometry
+- Visual Localization（3D 地図への位置推定）
+- SfM（Structure-from-Motion） / 3D 再構成
+- AR（Augmented Reality）やロボットナビゲーション
+- 平面同士の整合（ホモグラフィ推定）
+
+近年は Transformer 系の matcher（LoFTR, LightGlue など）や end-to-end dense matching が精度を引き上げましたが、
+
+- **計算が重い**（高解像度入力だと特に厳しい）
+- **実装が複雑**
+- **モバイル/CPU 環境、組み込み機器に載せづらい**
+
+という課題が残ります。
+
+さらに、画像マッチングでは「高解像度でのピクセル精度の対応」が必要になりがちです（姿勢推定・SfM では誤差が致命的）。
+そのため、入力解像度を落として速度を稼ぐと精度が落ち、精度を稼ぐと速度/メモリが落ちるというジレンマがあります。
+
+XFeat は、このジレンマに対して「**CNN の設計そのものを見直して**、高解像度を保ちながら高速に動く local feature extractor」を目指した研究です。
+
+---
+
+## 2. XFeat の狙いと貢献（何が新しい？）
+
+論文が主張する貢献は大きく 3 つです。
+
+1. **軽量で高速・汎用な CNN アーキテクチャ**（ハード依存の最適化なしでも速い）
+2. **小さいバックボーンでも動く、ミニマルなキーポイント検出ブランチ**
+3. **Semi-dense（準密）マッチングを軽量に実現する Match Refinement モジュール**
+
+特にポイントは、
+
+- 速度を上げるために「単にネットを浅く/細くする」のではなく、
+- **高解像度の早い層では極力チャンネル数を減らし**、
+- 解像度が下がるにつれ **チャンネル数を“倍”ではなく“3 倍”で増やして表現力を回復**する、
+
+という“計算コストの支配項（H×W）”に合わせた設計になっている点です。
+
+さらに、特徴点（sparse）だけでなく、
+
+- coarse feature map の点（semi-dense）も使える
+- その coarse match から **8×8 の候補オフセット分類**で pixel-level へ詰める
+
+という「軽量 coarse-to-fine」も実現しています。
+
+---
+
+## 3. 全体像：XFeat が出力するもの
+
+入力は **グレースケール画像**（論文では C=1）です。
+
+XFeat は 1 枚の画像から、次の 3 つを出します。
+
+1. **Keypoint heatmap（キーポイントのヒートマップ）** `K`
+2. **Dense descriptor map（密な特徴ベクトル）** `F`（解像度 1/8、チャネル 64）
+3. **Reliability map（マッチしやすさ＝信頼度）** `R`（解像度 1/8）
+
+これにより、
+
+- **Sparse matching（XFeat）**: `K` 上位のキーポイントだけを使ってマッチング
+- **Semi-dense matching（XFeat\*）**: `R` 上位の領域（最大 10,000 など）を使ってマッチングし、後段でピクセル精錬
+
+を同一バックボーンで切り替えできます。
+
+### 図：処理フロー（概略）
+
+```mermaid
+flowchart TB
+  I[入力画像 I (gray)] --> BB[Featherweight Backbone\n(早期Downsample + 後段で深く)]
+  BB --> F[Descriptor Head\nDense descriptor map F (H/8×W/8×64)]
+  BB --> R[Reliability Head\nR (H/8×W/8)]
+  I --> KP[Keypoint Head\n8×8ブロック畳み替え + 1×1Conv]
+  KP --> K[Keypoint heatmap K]
+  F -->|NN matching| M[粗い対応（coarse matches）]
+  M -->|必要なら| REF[Match Refinement (MLP)\n8×8オフセット分類]
+  REF --> PM[ピクセル精度の対応]
+  K -->|上位抽出| SP[キーポイント集合]
+  SP -->|MNN| SM[スパース対応]
+```
+
+---
+
+## 4. 主要アイデア(1)：Featherweight Backbone（計算を支配する「高解像度 × チャンネル」をどう抑えるか）
+
+### 4.1 CNN の計算量の支配項
+
+論文はまず、畳み込みの FLOPs を次で近似します（バイアス無し、stride=1、k×k カーネル）：
+
+```tex
+F_{ops} \approx H_i \cdot W_i \cdot C_i \cdot C_{i+1} \cdot k^2
+```
+
+ここで支配的なのは **H_i×W_i（解像度）**。つまり「高解像度の層に大きいチャンネル数を置く」のが最悪、という整理です。
+
+### 4.2 典型設計（VGG 的：解像度が半分になるたびにチャンネルが 2 倍）を再検討
+
+一般的な設計は、
+
+- 早い層: 解像度が大きい（H×W が大）
+- 後ろの層: 解像度が小さい（H×W が小）
+
+にもかかわらず、チャンネルを“均等に”削る、あるいは “2 倍ルール”のままにすると、
+**序盤の計算量が支配的で重い**ままになりやすい。
+
+### 4.3 XFeat の設計：序盤は極細、後段で一気に厚く
+
+XFeat は、
+
+- 初期チャンネル **C=4** から開始（かなり細い）
+- 解像度が下がるたびに **チャンネルを 3 倍ペースで増やす**
+- 最終的に **C=128** を確保（local feature の一般的な規模）
+
+という再配分を行います。
+
+論文の例（6 ブロック）ではチャンネル系列は：
+
+> `{4, 8, 24, 64, 64, 128}`、最終解像度は `H/32 × W/32`
+
+#### 図：チャンネル分配のイメージ
+
+```text
+高解像度（計算が重い）                     低解像度（計算が軽い）
+H×W      H/2×W/2    H/4×W/4   H/8×W/8   H/16×W/16  H/32×W/32
+  C=4  →   C=8   →    C=24 →   C=64  →    C=64  →   C=128
+  ↑序盤は極細でFLOPsを抑える                   ↑後ろで表現力を回復
+```
+
+### 4.4 depthwise separable conv を“使わない”理由
+
+MobileNet 等の depthwise separable conv は理論的に FLOPs を大きく下げますが、
+論文は「local feature extraction のように **浅いネット＋高解像度**で使う場合は、
+表現力が落ちやすく、速度改善も限定的になりやすい」と主張しています。
+
+（分類/検出のように入力解像度がより低い前提と相性が良い、という整理。）
+
+---
+
+## 5. 主要アイデア(2)：Descriptor Head（マルチスケール融合＋信頼度マップ）
+
+XFeat は **1/8 解像度の密な descriptor map**を作ります：
+
+- `F ∈ R^{H/8 × W/8 × 64}`
+
+### 5.1 Feature Pyramid 的に受容野を稼ぐ
+
+小さいバックボーンは受容野が足りず、視点変化に弱くなりがちです。そこで、
+
+- encoder を `1/32` まで下げる（受容野を拡大）
+- その中間表現を `{1/8, 1/16, 1/32}` の 3 スケールで取り出す
+- すべてを `H/8×W/8×64` に射影して足し合わせる（element-wise sum）
+
+という、軽量な FPN 的融合を入れています。
+
+### 5.2 Reliability map R（「この特徴はマッチできそう？」の事前確率）
+
+さらに `R ∈ R^{H/8 × W/8}` を推定します。
+
+- 直感：テクスチャが乏しい・繰り返し模様・ブレ等の領域は誤対応が起きやすい
+- `R` があると、semi-dense で「上位 K 箇所だけ」抽出でき、計算量を制御しやすい
+
+---
+
+## 6. 主要アイデア(3)：Keypoint Head（入力を 8×8 ブロックに畳み替えて 1×1 Conv で高速検出）
+
+SuperPoint は `1/8` 解像度の特徴から「8×8 セル内のどこがキーポイントか」を分類します。
+XFeat もこの考え方を踏襲しますが、**決定的に違う**のは：
+
+> descriptor の学習と keypoint 検出を同じバックボーンに“押し込まない”
+
+つまり **並列ブランチ**を立てます。
+
+### 6.1 なぜ分離する？（小さい CNN では“共存”が難しい）
+
+論文のアブレーションでは、
+
+- コンパクトな CNN で keypoint と descriptor を 1 本のバックボーンで両立させようとすると、
+- semi-dense の性能が落ちやすい
+
+と報告されています。
+
+理由の直感：
+
+- descriptor 側は視点・照明に強くなるために、ある程度抽象度の高い表現が欲しい
+- keypoint 側はコーナー/線分/ブロブなど低レベル構造に敏感であるべき
+- 小型ネットだと表現容量が不足し、相互に“取り合い”になりやすい
+
+### 6.2 8×8 ブロック畳み替え（Unfold）
+
+XFeat の keypoint head は入力を **8×8 ピクセルごとのブロックに分け**、
+各ブロックを **64 次元のベクトル**として扱います。
+
+- ブロック数: `H/8 × W/8`
+- ブロック内の位置（8×8=64 通り）を分類
+- さらに「キーポイント無し」を表す **dustbin** を加えて 65 クラス分類
+
+この表現だと、空間の粒度（8×8 内のどこか）を保持したまま、
+**1×1 Conv（=チャネル混合だけ）**で高速に推論できます。
+
+### 6.3 学習は蒸留（teacher の keypoints を模倣）
+
+keypoint supervision は自前で設計したロスではなく、
+**ALIKE（tiny backbone）のキーポイント**を teacher として蒸留します。
+
+狙い：ALIKE-Tiny のキーポイントは低レベル構造に寄りやすく、
+8×8 の小受容野の detector branch と相性が良い、という判断です。
+
+---
+
+## 7. 主要アイデア(4)：Semi-dense matching と Match Refinement（粗い特徴からピクセルオフセットを復元）
+
+### 7.1 Semi-dense とは？
+
+“dense matching”のように全画素を扱うと重いが、
+
+- `R` 上位の特徴だけを取れば、
+- ある程度密な拘束（特に低テクスチャ環境）を得られる
+
+という立ち位置です。
+
+XFeat\* は、
+
+- 画像を 2 スケール（0.65 と 1.3）で処理して頑健性を増やし
+- `R` に基づき最大 10,000 個の特徴を保持
+- MNN（Mutual Nearest Neighbor）で粗マッチング
+
+を行います。
+
+### 7.2 Match Refinement：coarse match から 8×8 オフセット分類
+
+descriptor map `F` は 1/8 解像度です。
+このままだとピクセル精度の対応になりません。
+
+そこで、対応した特徴ベクトル対 `(f_a, f_b)` から、
+
+- 元解像度での「8×8（=64 通り）のどのオフセットにあるか」を分類
+
+します。
+
+論文の式の直感（argmax で最尤オフセットを取る）：
+
+```tex
+(x,y) = \arg\max_{i\in\{1..8\}, j\in\{1..8\}} o(i,j)
+```
+
+ここで `o ∈ R^{8×8}` は MLP が出す logits です。
+
+#### 図：Match Refinement モジュール（概略）
+
+```mermaid
+flowchart LR
+  A[画像1の特徴 f_a (64D)] --> C[concat]
+  B[画像2の特徴 f_b (64D)] --> C
+  C --> MLP[軽量MLP]
+  MLP --> O[logits o (8×8)]
+  O --> P[最尤オフセット\n(Δx, Δy)]
+```
+
+重要なのは、LoFTR/ASpanFormer のように「高解像度の特徴マップ同士の巨大な相関」を計算せず、
+**“対応した特徴ペアだけ”** を入力にして精錬する点です。
+
+その結果、
+
+- メモリと計算が非常に軽い
+- 精錬は NN 検索の後に行うので、パイプラインに入れやすい
+
+という利点を得ます。
+
+---
+
+## 8. 学習：損失設計（dual-softmax・信頼度・オフセット・蒸留）
+
+XFeat は **ピクセルレベル GT 対応**（Megadepth の深度などから作る）を用いて supervised に学習します。
+
+### 8.1 Descriptor 学習（dual-softmax NLL）
+
+対応する `N` 個の点について、descriptor 行列 `F1, F2 ∈ R^{N×64}` を作り、
+類似度行列 `S = F1 · F2^T` を計算します。
+
+対応の対称性（1→2 / 2→1）を考慮して dual-softmax の NLL を使います。
+
+### 8.2 Reliability 学習（dual-softmax の確信度をターゲットに L1）
+
+dual-softmax の最大確率を「その点はマッチしやすいか」の proxy とみなし、
+学習した `R` がそれに一致するよう L1 を取ります。
+
+ここで重要な実装上の注意として、論文は
+
+> reliability loss では `R` のみに勾配を流す（descriptor 側には流さない）
+
+としています。
+
+### 8.3 Match Refinement 学習（8×8 分類 NLL）
+
+GT のピクセル座標差から `(x̄, ȳ)` を作り、8×8 分類の NLL を使って学習します。
+
+### 8.4 Keypoint 学習（蒸留 NLL）
+
+teacher（ALIKE-Tiny）のキーポイントを 8×8 セル内 index に落とし込み、
+65 クラス（64 + dustbin）として NLL を取ります。
+
+### 8.5 総合損失
+
+```tex
+L = \alpha L_{ds} + \beta L_{rel} + \gamma L_{fine} + \delta L_{kp}
+```
+
+---
+
+## 9. 実験：相対姿勢推定 / ホモグラフィ / 画像ローカライゼーション
+
+### 9.1 学習設定（論文の要点）
+
+- 実装: PyTorch
+- 学習データ: Megadepth + COCO の synthetic warp を 6:4 で混合
+- 画像サイズ: 800×600
+- Optimizer: Adam
+- RTX 4090 で約 36 時間で収束（メモリ 6.5GB 程度）
+
+「小型ネットはデータセットにバイアスが乗りやすい」ため、
+COCO の synthetic warp を混ぜる hybrid training が汎化に効いた、というのが重要な知見です。
+
+### 9.2 推論設定（XFeat と XFeat\*）
+
+- **XFeat（sparse）**: 最大 4,096 keypoints を抽出。スコアは `score = K_{i,j} · R_{i,j}`。descriptor は `F` から bicubic 補間。MNN でマッチ。
+- **XFeat\*（semi-dense）**: 2 スケールで処理し、`R` 上位 10,000 を保持。MNN の後に refinement を実行。refinement の確信度が 0.2 以上のマッチのみ残す。
+
+---
+
+### 9.3 相対姿勢推定（Megadepth-1500）
+
+RANSAC: LO-RANSAC、指標は AUC@{5°,10°,20°}、Acc@10°、MIR、inlier 数、FPS（CPU）等。
+
+#### 表 1：Megadepth-1500（論文 Table 1 を整理）
+
+| Method                   | AUC@5° | AUC@10° | AUC@20° | Acc@10° |  MIR | #inliers |   dim | FPS (VGA, CPU) |
+| ------------------------ | -----: | ------: | ------: | ------: | ---: | -------: | ----: | -------------: |
+| SiLK                     |   14.7 |    21.5 |    29.3 |    31.9 | 0.17 |      235 |  32-f |            2.8 |
+| SiLK\* (10k)             |   16.2 |    23.2 |    31.8 |    34.7 | 0.14 |      478 |  32-f |            2.9 |
+| SuperPoint               |   37.3 |    50.1 |    61.5 |    67.4 | 0.35 |      495 | 256-f |            3.0 |
+| DISK                     |   53.8 |    65.9 |    75.0 |    81.3 | 0.72 |     1231 | 128-f |            1.2 |
+| DISK\* (10k)             |   55.2 |    66.8 |    75.3 |    81.3 | 0.71 |     1997 | 128-f |            1.2 |
+| ORB                      |   17.9 |    27.6 |    39.0 |    43.1 | 0.25 |      288 | 256-b |           44.3 |
+| ZippyPoint               |   23.6 |    34.9 |    46.3 |    51.8 | 0.23 |      192 | 256-b |            1.8 |
+| ALIKE                    |   49.4 |    61.8 |    71.4 |    77.7 | 0.47 |      333 |  64-f |            5.3 |
+| **XFeat**                |   42.6 |    56.4 |    67.7 |    74.9 | 0.55 |      892 |  64-f |       **27.1** |
+| **XFeat\*** (semi-dense) |   50.2 |    65.4 |    77.1 |    85.1 | 0.74 |     1885 |  64-f |       **19.2** |
+
+解釈（論文の主張を噛み砕く）：
+
+- XFeat は **ALIKE より最大 5 倍程度高速**、SuperPoint より **9 倍**近い速度向上を報告。
+- XFeat\* は semi-dense で **DISK\*** と同じ 10k 特徴の条件でも、AUC@20°, Acc@10°, MIR で競争力がある。
+- descriptor 次元が 64 と小さく、マッチングコストも抑えやすい。
+
+### 9.4 相対姿勢推定（ScanNet-1500）
+
+屋内シーン（低テクスチャ、繰り返し構造）での汎化を見る実験。
+
+#### 表 2：ScanNet-1500（論文 Table 2 を整理）
+
+| AUC  | SuperPoint | DISK (4k / 10k) |  ORB | ALIKE | XFeat / XFeat\* |
+| ---- | ---------: | --------------: | ---: | ----: | --------------: |
+| @5°  |       12.5 |      9.6 / 11.3 |  9.0 |   8.0 | **16.7 / 18.4** |
+| @10° |       24.4 |     19.3 / 22.3 | 18.5 |  16.4 | **32.6 / 34.7** |
+| @20° |       36.7 |     30.4 / 33.9 | 29.9 |  25.9 | **47.8 / 50.3** |
+
+解釈：
+
+- DISK/ALIKE は屋外ランドマーク寄りデータへのバイアスが出やすいのに対し、
+- XFeat は hybrid training（COCO warp）が効き、屋内に強い傾向を示す、という議論です。
+
+---
+
+### 9.5 ホモグラフィ推定（HPatches）
+
+MAGSAC++ でホモグラフィを推定し、角の誤差が {3,5,7} ピクセル以内に収まる割合（MHA）を評価。
+
+#### 表 3：HPatches（論文 Table 3 を整理）
+
+| Method     | Illumination MHA@3 |   @5 |   @7 | Viewpoint MHA@3 |       @5 |       @7 |
+| ---------- | -----------------: | ---: | ---: | --------------: | -------: | -------: |
+| SiLK       |               78.5 | 82.3 | 83.8 |            48.6 |     59.6 |     62.5 |
+| SuperPoint |               94.6 | 98.5 | 98.8 |            71.1 |     79.6 |     83.9 |
+| DISK       |               94.6 | 98.8 | 99.6 |            66.4 |     77.5 |     81.8 |
+| ORB        |               74.6 | 84.6 | 85.4 |            63.2 |     71.4 |     78.6 |
+| ZippyPoint |               94.2 | 96.9 | 98.5 |            66.1 |     76.8 |     80.7 |
+| ALIKE      |               94.6 | 98.5 | 99.6 |            68.2 |     77.5 |     81.4 |
+| **XFeat**  |           **95.0** | 98.1 | 98.8 |            68.6 | **81.1** | **86.1** |
+
+解釈：
+
+- RANSAC が効くので多くの手法はそこそこ良いが、
+- ORB/SiLK は illumination/viewpoint の難しい分割で崩れやすい。
+- XFeat は軽量ながら高い MHA を維持。
+
+---
+
+### 9.6 Visual Localization（Aachen day-night）
+
+HLoc パイプラインで day と night のクエリをローカライズ。
+評価は位置誤差 {0.25m, 0.5m, 5m} と角度誤差 {2°,5°,10°} の閾値内の割合。
+
+#### 表 4：Aachen（論文 Table 4 を整理）
+
+| Method     | Day: 0.25m,2° | 0.5m,5° | 5m,10° | Night: 0.25m,2° |  0.5m,5° | 5m,10° |
+| ---------- | ------------: | ------: | -----: | --------------: | -------: | -----: |
+| SuperPoint |          87.4 |    93.2 |   97.0 |            77.6 |     85.7 |   95.9 |
+| DISK       |          86.9 |    95.1 |   97.8 |            83.7 |     89.8 |   99.0 |
+| ORB        |          66.9 |    76.1 |   81.7 |            10.2 |     12.2 |   19.4 |
+| ZippyPoint |          80.7 |    88.6 |   93.7 |            61.2 |     70.4 |   79.6 |
+| ALIKE      |          85.7 |    92.4 |   96.7 |            81.6 |     88.8 |   99.0 |
+| **XFeat**  |          84.7 |    91.5 |   96.5 |            77.6 | **89.8** |   98.0 |
+
+解釈：
+
+- DISK や SuperPoint と同等クラスの精度を維持しつつ、
+- XFeat はより高速・低次元で運用できる（特に CPU / リソース制約環境で有利）
+
+---
+
+## 10. アブレーション：どの設計が効いているか
+
+Megadepth-1500 での AUC@5° を中心に検証。
+
+#### 表 5：Ablation（論文 Table 5 を整理）
+
+| Strategy                                           | XFeat AUC@5° | XFeat\* AUC@5° |
+| -------------------------------------------------- | -----------: | -------------: |
+| Default                                            |         42.6 |           50.2 |
+| (i) No synthetic data                              |         41.5 |           33.9 |
+| (ii) Smaller model（後段チャンネル削減）           |         37.4 |           40.7 |
+| (iii) Joint keypoint extraction（分離せず 1 本化） |         42.9 |           39.7 |
+| (iv) No match refinement                           |            - |           38.6 |
+
+読み取り：
+
+- (i) 合成ワープ無しだと特に XFeat\* が大きく悪化 → **hybrid training が semi-dense に効く**
+- (ii) さらに小さくすると両方悪化 → 表現力の下限がある
+- (iii) keypoint を descriptor 側に押し込むと XFeat\* が悪化 → **分離設計が semi-dense を救う**
+- (iv) refinement を外すと XFeat\* が大きく悪化 → **軽量 refinement が肝**
+
+---
+
+## 11. まとめ：XFeat の価値と使いどころ
+
+XFeat の価値は「軽い」だけではなく、
+
+1. **高解像度を保ったまま高速**（CPU でも実用的な FPS を出しやすい）
+2. **スパースにも semi-dense にも対応**（同一バックボーンで用途に応じて切替可能）
+3. **高解像度の巨大コストボリュームを作らずに** coarse-to-fine を実現（refinement が軽い）
+
+にあります。
+
+### どんな場面に向く？
+
+- GPU がない/弱い環境でのローカライゼーションや SLAM
+- AR/ロボットで「他の処理も動かすので、特徴抽出に計算を使い切れない」ケース
+- 既存の MNN マッチングベースのパイプラインを崩さずに、速度を上げたいケース
+
+### 逆に、限界は？（論文の含意）
+
+- transformer matcher のような「極端に難しい wide-baseline / 曖昧な対応」では、
+  そもそもの枠組み上、限界があり得る（論文でも learned matcher との補完関係に言及）。
+- XFeat\* は refinement がペア入力を必要とする（ただし特徴自体は画像単体でキャッシュ可能）。
+
+---
+
+## 参考：learned matcher との比較（補足：論文 Supplement Table 6）
+
+XFeat\* は「learned matcher」と違い、
+
+- マッチング自体は従来型（NN 検索）
+- 学習するのは descriptor と軽量 refinement
+
+という位置づけです。
+
+#### 表 6：Matchers 比較（Megadepth-1500、論文補足の要点）
+
+| Method      | Type            | AUC@5° | @10° | @20° | Acc@10° |  MIR | #inliers | PPS（CPU, 1200px） |
+| ----------- | --------------- | -----: | ---: | ---: | ------: | ---: | -------: | -----------------: |
+| LoFTR       | learned matcher |   68.3 | 80.0 | 88.0 |    93.9 | 0.93 |     3009 |               0.06 |
+| LightGlue   | learned matcher |   61.4 | 75.0 | 84.8 |    91.8 | 0.92 |      475 |               0.31 |
+| Patch2Pix   | coarse-fine     |   47.8 | 61.0 | 71.0 |    77.8 | 0.59 |      536 |               0.05 |
+| **XFeat\*** | coarse-fine     |   50.2 | 65.4 | 77.1 |    85.1 | 0.74 |     1885 |           **1.33** |
+
+解釈：
+
+- LoFTR/LightGlue は精度は高いが CPU では非常に遅い（PPS が低い）
+- XFeat\* は精度を取りつつ、**CPU で実用になるスループット**を狙った設計
+
+```
+
+@/src/APA/test_recovery_paper.py
+```
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""test_recovery_paper.py
+
+目的
+----
+フォームA/Bのテンプレ（正解）画像を基準にして、
+
+- テンプレから自動生成した改悪画像（回転/射影/背景合成など）
+
+を XFeat matching で位置合わせ（Homography 推定）できるかを評価する。
+
+重要な方針（ユーザー指示）
+--------------------------
+- bad/ は無視（改悪はテンプレから生成）
+- 品質改善（2値化/影補正など）は実装しない
+- XFeat matching による Homography 性能を見たい
+
+使い方（例）
+------------
+静止画像（テンプレ→改悪生成→評価）:
+
+  python APA/test_recovery_paper.py --mode images --form A
+  python APA/test_recovery_paper.py --mode images --form B
+
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import time
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+import cv2
+import numpy as np
+
+# XFeat deps
+import torch
+
+
+# ------------------------------------------------------------
+# Windows environment: keep stdout UTF-8 friendly
+# ------------------------------------------------------------
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+
+# ------------------------------------------------------------
+# Utilities
+# ------------------------------------------------------------
+
+
+def ensure_portable_git_on_path() -> None:
+    """torch.hub may try to call git; this PC uses portable Git not on PATH."""
+
+    portable_git_bin = r"C:\Users\takumi\develop\git\bin"
+    if os.path.exists(portable_git_bin):
+        os.environ["PATH"] = portable_git_bin + os.pathsep + os.environ.get("PATH", "")
+
+
+def now_run_id() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def mkdir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def to_uint8(img: np.ndarray) -> np.ndarray:
+    if img.dtype == np.uint8:
+        return img
+    img = np.clip(img, 0, 255)
+    return img.astype(np.uint8)
+
+
+def order_quad_tl_tr_br_bl(pts: np.ndarray) -> np.ndarray:
+    """Order 4 points to TL/TR/BR/BL."""
+
+    pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1).reshape(-1)
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    tr = pts[np.argmin(diff)]
+    bl = pts[np.argmax(diff)]
+    return np.stack([tl, tr, br, bl], axis=0)
+
+
+# ------------------------------------------------------------
+# Synthetic degradation generation
+# ------------------------------------------------------------
+
+
+def random_background(h: int, w: int, rng: random.Random) -> np.ndarray:
+    """Generate a simple random background (noise + gradients)."""
+
+    bg = np.zeros((h, w, 3), dtype=np.uint8)
+
+    # base color
+    base = np.array([rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255)], dtype=np.uint8)
+    bg[:, :] = base
+
+    # gradient overlay
+    gx = np.linspace(0, 1, w, dtype=np.float32)
+    gy = np.linspace(0, 1, h, dtype=np.float32)
+    g = (np.outer(gy, gx) * 255.0).astype(np.float32)
+    g3 = np.stack([g, g, g], axis=-1)
+    bg = to_uint8(0.6 * bg.astype(np.float32) + 0.4 * g3)
+
+    # noise (milder)
+    n = np.zeros((h, w, 3), dtype=np.float32)
+    n[:, :, 0] = np.random.normal(0, 8, size=(h, w))
+    n[:, :, 1] = np.random.normal(0, 8, size=(h, w))
+    n[:, :, 2] = np.random.normal(0, 8, size=(h, w))
+    bg = to_uint8(bg.astype(np.float32) + n)
+
+    # random lines (milder)
+    for _ in range(rng.randint(3, 10)):
+        x1, y1 = rng.randint(0, w - 1), rng.randint(0, h - 1)
+        x2, y2 = rng.randint(0, w - 1), rng.randint(0, h - 1)
+        color = (rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255))
+        cv2.line(bg, (x1, y1), (x2, y2), color, rng.randint(1, 2), lineType=cv2.LINE_AA)
+
+    return bg
+
+
+def warp_template_to_random_view(
+    template_bgr: np.ndarray,
+    out_size: tuple[int, int],
+    rng: random.Random,
+    max_rotation_deg: float = 12.0,
+    min_abs_rotation_deg: float = 0.0,
+    rotation_mode: str = "uniform",
+    snap_step_deg: float = 90.0,
+    perspective_jitter: float = 0.08,
+    min_visible_area_ratio: float = 0.25,
+    max_attempts: int = 50,
+    save_steps_dir: Optional[Path] = None,
+    step_prefix: str = "",
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Create a degraded image by warping template into a random quadrilateral on a random background.
+
+    Returns:
+        degraded_bgr, H_ref_to_deg
+    """
+
+    h, w = template_bgr.shape[:2]
+    out_w, out_h = out_size
+
+    # IMPORTANT:
+    # 以前は、回転後に頂点を単純クリップしていたため、
+    #   - 紙が画面外に逃げる
+    #   - 紙が極端に小さくなる
+    #   - マスクがほぼ0（紙が写っていない）
+    # のケースが出ていた。
+    #
+    # ここでは「紙が必ず画面内に十分写る」まで再生成する。
+
+    margin = int(min(out_w, out_h) * 0.08)
+    base_w_min = int(out_w * 0.70)
+    base_w_max = int(out_w * 0.92)
+    min_visible_area_px = int(out_w * out_h * float(min_visible_area_ratio))
+
+    dst_quad = None
+    base_w = 0
+    base_h = 0
+    angle = 0.0
+    for _attempt in range(max_attempts):
+        # destination quad center
+        cx = rng.randint(margin, out_w - margin)
+        cy = rng.randint(margin, out_h - margin)
+
+        # Make the paper occupy larger area so that it keeps enough resolution.
+        base_w = rng.randint(base_w_min, base_w_max)
+        base_h = int(base_w * (h / w))
+        base_h = max(120, min(base_h, int(out_h * 0.85)))
+
+        # start from axis-aligned rectangle
+        x1, y1 = cx - base_w // 2, cy - base_h // 2
+        x2, y2 = cx + base_w // 2, cy + base_h // 2
+        rect = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+
+        # rotation
+        # rotation_mode:
+        #   - uniform: 0〜360一様（max_rotation_deg>=180時） or [-max_rot, +max_rot]
+        #   - snap:   snap_step_deg刻み（デフォルト90度）にスナップして「上下逆/横向き」を確実に作る
+        if max_rotation_deg >= 180:
+            if rotation_mode == "snap":
+                step = float(max(1.0, snap_step_deg))
+                # 0, step, 2*step, ... の候補からランダム（0度近傍は min_abs_rotation_deg で除外）
+                candidates = [i * step for i in range(int(round(360.0 / step)))]
+                rng.shuffle(candidates)
+                angle = 0.0
+                for cand in candidates:
+                    dist0 = min(cand % 360.0, 360.0 - (cand % 360.0))
+                    if dist0 >= float(min_abs_rotation_deg):
+                        angle = float(cand % 360.0)
+                        break
+            else:
+                for _ in range(100):
+                    angle = rng.uniform(0.0, 360.0)
+                    dist0 = min(angle, 360.0 - angle)
+                    if dist0 >= float(min_abs_rotation_deg):
+                        break
+                else:
+                    angle = rng.uniform(0.0, 360.0)
+        else:
+            angle = rng.uniform(-max_rotation_deg, max_rotation_deg)
+
+        M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+        rect_rot = cv2.transform(rect.reshape(-1, 1, 2), M).reshape(4, 2)
+
+        # perspective jitter
+        jitter = perspective_jitter * min(base_w, base_h)
+        rect_rot += np.array(
+            [[rng.uniform(-jitter, jitter), rng.uniform(-jitter, jitter)] for _ in range(4)],
+            dtype=np.float32,
+        )
+
+        # --- Keep the quad inside the output by scaling (not clipping) ---
+        # Clipping can collapse the quad and effectively remove the paper.
+        # Instead, if some corners go out of bounds, scale the quad towards the center.
+        inset = 2.0
+        dx = rect_rot[:, 0] - cx
+        dy = rect_rot[:, 1] - cy
+        max_dx = float(np.max(np.abs(dx))) if len(dx) else 0.0
+        max_dy = float(np.max(np.abs(dy))) if len(dy) else 0.0
+        allow_x = float(min(cx, (out_w - 1) - cx)) - inset
+        allow_y = float(min(cy, (out_h - 1) - cy)) - inset
+        if allow_x <= 1 or allow_y <= 1:
+            continue
+
+        sx = allow_x / max_dx if max_dx > 1e-6 else 1.0
+        sy = allow_y / max_dy if max_dy > 1e-6 else 1.0
+        s = float(min(1.0, sx, sy))
+        if s < 1.0:
+            rect_rot = np.stack([cx + dx * s, cy + dy * s], axis=1).astype(np.float32)
+
+        # Accept only if all corners are inside
+        if (
+            (rect_rot[:, 0].min() >= 0)
+            and (rect_rot[:, 1].min() >= 0)
+            and (rect_rot[:, 0].max() <= out_w - 1)
+            and (rect_rot[:, 1].max() <= out_h - 1)
+        ):
+            # IMPORTANT:
+            # ここでは「並べ替え」をしない。
+            # rect は [TL, TR, BR, BL] の順番で生成しており、
+            # 回転・射影後もこの“対応関係”を保ったまま Homography を作るべき。
+            # order_quad_* で画面上のTL/TR/BR/BLに並べ替えると、
+            # 角の対応が崩れて意図した回転（例：QRが下側）が壊れる。
+            cand = rect_rot.astype(np.float32)
+
+            # quick visible-area check by warping a ones mask
+            tmp_mask = cv2.warpPerspective(
+                np.ones((h, w), dtype=np.uint8) * 255,
+                cv2.getPerspectiveTransform(
+                    np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32),
+                    cand,
+                ),
+                (out_w, out_h),
+            )
+            if int(cv2.countNonZero(tmp_mask)) >= min_visible_area_px:
+                dst_quad = cand
+                break
+
+    if dst_quad is None:
+        # 最後の手段: クリップして必ず返す（ただしログ的には不自然になる）
+        rect_rot[:, 0] = np.clip(rect_rot[:, 0], 0, out_w - 1)
+        rect_rot[:, 1] = np.clip(rect_rot[:, 1], 0, out_h - 1)
+        dst_quad = order_quad_tl_tr_br_bl(rect_rot)
+
+    src_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
+    H = cv2.getPerspectiveTransform(src_quad, dst_quad)
+
+    bg = random_background(out_h, out_w, rng)
+    if save_steps_dir is not None:
+        mkdir(save_steps_dir)
+        cv2.imwrite(str(save_steps_dir / f"{step_prefix}01_background.jpg"), bg)
+
+    warped = cv2.warpPerspective(template_bgr, H, (out_w, out_h))
+    if save_steps_dir is not None:
+        cv2.imwrite(str(save_steps_dir / f"{step_prefix}02_warped_template.jpg"), warped)
+
+    # mask for blending
+    mask = cv2.warpPerspective(np.ones((h, w), dtype=np.uint8) * 255, H, (out_w, out_h))
+    if save_steps_dir is not None:
+        cv2.imwrite(str(save_steps_dir / f"{step_prefix}03_mask.jpg"), mask)
+    mask3 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    degraded = np.where(mask3 > 0, warped, bg)
+    if save_steps_dir is not None:
+        cv2.imwrite(str(save_steps_dir / f"{step_prefix}04_composited.jpg"), degraded)
+
+    # add *mild* blur/noise to simulate capturing conditions
+    if rng.random() < 0.35:
+        k = 3
+        degraded = cv2.GaussianBlur(degraded, (k, k), rng.uniform(0.4, 0.8))
+    if rng.random() < 0.35:
+        degraded = to_uint8(degraded.astype(np.float32) + np.random.normal(0, 4, size=degraded.shape))
+
+    if save_steps_dir is not None:
+        cv2.imwrite(str(save_steps_dir / f"{step_prefix}05_final_degraded.jpg"), degraded)
+
+    meta = {
+        "angle_deg": float(angle),
+        "rotation_mode": str(rotation_mode),
+        "snap_step_deg": float(snap_step_deg),
+        "base_w": int(base_w),
+        "base_h": int(base_h),
+        "out_w": int(out_w),
+        "out_h": int(out_h),
+        "perspective_jitter": float(perspective_jitter),
+        "min_visible_area_ratio": float(min_visible_area_ratio),
+        "max_attempts": int(max_attempts),
+    }
+    return degraded, H, meta
+
+
+# ------------------------------------------------------------
+# Form feature detection (for debug/metadata only)
+# ------------------------------------------------------------
+
+
+def detect_qr_codes_multiscale(image_bgr: np.ndarray) -> list[dict[str, Any]]:
+    """フォームB想定: OpenCV QRCodeDetector のマルチスケール検出（test_capture_formB.py を踏襲）。"""
+
+    qr_results: list[dict[str, Any]] = []
+    qr_detector = cv2.QRCodeDetector()
+    height, width = image_bgr.shape[:2]
+
+    scales = [0.5, 0.25, 1.0, 0.125, 0.75]
+    for scale in scales:
+        if scale == 1.0:
+            test_image = image_bgr
+        else:
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            if new_width < 100 or new_height < 100:
+                continue
+            test_image = cv2.resize(image_bgr, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+        try:
+            data, points, _ = qr_detector.detectAndDecode(test_image)
+            if data and points is not None:
+                pts = points[0]
+                if scale != 1.0:
+                    pts = pts / scale
+                pts = pts.astype(np.float32)
+                qr_results.append(
+                    {
+                        "data": data,
+                        "points": pts.tolist(),
+                        "scale": scale,
+                    }
+                )
+                break
+        except Exception:
+            pass
+
+    return qr_results
+
+
+def detect_formA_marker_boxes(image_bgr: np.ndarray) -> list[dict[str, Any]]:
+    """フォームA想定: 3点マークを検出し、各マーカーの角点（矩形4隅 or approx）を返す。
+
+    注: ここでの角点は、まずは安定性優先で bbox の 4隅を採用する。
+        （輪郭近似で4点が取れた場合はそれを利用）
+
+    元実装: APA/test_capture_formA.py
+    """
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = image_bgr.shape[:2]
+
+    # corner regions (15%)
+    corner_margin_x = int(w * 0.15)
+    corner_margin_y = int(h * 0.15)
+    corners = {
+        "top_left": (0, 0, corner_margin_x, corner_margin_y),
+        "top_right": (w - corner_margin_x, 0, w, corner_margin_y),
+        "bottom_left": (0, h - corner_margin_y, corner_margin_x, h),
+        "bottom_right": (w - corner_margin_x, h - corner_margin_y, w, h),
+    }
+
+    # size range
+    min_size = min(w, h) * 0.005
+    max_size = min(w, h) * 0.08
+    min_area = min_size**2
+    max_area = max_size**2
+
+    # binarization trials
+    bin_list: list[tuple[str, np.ndarray]] = []
+    for th in (50, 80, 120):
+        _, b = cv2.threshold(gray, th, 255, cv2.THRESH_BINARY_INV)
+        bin_list.append((f"th_{th}", b))
+    _, b_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    bin_list.append(("otsu", b_otsu))
+
+    found: dict[str, dict[str, Any]] = {}
+    kernel = np.ones((3, 3), np.uint8)
+
+    for method, binary in bin_list:
+        binary_clean = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        binary_clean = cv2.morphologyEx(binary_clean, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(binary_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            x, y, ww, hh = cv2.boundingRect(contour)
+            area_rect = ww * hh
+            area_contour = float(cv2.contourArea(contour))
+            if not (min_area < area_contour < max_area):
+                continue
+            ar = float(ww) / float(hh) if hh else 0.0
+            if not (0.4 < ar < 2.5):
+                continue
+
+            cx, cy = x + ww // 2, y + hh // 2
+            corner_name = None
+            for name, (x1, y1, x2, y2) in corners.items():
+                if x1 <= cx <= x2 and y1 <= cy <= y2:
+                    corner_name = name
+                    break
+            if corner_name not in ("top_left", "top_right", "bottom_left"):
+                continue
+
+            fill_ratio = area_contour / float(area_rect) if area_rect else 0.0
+            if fill_ratio <= 0.4:
+                continue
+
+            mask = np.zeros(gray.shape, dtype=np.uint8)
+            cv2.drawContours(mask, [contour], 0, 255, -1)
+            mean_val = float(cv2.mean(gray, mask=mask)[0])
+            if mean_val >= 180:
+                continue
+
+            eps = 0.05 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, eps, True)
+
+            # score
+            aspect_score = 1.0 - abs(ar - 1.0) * 0.5
+            intensity_score = (180.0 - mean_val) / 180.0
+            score = aspect_score * 0.25 + fill_ratio * 0.35 + intensity_score * 0.4
+
+            # corners
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                pts = approx.reshape(4, 2).astype(np.float32)
+                pts = order_quad_tl_tr_br_bl(pts)
+            else:
+                pts = np.array(
+                    [[x, y], [x + ww - 1, y], [x + ww - 1, y + hh - 1], [x, y + hh - 1]],
+                    dtype=np.float32,
+                )
+
+            info = {
+                "corner": corner_name,
+                "bbox": [int(x), int(y), int(ww), int(hh)],
+                "points": pts.tolist(),
+                "score": float(score),
+                "method": method,
+            }
+
+            if corner_name not in found or score > float(found[corner_name]["score"]):
+                found[corner_name] = info
+
+    # keep TL/TR/BL
+    return [found[k] for k in ("top_left", "top_right", "bottom_left") if k in found]
+
+
+# ------------------------------------------------------------
+# XFeat matching / homography
+# ------------------------------------------------------------
+
+
+@dataclass
+class XFeatHomographyResult:
+    ok: bool
+    ref_kpts: int
+    tgt_kpts: int
+    matches: int
+    inliers: int
+    inlier_ratio: float
+    reproj_rms: Optional[float]
+    H_ref_to_tgt: Optional[list[list[float]]]
+
+
+def resize_keep_aspect(img: np.ndarray, max_side: int) -> tuple[np.ndarray, float]:
+    """Resize so that max(H,W) == max_side (if larger). Returns (resized, scale)."""
+
+    h, w = img.shape[:2]
+    m = max(h, w)
+    if m <= max_side:
+        return img, 1.0
+    s = float(max_side) / float(m)
+    new_w = max(1, int(round(w * s)))
+    new_h = max(1, int(round(h * s)))
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return resized, s
+
+
+def scale_matrix(s: float) -> np.ndarray:
+    return np.array([[s, 0, 0], [0, s, 0], [0, 0, 1]], dtype=np.float64)
+
+
+def compute_reproj_rms(H: np.ndarray, src_pts: np.ndarray, dst_pts: np.ndarray) -> float:
+    """Compute RMS reprojection error on matched points."""
+
+    src = src_pts.reshape(-1, 1, 2).astype(np.float32)
+    dst = dst_pts.reshape(-1, 1, 2).astype(np.float32)
+    proj = cv2.perspectiveTransform(src, H)
+    err = np.linalg.norm(proj - dst, axis=2).reshape(-1)
+    return float(np.sqrt(np.mean(err**2))) if len(err) else float("nan")
+
+
+class XFeatMatcher:
+    def __init__(self, top_k: int = 4096, device: str = "cpu", match_max_side: int = 1200):
+        ensure_portable_git_on_path()
+        self.device = device
+        self.top_k = top_k
+        self.match_max_side = match_max_side
+        self.xfeat = torch.hub.load(
+            "verlab/accelerated_features",
+            "XFeat",
+            pretrained=True,
+            top_k=top_k,
+        ).to(device)
+        self.xfeat.eval()
+
+    def match_and_estimate_h(self, ref_bgr: np.ndarray, tgt_bgr: np.ndarray) -> tuple[XFeatHomographyResult, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        """Return result + (H, mkpts0, mkpts1)"""
+
+        t0 = time.time()
+
+        # Resize for matching stability/speed (then scale H back)
+        ref_small, s_ref = resize_keep_aspect(ref_bgr, self.match_max_side)
+        tgt_small, s_tgt = resize_keep_aspect(tgt_bgr, self.match_max_side)
+
+        out0 = self.xfeat.detectAndCompute(ref_small, top_k=self.top_k)[0]
+        out1 = self.xfeat.detectAndCompute(tgt_small, top_k=self.top_k)[0]
+        # (Upstream requires image_size for some matchers; keep it)
+        out0.update({"image_size": (ref_small.shape[1], ref_small.shape[0])})
+        out1.update({"image_size": (tgt_small.shape[1], tgt_small.shape[0])})
+
+        matches = self.xfeat.match_lighterglue(out0, out1)
+        if isinstance(matches, (list, tuple)) and len(matches) >= 2:
+            mkpts0, mkpts1 = matches[0], matches[1]
+        elif isinstance(matches, dict) and "mkpts0" in matches and "mkpts1" in matches:
+            mkpts0, mkpts1 = matches["mkpts0"], matches["mkpts1"]
+        else:
+            return (
+                XFeatHomographyResult(False, 0, 0, 0, 0, 0.0, None, None),
+                None,
+                None,
+                None,
+            )
+
+        mkpts0 = np.asarray(mkpts0, dtype=np.float32)
+        mkpts1 = np.asarray(mkpts1, dtype=np.float32)
+
+        # These points are in "small" coordinate system.
+        ref_kpts = int(len(out0.get("keypoints", [])) or 0)
+        tgt_kpts = int(len(out1.get("keypoints", [])) or 0)
+
+        if len(mkpts0) < 4:
+            return (
+                XFeatHomographyResult(False, ref_kpts, tgt_kpts, int(len(mkpts0)), 0, 0.0, None, None),
+                None,
+                mkpts0,
+                mkpts1,
+            )
+
+        H, mask = cv2.findHomography(
+            mkpts0,
+            mkpts1,
+            cv2.USAC_MAGSAC,
+            3.5,
+            maxIters=1_000,
+            confidence=0.999,
+        )
+
+        if H is None or mask is None:
+            return (
+                XFeatHomographyResult(False, ref_kpts, tgt_kpts, int(len(mkpts0)), 0, 0.0, None, None),
+                None,
+                mkpts0,
+                mkpts1,
+            )
+
+        mask = mask.reshape(-1).astype(bool)
+        inliers = int(mask.sum())
+        matches_n = int(len(mask))
+        inlier_ratio = float(inliers) / float(matches_n) if matches_n else 0.0
+
+        reproj = None
+        if inliers >= 4:
+            reproj = compute_reproj_rms(H, mkpts0[mask], mkpts1[mask])
+
+        _ = time.time() - t0
+
+        # scale H back to full resolution: H_full = inv(S_tgt) * H_small * S_ref
+        S_ref = scale_matrix(s_ref)
+        S_tgt = scale_matrix(s_tgt)
+        H_full = np.linalg.inv(S_tgt) @ H @ S_ref
+
+        return (
+            XFeatHomographyResult(
+                ok=True,
+                ref_kpts=ref_kpts,
+                tgt_kpts=tgt_kpts,
+                matches=matches_n,
+                inliers=inliers,
+                inlier_ratio=inlier_ratio,
+                reproj_rms=reproj,
+                H_ref_to_tgt=H_full.astype(float).tolist(),
+            ),
+            H_full,
+            mkpts0,
+            mkpts1,
+        )
+
+
+# ------------------------------------------------------------
+# Visualization
+# ------------------------------------------------------------
+
+
+def draw_inlier_matches(
+    ref_bgr: np.ndarray,
+    tgt_bgr: np.ndarray,
+    mkpts0: np.ndarray,
+    mkpts1: np.ndarray,
+    match_max_side: int,
+) -> np.ndarray:
+    """Draw projected ref corners on tgt + inlier matches."""
+
+    # NOTE:
+    # mkpts0/mkpts1 are in the "matching" coordinate system (resized images).
+    # For visualization to look correct, we must draw on the SAME resized images.
+    # This prevents the left/right size mismatch and “not matching” appearance.
+
+    ref_vis, _ = resize_keep_aspect(ref_bgr, match_max_side)
+    tgt_vis, _ = resize_keep_aspect(tgt_bgr, match_max_side)
+
+    Hm, mask = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 3.5)
+    if Hm is None or mask is None:
+        return tgt_vis
+    mask = mask.reshape(-1).astype(bool)
+
+    h, w = ref_vis.shape[:2]
+    corners = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32).reshape(-1, 1, 2)
+    warped = cv2.perspectiveTransform(corners, Hm)
+
+    tgt2 = tgt_vis.copy()
+    for i in range(len(warped)):
+        p1 = tuple(warped[i - 1][0].astype(int))
+        p2 = tuple(warped[i][0].astype(int))
+        cv2.line(tgt2, p1, p2, (0, 255, 0), 4)
+
+    k0 = [cv2.KeyPoint(float(p[0]), float(p[1]), 5) for p in mkpts0]
+    k1 = [cv2.KeyPoint(float(p[0]), float(p[1]), 5) for p in mkpts1]
+    matches = [cv2.DMatch(i, i, 0) for i, m in enumerate(mask) if m]
+    canvas = cv2.drawMatches(ref_vis, k0, tgt2, k1, matches, None, matchColor=(0, 255, 0), flags=2)
+    return canvas
+
+
+# ------------------------------------------------------------
+# Image mode
+# ------------------------------------------------------------
+
+
+def load_templates(form: str) -> list[Path]:
+    base = Path(__file__).resolve().parent / "image" / form
+    paths = []
+    for i in range(1, 7):
+        p = base / f"{i}.jpg"
+        if p.exists():
+            paths.append(p)
+    return paths
+
+
+def run_images_mode(args: argparse.Namespace) -> int:
+    out_root = mkdir(Path(args.out) / f"run_{now_run_id()}_{args.form}_images")
+    debug_dir = mkdir(out_root / "debug")
+    warped_dir = mkdir(out_root / "warped")
+    degraded_dir = mkdir(out_root / "degraded")
+    steps_root = mkdir(out_root / "degrade_steps") if args.save_degrade_steps else None
+
+    # reproducibility
+    rng = random.Random(args.seed)
+    np.random.seed(args.seed)
+
+    templates = load_templates(args.form)
+    if not templates:
+        print(f"[ERROR] templates not found: APA/image/{args.form}/*.jpg")
+        return 1
+
+    if args.only_template is not None:
+        templates = [p for p in templates if p.stem == str(args.only_template)]
+        if not templates:
+            print(f"[ERROR] only_template={args.only_template} not found.")
+            return 1
+
+    device = "cuda" if args.device == "auto" and torch.cuda.is_available() else (args.device if args.device != "auto" else "cpu")
+    matcher = XFeatMatcher(top_k=args.top_k, device=device, match_max_side=args.match_max_side)
+
+    summary: list[dict[str, Any]] = []
+
+    for tp in templates:
+        template_bgr = cv2.imread(str(tp))
+        if template_bgr is None:
+            print(f"[WARN] failed to read: {tp}")
+            continue
+
+        template_features: dict[str, Any] = {}
+        if args.detect_features:
+            if args.form == "A":
+                template_features["markers"] = detect_formA_marker_boxes(template_bgr)
+            if args.form == "B":
+                template_features["qrs"] = detect_qr_codes_multiscale(template_bgr)
+
+        # generate N degraded variants
+        for k in range(args.degrade_n):
+            name = f"{tp.stem}_deg{k:02d}"
+            step_dir = (steps_root / name) if steps_root is not None else None
+            degraded_bgr, H_gt, degrade_meta = warp_template_to_random_view(
+                template_bgr,
+                out_size=(args.degrade_w, args.degrade_h),
+                rng=rng,
+                max_rotation_deg=args.max_rot,
+                min_abs_rotation_deg=args.min_abs_rot,
+                rotation_mode=args.rotation_mode,
+                snap_step_deg=args.snap_step_deg,
+                perspective_jitter=args.perspective,
+                min_visible_area_ratio=args.min_visible_area_ratio,
+                max_attempts=args.max_attempts,
+                save_steps_dir=step_dir,
+                step_prefix="",
+            )
+            cv2.imwrite(str(degraded_dir / f"{name}.jpg"), degraded_bgr)
+
+            # Safety check: ensure the paper is actually visible in the degraded image.
+            # (This should already be satisfied by the generator constraints, but keep
+            # a cheap post-check so that we can catch unexpected failures early.)
+            # Use edge density as a lightweight proxy.
+            try:
+                gray_chk = cv2.cvtColor(degraded_bgr, cv2.COLOR_BGR2GRAY)
+                edges_chk = cv2.Canny(gray_chk, 50, 150)
+                edge_ratio = float((edges_chk > 0).mean())
+                if edge_ratio < 0.001:
+                    print(f"[WARN] degraded may not contain enough paper pixels: {name} edge_ratio={edge_ratio:.6f}")
+            except Exception:
+                pass
+
+            res, H, mk0, mk1 = matcher.match_and_estimate_h(template_bgr, degraded_bgr)
+            item: dict[str, Any] = {
+                "template": str(tp),
+                "case": name,
+                "ok": res.ok,
+                "degrade": degrade_meta,
+                "H_gt_ref_to_tgt": H_gt.astype(float).tolist(),
+                **asdict(res),
+            }
+
+            if args.detect_features:
+                item["template_features"] = template_features
+                if args.form == "A":
+                    item["degraded_features"] = {"markers": detect_formA_marker_boxes(degraded_bgr)}
+                if args.form == "B":
+                    item["degraded_features"] = {"qrs": detect_qr_codes_multiscale(degraded_bgr)}
+            summary.append(item)
+
+            if not res.ok or H is None or mk0 is None or mk1 is None:
+                continue
+
+            # warp degraded back to template plane (inverse H)
+            H_inv = np.linalg.inv(H)
+            warped = cv2.warpPerspective(degraded_bgr, H_inv, (template_bgr.shape[1], template_bgr.shape[0]))
+            cv2.imwrite(str(warped_dir / f"{name}_warped.jpg"), warped)
+
+            # debug matches image
+            try:
+                dbg = draw_inlier_matches(
+                    template_bgr,
+                    degraded_bgr,
+                    mk0,
+                    mk1,
+                    args.match_max_side,
+                )
+                cv2.imwrite(str(debug_dir / f"{name}_matches.jpg"), dbg)
+            except Exception:
+                pass
+
+        print(f"[OK] processed template: {tp.name}")
+
+    # save summary
+    with open(out_root / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    # simple csv
+    csv_path = out_root / "summary.csv"
+    header = [
+        "template",
+        "case",
+        "ok",
+        "ref_kpts",
+        "tgt_kpts",
+        "matches",
+        "inliers",
+        "inlier_ratio",
+        "reproj_rms",
+    ]
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write(",".join(header) + "\n")
+        for it in summary:
+            row = [
+                str(it.get("template", "")),
+                str(it.get("case", "")),
+                str(it.get("ok", "")),
+                str(it.get("ref_kpts", "")),
+                str(it.get("tgt_kpts", "")),
+                str(it.get("matches", "")),
+                str(it.get("inliers", "")),
+                str(it.get("inlier_ratio", "")),
+                str(it.get("reproj_rms", "")),
+            ]
+            f.write(",".join(row) + "\n")
+
+    print(f"\n[DONE] outputs: {out_root}")
+    return 0
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["images"], required=True)
+    p.add_argument("--form", choices=["A", "B"], required=True)
+    p.add_argument("--out", type=str, default=str(Path(__file__).resolve().parent / "output_recovery"))
+
+    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    p.add_argument("--top-k", type=int, default=2048)
+    p.add_argument(
+        "--match-max-side",
+        type=int,
+        default=1200,
+        help="XFeat matching 用の最大辺（大きいほど精度↑/速度↓）",
+    )
+    p.add_argument(
+        "--detect-features",
+        action="store_true",
+        help="フォームA(マーカー)/B(QR)の検出も行い、summary.jsonに入れる（Homographyには未使用）",
+    )
+
+    # images mode options
+    p.add_argument("--degrade-n", type=int, default=5)
+    # 改悪画像が小さすぎると現実の撮影条件と乖離するため、デフォルトを少し大きめにする
+    p.add_argument("--degrade-w", type=int, default=2400)
+    p.add_argument("--degrade-h", type=int, default=1800)
+    # Make default degradation milder (user feedback)
+    p.add_argument("--max-rot", type=float, default=12.0)
+    p.add_argument(
+        "--min-abs-rot",
+        type=float,
+        default=0.0,
+        help=(
+            "フル回転モード（--max-rot>=180）時に、0度に近い回転を避けたい場合の下限（度）。"
+            " 例: --max-rot 180 --min-abs-rot 120 とすると、ほぼ上下逆/横向きが必ず混ざる。"
+        ),
+    )
+    p.add_argument("--perspective", type=float, default=0.08)
+
+    p.add_argument(
+        "--rotation-mode",
+        choices=["uniform", "snap"],
+        default="uniform",
+        help=(
+            "回転角の生成方法。uniform=連続一様乱数、snap=角度を一定刻みにスナップ（上下逆/横向きを確実に作る）。"
+        ),
+    )
+    p.add_argument(
+        "--snap-step-deg",
+        type=float,
+        default=90.0,
+        help="rotation-mode=snap のときの刻み角度（度）。例: 90 -> 0/90/180/270",
+    )
+    p.add_argument(
+        "--min-visible-area-ratio",
+        type=float,
+        default=0.25,
+        help="改悪画像内で紙（テンプレ）が占める最小面積比（0〜1）。紙が写っていないケースを防ぐ。",
+    )
+    p.add_argument(
+        "--max-attempts",
+        type=int,
+        default=50,
+        help="紙が十分写る改悪を生成するための最大リトライ回数。",
+    )
+    p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument(
+        "--save-degrade-steps",
+        action="store_true",
+        help="改悪生成の途中経過（背景/ワープ/マスク/合成/最終）を out_root/degrade_steps/<case>/ に保存する",
+    )
+
+    p.add_argument(
+        "--only-template",
+        type=int,
+        default=None,
+        help="デバッグ用：テンプレ番号（1〜6）を指定した場合、その1枚だけ処理する",
+    )
+
+    return p
+
+
+def main() -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    print("=" * 70)
+    print("test_recovery_paper")
+    print("=" * 70)
+    print(f"OpenCV: {cv2.__version__}")
+    print(f"torch: {torch.__version__}")
+    print(f"mode: {args.mode} / form: {args.form}")
+
+    if args.mode == "images":
+        return run_images_mode(args)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+```
+
+上記の技術は以下の要件をクリアしていくための技術やプログラム、先行研究です
+```
+# 改訂版 memo（整理・清書）
+
+目的：
+カメラ映像から紙フォームを検出し、フォーム種別（A/B/その他）を判定したうえで、テンプレートに対して自動補正しリアルタイム表示する。
+
+前提：
+・リアルタイム処理はCPU中心（軽量優先）
+
+--------------------------------------------
+1. 入力（リアルタイム）
+--------------------------------------------
+- カメラからフレームを連続取得
+- 事前にレンズ歪み補正（undistort）を適用（精度・見栄え向上）
+
+
+--------------------------------------------
+2. 検出フェーズ（軽量・頑健）
+--------------------------------------------
+(2-1) 紙検出（優先）
+- 輪郭検出・直線検出などで「紙らしい四角形」を推定
+- 紙候補を得る
+
+(2-2)  紙検出部分からQR / マーカー検出（A or B or etc...）
+- QRコードやマーカーを高速に探索
+- 検出を判定
+
+（理由）
+カメラ全画面からQRやマーカーを認識するのは非常に誤検出のリスクがある
+また、用紙のフォーム別検出に関する豊富なデータや先行研究モデルもないことから、背景込みから特定の模様や特徴を探すのは困難と判断
+しかし、紙の検出であれば先行研究モデルが存在している
+
+
+--------------------------------------------
+3. フォーム種別判定（A/B/その他：ここは追加可能なようにモジュール実装）
+--------------------------------------------
+- フォームA：マーカー（例：正方形マーカー）で識別
+- フォームB：QRコードで識別
+- その他：必要に応じた識別方法（ロゴ等）
+
+※基本方針：
+フォームの変更は絶対に不可
+「識別できた特徴点（QR四隅／マーカー角点など）を、整列用の対応点として使える形で保持する」
+
+
+--------------------------------------------
+4. 補正画像の生成
+--------------------------------------------
+- 1フレームの画像、それに対して
+  - 紙検出時の四角形ボックス
+  - モジュールの抽出された特徴点情報
+が得られるので...
+
+(4-1) 位置合わせ（Homography）
+- フレームで Homography を推定
+  - もしくは「追跡」で更新し、安定なワープを得る
+- テンプレ座標系へ warp（透視変換）した画像を蓄積する
+- 紙のたわみや角度的なずれをここで改善
+
+(4-2) 画像の品質改善
+- ブラー（ピンぼけ/手ブレ）改善
+- ノイズ除去
+- 文字化け改善（2値化等）
+- 影の改善（照明ムラ補正）
+- 汚れ・しみ補正
+etc...
+
+完璧にきれいにする
+
+
+--------------------------------------------
+5. 表示
+--------------------------------------------
+- 補正された画像を標準形式でリアルタイム表示
+- メタ情報も表示（フォームID、スコア、検出成功率、処理時間など）
+
+↓
+
+OCR作業へ（担当外）
+
+```
+
+現在の実装では、解像度が高いとうまくいきますが、解像度が低い場合（カメラ読み取りにするとWebカメラが720p）うまくいきません
+何か方法はありますか？
+CPUベースで動いて軽くて商業利用可能な、解像度問題を解決できそうなライブラリ、研究、技術を調査して下さい
+日本語で解説
