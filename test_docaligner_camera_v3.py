@@ -8,6 +8,8 @@ v2 からの改善点（カメラ周りの汎用化）
 ------------------------------------
 python test_recovery_paper.py --mode images --form A --device cpu --only-template 1 --degrade-n 1 --degrade-w 1200 --degrade-h 900 --match-max-side 900
 
+C:\Users\takumi\develop\miniconda3\python.exe C:\Users\takumi\develop\APA\test_recovery_paper.py --mode images --form A --device cpu
+
 `test_camera.py` と同様に、カメラが複数ある環境（例: Mac内蔵 + iPhone連係カメラ + USBカメラ / Windows + 複数Webカメラ）でも
 「どのカメラを使うか」を起動時に明示できるようにしました。
 
