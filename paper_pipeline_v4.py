@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""paper_pipeline_v3.py
+"""paper_pipeline_v4.py
+
+C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v4.py --degrade-n 3 --template-topn 0
 
 目的
 ----
@@ -60,12 +62,8 @@
 - 日本語ラベル描画は Pillow を使用（OpenCV putText は日本語非対応のため）。
   - `APA_FONT_PATH` を設定すると任意フォントを優先可能
 
-改善点メモ（v3で優先対応）
+改善点メモ
 ----
-- BでQRコード検出ができない事例多数（解像度の低いQRコードが読めていない）
-- CがAと誤判定される事例多数（3つの四角を読み込むロジックが不十分）
-- ログが読みづらい（用紙検出不可でもログに出してほしい、結果不正解か正解かをログにも出力してほしい、1～6の処理のそれぞれの実行時間、1枚行うときの実行時間を表示してほしい）
-- csvをさらにリッチにしてほしい（改悪パラメータの情報、作成したり出力したり読み込む画像の解像度、すべての実行時間、XFeat matchingやDocAlignerからわかるあらゆること、最終的に改悪前の様式と判断したテンプレートがあっているかの正解不正解かどうかなど、後で様式の判断ミスや精度が悪いことや時間がかかりすぎる原因分析をリッチに行えるようにあらゆる項目を記録してほしい。またcsvの項目名は、長くてもいいので誰でもその項目のことがわかるような名前にしてください）
 
 """
 
@@ -93,6 +91,106 @@ import numpy as np
 import torch
 
 from PIL import Image, ImageDraw, ImageFont
+
+
+# ------------------------------------------------------------
+# WeChat QRCode Engine (cv2.wechat_qrcode_WeChatQRCode)
+# ------------------------------------------------------------
+
+
+class WeChatQRDetector:
+    """WeChat QR code detector wrapper.
+
+    Why:
+      OpenCV's default QRCodeDetector sometimes fails on tiny/low-res QR codes.
+      WeChat engine includes a CNN detector + super-resolution model.
+
+    Note:
+      Requires opencv-contrib build and 4 model files.
+      We keep this wrapper small and cache the heavy detector instance.
+    """
+
+    def __init__(self, model_dir: str):
+        self.model_dir = str(model_dir)
+        self.detector = self._init_detector(self.model_dir)
+
+    @staticmethod
+    def _init_detector(model_dir: str) -> Any:
+        if not hasattr(cv2, "wechat_qrcode_WeChatQRCode"):
+            raise RuntimeError(
+                "cv2.wechat_qrcode_WeChatQRCode is not available. "
+                "Install opencv-contrib-python and restart python."
+            )
+
+        detect_proto = os.path.join(model_dir, "detect.prototxt")
+        detect_caffe = os.path.join(model_dir, "detect.caffemodel")
+        sr_proto = os.path.join(model_dir, "sr.prototxt")
+        sr_caffe = os.path.join(model_dir, "sr.caffemodel")
+
+        if not all(map(os.path.exists, [detect_proto, detect_caffe, sr_proto, sr_caffe])):
+            raise FileNotFoundError(
+                "WeChat QR model files not found. Expected: "
+                f"{detect_proto}, {detect_caffe}, {sr_proto}, {sr_caffe}"
+            )
+
+        return cv2.wechat_qrcode_WeChatQRCode(detect_proto, detect_caffe, sr_proto, sr_caffe)
+
+    def detect(self, image_bgr: np.ndarray) -> list[dict[str, Any]]:
+        """Detect and decode QR codes.
+
+        Returns:
+          List of dicts: [{data, points, engine}]
+        """
+
+        if image_bgr is None:
+            return []
+        res, points = self.detector.detectAndDecode(image_bgr)
+
+        out: list[dict[str, Any]] = []
+        if res is None or points is None:
+            return out
+
+        # OpenCV returns tuple/list of strings and a list/np array of points.
+        try:
+            res_list = list(res)
+        except Exception:
+            res_list = [str(res)]
+
+        pts_arr = np.asarray(points, dtype=np.float32)
+        if pts_arr.ndim == 2:
+            pts_arr = pts_arr.reshape(1, -1, 2)
+
+        for i, data in enumerate(res_list):
+            if not data:
+                continue
+            if i >= len(pts_arr):
+                continue
+            pts = pts_arr[i].reshape(-1, 2)
+            out.append({"data": str(data), "points": pts.tolist(), "engine": "wechat"})
+
+        return out
+
+
+_WECHAT_QR: Optional[WeChatQRDetector] = None
+
+
+def init_wechat_qr_detector(model_dir: str, logger: Optional[logging.Logger] = None) -> Optional[WeChatQRDetector]:
+    """Initialize global WeChat QR detector (heavy) once.
+
+    Returns None if unavailable.
+    """
+
+    global _WECHAT_QR
+    try:
+        _WECHAT_QR = WeChatQRDetector(model_dir=model_dir)
+        if logger:
+            logger.info("[OK] WeChat QR detector initialized: %s", model_dir)
+        return _WECHAT_QR
+    except Exception as e:
+        _WECHAT_QR = None
+        if logger:
+            logger.warning("[WARN] WeChat QR detector disabled: %s", e)
+        return None
 
 
 # --- reuse implementations from previous work ---
@@ -776,6 +874,23 @@ def detect_qr_codes_robust(image_bgr: np.ndarray) -> list[dict[str, Any]]:
     return []
 
 
+def detect_qr_codes_wechat(
+    image_bgr: np.ndarray,
+    wechat: Optional[WeChatQRDetector],
+) -> list[dict[str, Any]]:
+    """WeChat engine based detection (best for tiny/low-res QR).
+
+    Returns empty list if detector is not available.
+    """
+
+    if wechat is None:
+        return []
+    try:
+        return wechat.detect(image_bgr)
+    except Exception:
+        return []
+
+
 def detect_qr_codes_fast(image_bgr: np.ndarray) -> list[dict[str, Any]]:
     """フォーム判定のスキャン用: 速さ優先のQR検出。
 
@@ -835,7 +950,102 @@ class FormDecision:
     detail: dict[str, Any]
 
 
-def score_formA(image_bgr: np.ndarray, marker_preproc: str = "none") -> tuple[bool, float, dict[str, Any]]:
+@dataclass
+class MarkerGeometryConfig:
+    """Constraints to reduce false-positive Form A detections (e.g. Form C misread as A)."""
+
+    # Marker bbox areas should be similar (avoid cases where 1 big blob + 2 tiny noise boxes)
+    max_marker_area_ratio: float = 3.0  # max(area)/min(area)
+
+    # Marker size relative to page (rectified image)
+    min_marker_area_page_ratio: float = 5e-5
+    max_marker_area_page_ratio: float = 5e-3
+
+    # Triangle shape constraint (TL-TR vs TL-BL)
+    # Expect dist(TL,TR) / dist(TL,BL) ~= (page_w / page_h)
+    max_dist_ratio_relative_error: float = 0.35
+
+
+def validate_formA_marker_geometry(
+    image_bgr: np.ndarray,
+    markers: list[dict[str, Any]],
+    cfg: MarkerGeometryConfig,
+) -> tuple[bool, dict[str, Any]]:
+    """Apply additional geometric/scale constraints for Form A markers.
+
+    Returns:
+      (ok, detail)
+    """
+
+    detail: dict[str, Any] = {"ok": False, "reasons": [], "cfg": asdict(cfg)}
+    if image_bgr is None or len(markers) != 3:
+        detail["reasons"].append("markers_not_3")
+        return False, detail
+
+    h, w = image_bgr.shape[:2]
+    page_area = float(max(1, w * h))
+
+    areas: list[float] = []
+    corner_to_center: dict[str, tuple[float, float]] = {}
+    for m in markers:
+        x, y, bw, bh = m.get("bbox", [0, 0, 0, 0])
+        a = float(max(0, bw) * max(0, bh))
+        areas.append(a)
+        corner = str(m.get("corner", ""))
+        corner_to_center[corner] = _marker_center_xy(m)
+
+    if not areas or min(areas) <= 0:
+        detail["reasons"].append("invalid_area")
+        return False, detail
+
+    max_over_min = float(max(areas) / max(1e-9, min(areas)))
+    detail["marker_area_max_over_min"] = max_over_min
+    if max_over_min > float(cfg.max_marker_area_ratio):
+        detail["reasons"].append("marker_area_ratio_too_large")
+
+    mean_area_ratio = float(np.mean(areas) / page_area)
+    detail["marker_area_page_ratio_mean"] = mean_area_ratio
+    if mean_area_ratio < float(cfg.min_marker_area_page_ratio):
+        detail["reasons"].append("marker_too_small_for_page")
+    if mean_area_ratio > float(cfg.max_marker_area_page_ratio):
+        detail["reasons"].append("marker_too_large_for_page")
+
+    # Triangle distance ratio: require TL/TR/BL centers exist
+    need = ["top_left", "top_right", "bottom_left"]
+    if all(k in corner_to_center for k in need):
+        tl = np.array(corner_to_center["top_left"], dtype=np.float32)
+        tr = np.array(corner_to_center["top_right"], dtype=np.float32)
+        bl = np.array(corner_to_center["bottom_left"], dtype=np.float32)
+        dist_w = float(np.linalg.norm(tr - tl))
+        dist_h = float(np.linalg.norm(bl - tl))
+        if dist_h <= 1e-6 or dist_w <= 1e-6:
+            detail["reasons"].append("invalid_marker_dist")
+        else:
+            ratio = dist_w / dist_h
+            expected = float(w) / float(max(1, h))
+            rel_err = float(abs(ratio - expected) / max(1e-9, expected))
+            detail.update(
+                {
+                    "marker_dist_ratio_w_over_h": ratio,
+                    "page_aspect_w_over_h": expected,
+                    "marker_dist_ratio_relative_error": rel_err,
+                }
+            )
+            if rel_err > float(cfg.max_dist_ratio_relative_error):
+                detail["reasons"].append("marker_triangle_ratio_off")
+    else:
+        detail["reasons"].append("missing_required_corners")
+
+    ok = len(detail["reasons"]) == 0
+    detail["ok"] = ok
+    return ok, detail
+
+
+def score_formA(
+    image_bgr: np.ndarray,
+    marker_preproc: str = "none",
+    geom_cfg: Optional[MarkerGeometryConfig] = None,
+) -> tuple[bool, float, dict[str, Any]]:
     """フォームA判定。
 
     3点マーカー検出（TL/TR/BL）ができることに加えて、
@@ -846,6 +1056,12 @@ def score_formA(image_bgr: np.ndarray, marker_preproc: str = "none") -> tuple[bo
     ok = len(markers) == 3
     if not ok:
         return False, 0.0, {"markers": markers}
+
+    # Extra constraints to suppress C->A false positives
+    cfg = geom_cfg or MarkerGeometryConfig()
+    geom_ok, geom_detail = validate_formA_marker_geometry(image_bgr, markers, cfg)
+    if not geom_ok:
+        return False, 0.0, {"markers": markers, "geometry": geom_detail}
 
     base_score = float(sum(m.get("score", 0.0) for m in markers))
 
@@ -878,6 +1094,7 @@ def score_formA(image_bgr: np.ndarray, marker_preproc: str = "none") -> tuple[bo
 
     return True, float(score), {
         "markers": markers,
+        "geometry": geom_detail,
         "pos_score": pos_score,
         "pos_score_per_corner": per_corner,
         "base_score": base_score,
@@ -886,7 +1103,9 @@ def score_formA(image_bgr: np.ndarray, marker_preproc: str = "none") -> tuple[bo
 
 
 def score_formB(image_bgr: np.ndarray) -> tuple[bool, float, dict[str, Any]]:
-    qrs = detect_qr_codes_robust(image_bgr)
+    qrs = detect_qr_codes_wechat(image_bgr, getattr(score_formB, "_wechat", None))
+    if not qrs:
+        qrs = detect_qr_codes_robust(image_bgr)
     if not qrs:
         return False, 0.0, {"qrs": []}
 
@@ -908,7 +1127,13 @@ def score_formB(image_bgr: np.ndarray) -> tuple[bool, float, dict[str, Any]]:
     y_score = 1.0 - (cy / float(max(1, h)))
     pos_score = 0.6 * x_score + 0.4 * y_score
 
-    return True, 1.0 + rel * 10.0 + pos_score, {"qrs": qrs, "qr_center": [cx, cy], "qr_rel_area": rel, "qr_pos_score": pos_score}
+    return True, 1.0 + rel * 10.0 + pos_score, {
+        "qrs": qrs,
+        "qr_center": [cx, cy],
+        "qr_rel_area": rel,
+        "qr_pos_score": pos_score,
+        "qr_engine": str(qrs[0].get("engine", "opencv")) if qrs else "",
+    }
 
 
 def score_formB_fast(image_bgr: np.ndarray) -> tuple[bool, float, dict[str, Any]]:
@@ -1521,6 +1746,14 @@ def build_csv_row(
     # NOTE: CSV は「フルパス禁止」の要望に従い、原則 filename のみ出力する。
     src_filename = _filename_only(item.get("source_path"))
 
+    expected_behavior_label = ""
+    if src_form == "C":
+        expected_behavior_label = "C_should_be_rejected_as_form_unknown"
+    elif src_form in ("A", "B"):
+        expected_behavior_label = "A_or_B_should_be_correct_form_and_template_and_warp"
+    else:
+        expected_behavior_label = "unknown_source_form"
+
     row: dict[str, Any] = {
         # ---- identity (short, human-friendly) ----
         "case_id": str(item.get("case") or ""),
@@ -1545,8 +1778,11 @@ def build_csv_row(
         "is_predicted_best_template_correct": _bool_to_str(is_template_correct) if gt_form else "",
 
         # ---- pipeline status ----
-        "pipeline_final_ok(warp_done)": _bool_to_str(item.get("ok")),
+        "pipeline_final_ok(warp_done)": _bool_to_str(item.get("ok_warp")),
+        "pipeline_final_ok(expected_behavior)": _bool_to_str(item.get("ok")),
         "pipeline_stop_stage": str(item.get("stage") or ""),
+        "pipeline_expected_behavior_label": expected_behavior_label,
+        "pipeline_predicted_form_raw(A_or_B_or_empty)": str(item.get("predicted_form") or ""),
 
         # ---- timings ----
         "elapsed_time_total_one_case_seconds": f"{float(item.get('case_total_s', 0.0)):.6f}",
@@ -1709,6 +1945,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--max-attempts", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
 
+    # WeChat QR models
+    p.add_argument(
+        "--wechat-model-dir",
+        type=str,
+        default=str(Path(__file__).resolve().parent / "models" / "wechat_qrcode"),
+        help="WeChat QRCode Engine のモデルディレクトリ（detect/sr の prototxt/caffemodel を配置）",
+    )
+
     # 回転スキャン（ユーザー要件: 0..350 を10度刻み）
     p.add_argument("--rotation-step", type=float, default=10.0, help="フォーム判定の回転スキャン刻み（度）")
     p.add_argument("--rotation-max-workers", type=int, default=8, help="回転スキャンの並列数（スレッド）")
@@ -1856,7 +2100,9 @@ def log_case_summary(logger: logging.Logger, row: dict[str, Any]) -> None:
     """Always print one-line case summary for readability."""
 
     case_id = str(row.get("case_id") or "")
-    ok = str(row.get("pipeline_final_ok(warp_done)") or "")
+    # user-facing ok = expected-behavior success
+    ok = str(row.get("pipeline_final_ok(expected_behavior)") or "")
+    ok_warp = str(row.get("pipeline_final_ok(warp_done)") or "")
     stage = str(row.get("pipeline_stop_stage") or "")
     src = str(row.get("source_image_filename") or "")
 
@@ -1884,7 +2130,7 @@ def log_case_summary(logger: logging.Logger, row: dict[str, Any]) -> None:
         truth_part += f" form_ok={form_ok} template_ok={template_ok}"
 
     msg = (
-        f"[CASE] id={case_id} ok={ok} stage={stage} {truth_part} "
+        f"[CASE] id={case_id} ok={ok} ok_warp={ok_warp} stage={stage} {truth_part} "
         f"best_template={best_tpl_name} inliers={inliers} inlier_ratio={inlier_ratio} "
         f"time_total_s={t_total} (1_degrade={t1},2_doc={t2},3_rectify={t3},4_decide={t4},5_match={t5},6_warp={t6}) "
         f"src={src}"
@@ -1895,6 +2141,118 @@ def log_case_summary(logger: logging.Logger, row: dict[str, Any]) -> None:
     else:
         # failure is important for later analysis
         logger.warning(msg)
+
+
+def _safe_div(n: float, d: float) -> float:
+    if d == 0:
+        return float("nan")
+    return float(n) / float(d)
+
+
+def _mean(xs: list[float]) -> float:
+    xs2 = [float(x) for x in xs if x is not None and math.isfinite(float(x))]
+    if not xs2:
+        return float("nan")
+    return float(sum(xs2) / len(xs2))
+
+
+def _median(xs: list[float]) -> float:
+    xs2 = sorted([float(x) for x in xs if x is not None and math.isfinite(float(x))])
+    if not xs2:
+        return float("nan")
+    m = len(xs2) // 2
+    if len(xs2) % 2 == 1:
+        return float(xs2[m])
+    return float((xs2[m - 1] + xs2[m]) / 2.0)
+
+
+def summarize_results(logger: logging.Logger, summary: list[dict[str, Any]], stage_times: dict[str, float], dt_total: float) -> None:
+    """Print dataset-level statistics at the end of the log.
+
+    Focus:
+      - expected-behavior success (ユーザー要望の主KPI)
+      - A/B form+template accuracy
+      - C rejection success rate (should be form_unknown)
+      - false positive analysis: C predicted as A/B
+      - stage time averages (mean/median)
+    """
+
+    total = len(summary)
+    if total == 0:
+        logger.info("[STATS] no cases")
+        return
+
+    ok_warp = sum(1 for s in summary if bool(s.get("ok_warp")))
+    ok_expected = sum(1 for s in summary if bool(s.get("ok")))
+
+    # Per source form buckets
+    by_src: dict[str, list[dict[str, Any]]] = {"A": [], "B": [], "C": [], "other": []}
+    for s in summary:
+        sf = str(s.get("source_form") or "")
+        if sf in by_src:
+            by_src[sf].append(s)
+        else:
+            by_src["other"].append(s)
+
+    # A/B accuracy (form correct, template correct)
+    def _count_true(items: list[dict[str, Any]], key: str) -> int:
+        return sum(1 for it in items if bool(it.get(key)))
+
+    a_items = by_src["A"]
+    b_items = by_src["B"]
+    c_items = by_src["C"]
+
+    a_form_ok = _count_true(a_items, "is_predicted_form_correct")
+    b_form_ok = _count_true(b_items, "is_predicted_form_correct")
+    a_tpl_ok = _count_true(a_items, "is_predicted_best_template_correct")
+    b_tpl_ok = _count_true(b_items, "is_predicted_best_template_correct")
+
+    # C should be rejected as form_unknown
+    c_reject_ok = sum(1 for it in c_items if str(it.get("stage")) == "form_unknown")
+    c_fp_as_A = sum(1 for it in c_items if str(it.get("predicted_form") or "") == "A")
+    c_fp_as_B = sum(1 for it in c_items if str(it.get("predicted_form") or "") == "B")
+
+    # Stage timing per-case (mean/median)
+    t_total_cases = [float(s.get("case_total_s", 0.0)) for s in summary if s.get("case_total_s") is not None]
+    t1 = [float(s.get("stage_times", {}).get("degrade_s", 0.0)) for s in summary if isinstance(s.get("stage_times"), dict)]
+    # If stage_times are not embedded, fallback to overall sums / total.
+
+    logger.info("=" * 70)
+    logger.info("[STATS] overall")
+    logger.info("  total_cases                       : %d", total)
+    logger.info("  ok_warp(done_aligned_generated)    : %d (%.1f%%)", ok_warp, _safe_div(ok_warp * 100.0, total))
+    logger.info("  ok_expected_behavior(user_KPI)     : %d (%.1f%%)", ok_expected, _safe_div(ok_expected * 100.0, total))
+    logger.info("  run_elapsed_total_seconds          : %.3f", float(dt_total))
+    logger.info("  avg_elapsed_per_case_seconds       : %.3f", float(dt_total) / float(total))
+
+    logger.info("[STATS] A form")
+    logger.info("  cases                             : %d", len(a_items))
+    logger.info("  form_accuracy                      : %d (%.1f%%)", a_form_ok, _safe_div(a_form_ok * 100.0, len(a_items)))
+    logger.info("  template_accuracy                  : %d (%.1f%%)", a_tpl_ok, _safe_div(a_tpl_ok * 100.0, len(a_items)))
+    logger.info("[STATS] B form")
+    logger.info("  cases                             : %d", len(b_items))
+    logger.info("  form_accuracy                      : %d (%.1f%%)", b_form_ok, _safe_div(b_form_ok * 100.0, len(b_items)))
+    logger.info("  template_accuracy                  : %d (%.1f%%)", b_tpl_ok, _safe_div(b_tpl_ok * 100.0, len(b_items)))
+    logger.info("[STATS] C form (should be rejected)")
+    logger.info("  cases                             : %d", len(c_items))
+    logger.info("  reject_success(stage=form_unknown) : %d (%.1f%%)", c_reject_ok, _safe_div(c_reject_ok * 100.0, len(c_items)))
+    logger.info("  false_positive_as_A                : %d (%.1f%%)", c_fp_as_A, _safe_div(c_fp_as_A * 100.0, len(c_items)))
+    logger.info("  false_positive_as_B                : %d (%.1f%%)", c_fp_as_B, _safe_div(c_fp_as_B * 100.0, len(c_items)))
+
+    # Stage time aggregates
+    logger.info("[STATS] stage time totals (s) (same as SUMMARY)")
+    for k, v in stage_times.items():
+        logger.info("  %-12s : %.2f", k, float(v))
+
+    # Means from aggregate totals
+    logger.info("[STATS] stage time mean per case (s)")
+    for k, v in stage_times.items():
+        logger.info("  %-12s : %.3f", k, float(v) / float(total))
+
+    # Total time mean/median
+    logger.info("[STATS] per-case total time (s)")
+    logger.info("  mean  : %.3f", _mean(t_total_cases))
+    logger.info("  median: %.3f", _median(t_total_cases))
 
 
 def print_config(args: argparse.Namespace) -> None:
@@ -1970,7 +2328,12 @@ def process_one_case(
         "source_form": src_form,
         "source_path": str(src_path),
         "case": case_id,
+        # NOTE:
+        #   ユーザー要望に合わせて ok の意味を変更する：
+        #     ok      = 期待動作として成功したか（C は form_unknown が成功）
+        #     ok_warp = warp まで到達したか（aligned 出力が生成されたか）
         "ok": False,
+        "ok_warp": False,
         "stage": "start",
         "degraded_variant_index": int(k),
     }
@@ -2092,11 +2455,26 @@ def process_one_case(
     )
     times.decide_s = time.perf_counter() - t0
     item["form_decision"] = asdict(decision)
+    # quick access (for logging/statistics)
+    item["predicted_form"] = str(decision.form or "")
+    item["predicted_angle_deg"] = "" if decision.angle_deg is None else float(decision.angle_deg)
+
     if not decision.ok or decision.form not in ("A", "B") or decision.angle_deg is None:
         item["stage"] = "form_unknown"
+        # Expected behaviour:
+        # - A/B: should NOT become form_unknown
+        # - C  : should become form_unknown (paper detected but not A/B)
+        item["ok"] = bool(src_form == "C")
+        item["ok_warp"] = False
         item["case_total_s"] = float(time.perf_counter() - case_t0)
         return item, times
     item["stage"] = "form_found"
+
+    # Form correctness for A/B (C は ground truth 未定義のため空扱い)
+    if src_form in ("A", "B"):
+        item["is_predicted_form_correct"] = bool(decision.form == src_form)
+    else:
+        item["is_predicted_form_correct"] = None
 
     chosen = rotate_image_bound(rectified, float(decision.angle_deg))
     chosen, _ = enforce_landscape(chosen)
@@ -2173,6 +2551,8 @@ def process_one_case(
     item["template_match_candidates"] = template_candidate_results
     if best is None or not best.get("ok"):
         item["stage"] = "xfeat_failed"
+        item["ok"] = False
+        item["ok_warp"] = False
         item["case_total_s"] = float(time.perf_counter() - case_t0)
         return item, times
 
@@ -2180,8 +2560,19 @@ def process_one_case(
     tpl_bgr = cv2.imread(str(tpl_path))
     if tpl_bgr is None:
         item["stage"] = "template_read_failed"
+        item["ok"] = False
+        item["ok_warp"] = False
         item["case_total_s"] = float(time.perf_counter() - case_t0)
         return item, times
+
+    # Template correctness for A/B only
+    if src_form in ("A", "B"):
+        try:
+            item["is_predicted_best_template_correct"] = bool(Path(str(best.get("template", ""))).name == Path(str(src_path)).name)
+        except Exception:
+            item["is_predicted_best_template_correct"] = False
+    else:
+        item["is_predicted_best_template_correct"] = None
 
     try:
         ht, wt = tpl_bgr.shape[:2]
@@ -2204,6 +2595,8 @@ def process_one_case(
     item["homography_inv"] = {"ok": bool(ok_inv), "reason": inv_reason, "cond": h_cond, "det": h_det}
     if not ok_inv or H_img_to_tpl is None:
         item["stage"] = "homography_unstable"
+        item["ok"] = False
+        item["ok_warp"] = False
         item["case_total_s"] = float(time.perf_counter() - case_t0)
         return item, times
 
@@ -2242,7 +2635,14 @@ def process_one_case(
         pass
 
     item["stage"] = "done"
-    item["ok"] = True
+    item["ok_warp"] = True
+    # Expected-behaviour success:
+    # - A/B: form correct AND template correct AND warp done
+    # - C  : reaching "done" is actually a false-positive (should have been rejected)
+    if src_form in ("A", "B"):
+        item["ok"] = bool(item.get("is_predicted_form_correct")) and bool(item.get("is_predicted_best_template_correct"))
+    else:
+        item["ok"] = False
     item["case_total_s"] = float(time.perf_counter() - case_t0)
     return item, times
 
@@ -2289,6 +2689,11 @@ def main(argv=None) -> int:
     logger.info("[INFO] Loading XFeat...")
     matcher = XFeatMatcher(top_k=args.top_k, device=device, match_max_side=args.match_max_side)
     logger.info("[OK] XFeat loaded")
+
+    # Initialize WeChat QR detector (optional)
+    wechat = init_wechat_qr_detector(str(getattr(args, "wechat_model_dir", "")), logger=logger)
+    # Bind to score_formB via function attribute to avoid threading/arg plumbing
+    setattr(score_formB, "_wechat", wechat)
 
     # (4) template cache
     cached_matcher: Optional[CachedXFeatMatcher] = None
@@ -2404,6 +2809,7 @@ def main(argv=None) -> int:
                         "source_path": str(sp),
                         "case": f"{sf}_{sp.stem}_deg{k:02d}",
                         "ok": False,
+                        "ok_warp": False,
                         "stage": "exception",
                         "error": str(e),
                         "traceback": traceback.format_exc(),
@@ -2414,6 +2820,16 @@ def main(argv=None) -> int:
                 # attach run metadata (for CSV)
                 item["run_id"] = str(run_id)
                 item["run_output_root_directory"] = str(out_root)
+
+                # attach stage times so we can compute per-case stats later
+                item["stage_times"] = {
+                    "degrade_s": float(st.degrade_s),
+                    "docaligner_s": float(st.docaligner_s),
+                    "rectify_s": float(st.rectify_s),
+                    "decide_s": float(st.decide_s),
+                    "match_s": float(st.match_s),
+                    "warp_s": float(st.warp_s),
+                }
 
                 summary.append(item)
 
@@ -2477,9 +2893,17 @@ def main(argv=None) -> int:
 
     # (2) stage summary
     total_cases = len(summary)
-    ok_cases = sum(1 for s in summary if bool(s.get("ok")))
+    ok_expected_cases = sum(1 for s in summary if bool(s.get("ok")))
+    ok_warp_cases = sum(1 for s in summary if bool(s.get("ok_warp")))
     logger.info("=" * 70)
-    logger.info("[SUMMARY] total=%d ok=%d (%.1f%%)", total_cases, ok_cases, (ok_cases / total_cases * 100.0) if total_cases else 0.0)
+    logger.info(
+        "[SUMMARY] total=%d ok_expected=%d (%.1f%%) ok_warp=%d (%.1f%%)",
+        total_cases,
+        ok_expected_cases,
+        (ok_expected_cases / total_cases * 100.0) if total_cases else 0.0,
+        ok_warp_cases,
+        (ok_warp_cases / total_cases * 100.0) if total_cases else 0.0,
+    )
     if total_cases:
         logger.info("[SUMMARY] elapsed avg per case: %.3fs", float(dt) / float(total_cases))
     logger.info("[SUMMARY] stage counts:")
@@ -2488,6 +2912,9 @@ def main(argv=None) -> int:
     logger.info("[SUMMARY] stage time totals (s):")
     for k, v in stage_times.items():
         logger.info("  %-12s : %.2f", k, float(v))
+
+    # Additional dataset-level stats (requested)
+    summarize_results(logger, summary, stage_times, dt)
 
     logger.info("[DONE] outputs: %s", out_root)
     logger.info("[DONE] elapsed: %.1fs", dt)
