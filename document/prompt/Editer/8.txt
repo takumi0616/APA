@@ -1,0 +1,80 @@
+# タスク（プロンプト）を行う前に必ず以下の資料を読んでください
+
+この資料は環境がどう構築されたかを記しておりコマンド実行などの際は必ず参考にしてください
+@/git_installation_guide.md
+@/miniconda_installation_guide.md
+
+タスクを行った際は、タスク成功後に、行ったことをマークダウン記法でまとめたものを@/APA\document\report の中にファイルを作成してください
+ファイル名のルール：番号_年月日_行ったことを日本語.md（例：1_20260106_環境構築）
+番号は@/APA\document\report の中を精査して確認してください
+これまでのreportも読み込んでからタスクを行ってください
+---
+# プロンプト
+
+@/APA\paper_pipeline_v4.py 
+上記のプログラムに以下の改善を行ってほしいです
+
+- BでQRコード検出ができない事例多数（解像度の低いQRコードが読めていない）
+```
+現在のものを変更して、WeChat QR Code Engineを導入
+
+参考プログラム
+import cv2
+import time
+import os
+
+class WeChatQRDetector:
+    def __init__(self, model_dir="./models"):
+        # モデルパスの定義
+        detect_proto = os.path.join(model_dir, "detect.prototxt")
+        detect_caffe = os.path.join(model_dir, "detect.caffemodel")
+        sr_proto = os.path.join(model_dir, "sr.prototxt")
+        sr_caffe = os.path.join(model_dir, "sr.caffemodel")
+        
+        # モデルファイルの存在確認
+        if not all(map(os.path.exists, [detect_proto, detect_caffe, sr_proto, sr_caffe])):
+            raise FileNotFoundError("WeChatQR model files not found.")
+
+        # 検出器の初期化（ここが重いため、一度だけ実行する）
+        self.detector = cv2.wechat_qrcode_WeChatQRCode(
+            detect_proto, detect_caffe, sr_proto, sr_caffe
+        )
+
+    def detect(self, image_path):
+        img = cv2.imread(image_path)
+        if img is None:
+            return None, 0
+
+        start = time.time()
+        # 検出とデコードを一括実行。必要に応じて内部で超解像が行われる。
+        res, points = self.detector.detectAndDecode(img)
+        elapsed = (time.time() - start) * 1000
+        
+        return res, points, elapsed
+
+# 使用例
+if __name__ == "__main__":
+    qr_engine = WeChatQRDetector()
+    results, coords, time_ms = qr_engine.detect("low_res_qr.jpg")
+    print(f"Decoded: {results}, Time: {time_ms:.2f}ms")
+
+```
+
+- CがAと誤判定される事例多数（3つの四角を読み込むロジックが不十分）
+```
+追加すべき制約
+
+- マーカーサイズ比
+3個の bbox面積が極端に違うなら間違い
+bbox面積 / ページ面積 が一定範囲外なら間違い
+
+- 三角形の形（距離比）
+dist(TL,TR) と dist(TL,BL) はページの縦横比に応じた比率に近いはず
+この比率が崩れている場合はCの可能性が高い
+```
+
+上記の改善を順番に確実に行ってください
+paper_pipeline_v4.py にはpaper_pipeline_v3.py をそのままコピーしているので、それをちょくちょく直す形で改善を行って下さい
+上記の2点を改善してください
+プログラムをすべて改善できたのちに実行して結果確認、エラーが出る場合は試行錯誤して適宜改善してください
+全ての改善が無事に終了したときに、レポートの作成を行ってください
