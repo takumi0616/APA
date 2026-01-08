@@ -1,53 +1,86 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""paper_pipeline.py
+"""paper_pipeline_v2.py
 
 目的
 ----
-ユーザー指示のパイプラインを、既存の検証コード（DocAligner / フォームA・B判定 / XFeat Homography）を
-ベースにして「静止画像一括処理」として実装する。
+既存の検証コード（DocAligner / フォームA・B判定 / XFeat Homography）をベースに、
+静止画像の一括処理パイプラインとして統合・運用しやすくする。
+
+特に以下を重視：
+
+- 解像度差に強い処理（polygon margin の比率化）
+- 大量処理時に原因追跡しやすいログ/サマリ（logging + stage集計 + 所要時間）
+- 検出率向上（マーカー/QR の前処理オプション）
+- 高速化（テンプレ特徴キャッシュ + グローバル特徴で候補絞り込み）
+- 安定性（Unknown 判定、逆ホモグラフィの信頼度チェック）
 
 パイプライン概要
 ----------------
-入力: `APA/image/{A,B,C}/*.jpg`（全画像）
+入力:
+
+- 改悪元画像: `APA/image/{A,B,C}/` 配下（デフォルト実装では `1.jpg`〜`6.jpg` を対象）
+  - 対象フォームは `--src-forms` で指定
+
+処理フロー（1 case = 1 枚の入力から生成した 1 枚の改悪画像）:
 
 1) 改悪生成（`APA/test_recovery_paper.py` の実装を流用）
-2) 改悪画像に DocAligner を適用し、紙の四角枠（polygon）を得る
-   - 得られない場合、その画像の処理は終了
-3) polygon を用いて紙領域を透視補正（perspective warp）
-4) 透視補正後の紙画像を 0〜350度（10度刻み）で回転させ、フォーム判定を並列に実行
-   - フォームA: 3点マーク（TL/TR/BL）が検出できる
-   - フォームB: 右上にQRコードが検出できる
-   - 見つからなければ、その画像の処理は終了
-5) 確定フォームに応じて、全テンプレ（`APA/image/A` or `APA/image/B`）と XFeat matching を実行
-   - Homography を推定し、対応点一致度（inliers）最大のテンプレを採用
-6) 採用した Homography の逆で、改悪画像（透視補正＋回転確定済み）をテンプレ座標にワープして保存
+2) DocAligner により紙領域 polygon（4点）を推定
+   - 失敗したら `stage=docaligner_failed` で終了
+3) polygon を（紙サイズ比の margin で）外側に拡張 → 透視補正（rectify）
+4) フォーム判定（回転探索）
+   - 角度リストは仕様として `0..350` を `--rotation-step` 刻みで作成
+   - 実処理は高速化のため Coarse-to-Fine（0/90/180/270 で粗探索→近傍のみ探索）
+   - フォームA: 3点マーク（TL/TR/BL）が検出できる（`--marker-preproc` で前処理オプション）
+   - フォームB: QRコードが検出できる（robust前処理 + マルチスケール）
+   - 判定不能/曖昧なら `stage=form_unknown`（Unknown）で終了
+5) XFeat matching によるテンプレ照合
+   - テンプレは `APA/image/A` または `APA/image/B`（`1.jpg`〜`6.jpg`）
+   - グローバル特徴で上位 `--template-topn` 枚へ絞り込み→局所特徴で精密推定
+6) Homography を信頼度チェックの上で逆行列化し、テンプレ座標へ warp
+   - 不安定なら `stage=homography_unstable` で終了
 
 出力
 ----
 `APA/output_pipeline/run_YYYYmmdd_HHMMSS/` 配下に（処理順が分かるように番号付き）：
- - 1_degraded/             : 改悪画像
- - 2_doc/                  : DocAligner polygon 可視化
- - 3_rectified/            : 透視補正した紙画像
- - 4_rectified_rot/        : フォーム確定に使った回転後画像
- - 5_debug_matches/        : best template のマッチ可視化
- - 6_aligned/              : best template にワープした結果
- - summary.json / summary.csv
+
+- `1_degraded/`       : 改悪画像
+- `2_doc/`            : DocAligner polygon 可視化
+- `3_rectified/`      : 透視補正した紙画像
+- `4_rectified_rot/`  : フォーム確定に使った回転後画像（根拠も描画）
+- `5_debug_matches/`  : best template のマッチ可視化
+- `6_aligned/`        : best template にワープした結果
+- `summary.json` / `summary.csv`
+- `run.log`           : 実行ログ（logging）
 
 注意
 ----
- - torch.hub 経由の XFeat 読み込みで git が必要になることがあるため、
-   portable git を PATH に追加する処理を `test_recovery_paper` から流用する。
+- torch.hub 経由の XFeat 読み込みで git が必要になることがあるため、
+  portable git を PATH に追加する処理を `test_recovery_paper` から流用する。
+- 日本語ラベル描画は Pillow を使用（OpenCV putText は日本語非対応のため）。
+  - `APA_FONT_PATH` を設定すると任意フォントを優先可能
+
+改善点メモ
+----
+- BでQRコード検出ができない事例多数（解像度の低いQRコードが読めていない）
+- CがAと誤判定される事例多数（3つの四角を読み込むロジックが不十分）
+- ログが読みづらい（用紙検出不可でもログに出してほしい、結果不正解か正解かをログにも出力してほしい、1～6の処理のそれぞれの実行時間、1枚行うときの実行時間を表示してほしい）
+- csvをさらにリッチにしてほしい（改悪パラメータの情報、作成したり出力したり読み込む画像の解像度、すべての実行時間、XFeat matchingやDocAlignerからわかるあらゆること、最終的に改悪前の様式と判断したテンプレートがあっているかの正解不正解かどうかなど、後で様式の判断ミスや精度が悪いことや時間がかかりすぎる原因分析をリッチに行えるようにあらゆる項目を記録してほしい。またcsvの項目名は、長くてもいいので誰でもその項目のことがわかるような名前にしてください）
+
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
+import math
 import json
 import os
+import platform
 import random
 import sys
 import time
+import traceback
 import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -62,15 +95,17 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 # --- reuse implementations from previous work ---
-# NOTE: このスクリプトは `python APA/paper_pipeline.py ...` の形で実行される想定。
+# NOTE: このスクリプトは `python APA/paper_pipeline_v2.py ...` の形で実行される想定。
 # その場合 sys.path[0] は `.../APA` になるため、同ディレクトリのモジュールは
 # `from test_recovery_paper import ...` の形で import する（`import APA.xxx` は失敗しやすい）。
 from test_recovery_paper import (
     XFeatMatcher,
-    detect_formA_marker_boxes,
+    detect_formA_marker_boxes as _detect_formA_marker_boxes_base,
     draw_inlier_matches,
     ensure_portable_git_on_path,
     now_run_id,
+    resize_keep_aspect,
+    scale_matrix,
     warp_template_to_random_view,
 )
 
@@ -90,6 +125,50 @@ if sys.stderr:
         sys.stderr.reconfigure(encoding="utf-8")
     except Exception:
         pass
+
+
+# ------------------------------------------------------------
+# logging
+# ------------------------------------------------------------
+
+
+def setup_logging(
+    out_root: Optional[Path],
+    level: str = "INFO",
+    console_level: Optional[str] = None,
+) -> logging.Logger:
+    """Configure logging.
+
+    - console: INFO by default (or console_level)
+    - file: same as level, saved to out_root/run.log
+    """
+
+    logger = logging.getLogger("paper_pipeline")
+    logger.handlers.clear()
+    logger.propagate = False
+    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    fmt = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    ch = logging.StreamHandler(stream=sys.stdout)
+    ch.setFormatter(fmt)
+    ch.setLevel(getattr(logging, (console_level or level).upper(), logging.INFO))
+    logger.addHandler(ch)
+
+    if out_root is not None:
+        try:
+            fh = logging.FileHandler(str(out_root / "run.log"), encoding="utf-8")
+            fh.setFormatter(fmt)
+            fh.setLevel(getattr(logging, level.upper(), logging.INFO))
+            logger.addHandler(fh)
+        except Exception:
+            # Keep running even if file handler fails
+            pass
+
+    return logger
 
 
 # ------------------------------------------------------------
@@ -162,6 +241,31 @@ def expand_polygon(polygon_xy: np.ndarray, margin_px: float, img_w: int, img_h: 
     out[:, 0] = np.clip(out[:, 0], 0, max(0, img_w - 1))
     out[:, 1] = np.clip(out[:, 1], 0, max(0, img_h - 1))
     return out
+
+
+def polygon_margin_px_from_ratio(
+    polygon_xy: np.ndarray,
+    ratio: float,
+    min_px: float,
+    max_px: float,
+) -> float:
+    """Compute margin in px from polygon size ratio.
+
+    We use the polygon's estimated paper size (max(edge lengths)) as the reference.
+    This makes behaviour more stable across different image resolutions.
+    """
+
+    poly = order_quad_tl_tr_br_bl(polygon_xy)
+    w_top = float(np.linalg.norm(poly[1] - poly[0]))
+    w_bottom = float(np.linalg.norm(poly[2] - poly[3]))
+    h_left = float(np.linalg.norm(poly[3] - poly[0]))
+    h_right = float(np.linalg.norm(poly[2] - poly[1]))
+    ref = max(w_top, w_bottom, h_left, h_right)
+    px = float(ref) * float(ratio)
+    px = max(float(min_px), px)
+    if max_px > 0:
+        px = min(float(max_px), px)
+    return float(px)
 
 
 def polygon_to_rectified(
@@ -256,18 +360,66 @@ def _get_japanese_font(size_px: int) -> ImageFont.FreeTypeFont:
     OpenCV's cv2.putText cannot render Japanese, so we use Pillow.
     """
 
-    # Windows default Japanese font
-    candidates = [
-        r"C:\Windows\Fonts\meiryo.ttc",
-        r"C:\Windows\Fonts\meiryob.ttc",
-    ]
+    # NOTE:
+    # 以前は Windows フォントパスをハードコードしていたが、
+    # Linux/Mac/Docker では存在しないため、可能な限り OS 非依存で解決する。
+
+    # 1) user override
+    font_path = os.environ.get("APA_FONT_PATH")
+    if font_path:
+        try:
+            if os.path.exists(font_path):
+                return ImageFont.truetype(font_path, size=int(size_px))
+        except Exception:
+            pass
+
+    # 2) common OS fonts
+    candidates: list[str] = []
+    sysname = platform.system().lower()
+    if "windows" in sysname:
+        candidates += [
+            r"C:\Windows\Fonts\meiryo.ttc",
+            r"C:\Windows\Fonts\meiryob.ttc",
+            r"C:\Windows\Fonts\msgothic.ttc",
+            r"C:\Windows\Fonts\msyh.ttc",
+        ]
+    elif "darwin" in sysname or "mac" in sysname:
+        candidates += [
+            "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/Helvetica.ttc",
+        ]
+    else:
+        candidates += [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+
     for p in candidates:
         try:
             if os.path.exists(p):
                 return ImageFont.truetype(p, size=int(size_px))
         except Exception:
             pass
-    # Fallback: default (may not support Japanese, but keep running)
+
+    # 3) matplotlib font_manager (best effort)
+    try:
+        import matplotlib.font_manager as fm
+
+        # try a couple of known JP-capable family names; if not installed, findfont falls back.
+        for fam in ["Meiryo", "MS Gothic", "Noto Sans CJK JP", "Noto Sans CJK", "IPAPGothic", "DejaVu Sans"]:
+            try:
+                p = fm.findfont(fm.FontProperties(family=fam), fallback_to_default=True)
+                if p and os.path.exists(p):
+                    return ImageFont.truetype(p, size=int(size_px))
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 4) fallback: default (may not support Japanese, but keep running)
     return ImageFont.load_default()
 
 
@@ -303,6 +455,30 @@ def draw_text_pil(
     return cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
 
 
+def draw_text_ascii_cv2(
+    image_bgr: np.ndarray,
+    xy: tuple[int, int],
+    text: str,
+    color_bgr: tuple[int, int, int],
+    font_scale: float,
+    thickness: int,
+) -> np.ndarray:
+    """ASCII-only fallback when no Japanese-capable font is available."""
+
+    out = image_bgr.copy()
+    cv2.putText(
+        out,
+        text,
+        (int(xy[0]), int(xy[1])),
+        cv2.FONT_HERSHEY_COMPLEX,
+        float(font_scale),
+        color_bgr,
+        int(thickness),
+        lineType=cv2.LINE_AA,
+    )
+    return out
+
+
 def _marker_center_xy(marker: dict[str, Any]) -> tuple[float, float]:
     """Get marker center from bbox."""
 
@@ -322,14 +498,25 @@ def draw_formA_markers_overlay(image_bgr: np.ndarray, markers: list[dict[str, An
         corner = str(m.get("corner", ""))
         label = f"{corner}({jp.get(corner, corner)})"
         cv2.rectangle(out, (int(x), int(y)), (int(x + w), int(y + h)), (0, 0, 255), thickness)
-        out = draw_text_pil(
-            out,
-            (int(x), max(5, int(y) - font_px - 4)),
-            label,
-            color_bgr=(0, 0, 255),
-            font_size=font_px,
-            outline=True,
-        )
+        # Prefer JP label if possible, otherwise fallback to ASCII.
+        try:
+            out = draw_text_pil(
+                out,
+                (int(x), max(5, int(y) - font_px - 4)),
+                label,
+                color_bgr=(0, 0, 255),
+                font_size=font_px,
+                outline=True,
+            )
+        except Exception:
+            out = draw_text_ascii_cv2(
+                out,
+                (int(x), max(5, int(y) - font_px - 4)),
+                corner,
+                color_bgr=(0, 0, 255),
+                font_scale=float(font_scale),
+                thickness=int(font_thickness),
+            )
     return out
 
 
@@ -351,14 +538,24 @@ def draw_formB_qr_overlay(image_bgr: np.ndarray, qrs: list[dict[str, Any]]) -> n
     # choose QR top-right point to place label
     tr_idx = int(np.argmax(pts[:, 0] - pts[:, 1]))
     tr = pts[tr_idx]
-    out = draw_text_pil(
-        out,
-        (int(tr[0] + 10), max(5, int(tr[1] - font_px - 4))),
-        "右上",
-        color_bgr=(255, 0, 0),
-        font_size=font_px,
-        outline=True,
-    )
+    try:
+        out = draw_text_pil(
+            out,
+            (int(tr[0] + 10), max(5, int(tr[1] - font_px - 4))),
+            "右上",
+            color_bgr=(255, 0, 0),
+            font_size=font_px,
+            outline=True,
+        )
+    except Exception:
+        out = draw_text_ascii_cv2(
+            out,
+            (int(tr[0] + 10), max(5, int(tr[1] - font_px - 4))),
+            "TOP_RIGHT",
+            color_bgr=(255, 0, 0),
+            font_scale=float(font_scale),
+            thickness=int(font_thickness),
+        )
     return out
 
 
@@ -386,6 +583,81 @@ def detect_polygon_docaligner(model: Any, cb: Any, image_bgr: np.ndarray, pad_px
         return None
     poly = poly[:4] - float(pad_px)
     return poly
+
+
+# ------------------------------------------------------------
+# marker detection wrapper (optional extra preprocessing)
+# ------------------------------------------------------------
+
+
+def _preprocess_variants_for_markers(image_bgr: np.ndarray, mode: str) -> list[tuple[str, np.ndarray]]:
+    """Generate preprocessed variants to improve marker detection robustness."""
+
+    if mode == "none":
+        return [("bgr", image_bgr)]
+
+    variants: list[tuple[str, np.ndarray]] = [("bgr", image_bgr)]
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    variants.append(("gray", cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)))
+
+    if mode in ("basic", "morph"):
+        # illumination-robust contrast
+        try:
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            g2 = clahe.apply(gray)
+            variants.append(("clahe", cv2.cvtColor(g2, cv2.COLOR_GRAY2BGR)))
+        except Exception:
+            pass
+        # adaptive threshold (contour-based)
+        try:
+            bw = cv2.adaptiveThreshold(
+                gray,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                51,
+                5,
+            )
+            variants.append(("adaptive", cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)))
+        except Exception:
+            pass
+
+    if mode == "morph":
+        try:
+            # Morphological closing/opening to reduce noise and connect marker blobs
+            k = max(3, int(round(min(image_bgr.shape[:2]) * 0.004)))
+            if k % 2 == 0:
+                k += 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+            bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 51, 5)
+            bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel)
+            bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel)
+            variants.append(("adaptive_morph", cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)))
+        except Exception:
+            pass
+
+    return variants
+
+
+def detect_formA_marker_boxes(image_bgr: np.ndarray, preproc_mode: str = "none") -> list[dict[str, Any]]:
+    """Try marker detection with optional preprocessing variants."""
+
+    best: list[dict[str, Any]] = []
+    best_score = -1.0
+    for name, var in _preprocess_variants_for_markers(image_bgr, preproc_mode):
+        markers = _detect_formA_marker_boxes_base(var)
+        # prefer complete detection
+        ok = len(markers) == 3
+        score = float(sum(m.get("score", 0.0) for m in markers))
+        if ok:
+            score += 10.0
+        # prefer later preprocessing only slightly
+        if name != "bgr":
+            score += 0.05
+        if score > best_score:
+            best_score = score
+            best = markers
+    return best
 
 
 # ------------------------------------------------------------
@@ -420,7 +692,7 @@ def detect_qr_codes_robust(image_bgr: np.ndarray) -> list[dict[str, Any]]:
     """フォームB向け: 回転/透視補正後の画像でも落ちにくい QR 検出。
 
     方針:
-    - 複数の前処理（gray/CLAHE/Otsu）
+    - 複数の前処理（gray/CLAHE/Otsu/Adaptive + Morphology）
     - マルチスケール（小さすぎる場合は upscale も試す）
     """
 
@@ -445,6 +717,23 @@ def detect_qr_codes_robust(image_bgr: np.ndarray) -> list[dict[str, Any]]:
     try:
         _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         candidates.append(("otsu", cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)))
+    except Exception:
+        pass
+
+    # Adaptive + Morphology (uneven lighting / blur)
+    try:
+        bw = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            51,
+            5,
+        )
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        bw2 = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel)
+        bw2 = cv2.morphologyEx(bw2, cv2.MORPH_OPEN, kernel)
+        candidates.append(("adaptive_morph", cv2.cvtColor(bw2, cv2.COLOR_GRAY2BGR)))
     except Exception:
         pass
 
@@ -545,14 +834,14 @@ class FormDecision:
     detail: dict[str, Any]
 
 
-def score_formA(image_bgr: np.ndarray) -> tuple[bool, float, dict[str, Any]]:
+def score_formA(image_bgr: np.ndarray, marker_preproc: str = "none") -> tuple[bool, float, dict[str, Any]]:
     """フォームA判定。
 
     3点マーカー検出（TL/TR/BL）ができることに加えて、
     それぞれが「本来の位置（左上/右上/左下）」に近いほどスコア加点する。
     """
 
-    markers = detect_formA_marker_boxes(image_bgr)
+    markers = detect_formA_marker_boxes(image_bgr, preproc_mode=marker_preproc)
     ok = len(markers) == 3
     if not ok:
         return False, 0.0, {"markers": markers}
@@ -586,7 +875,13 @@ def score_formA(image_bgr: np.ndarray) -> tuple[bool, float, dict[str, Any]]:
     # pos_score は 0..1。ベーススコア（概ね0..3）に対して少し効くように重み付け。
     score = base_score + pos_score * 2.0
 
-    return True, float(score), {"markers": markers, "pos_score": pos_score, "pos_score_per_corner": per_corner, "base_score": base_score}
+    return True, float(score), {
+        "markers": markers,
+        "pos_score": pos_score,
+        "pos_score_per_corner": per_corner,
+        "base_score": base_score,
+        "marker_preproc": marker_preproc,
+    }
 
 
 def score_formB(image_bgr: np.ndarray) -> tuple[bool, float, dict[str, Any]]:
@@ -638,15 +933,17 @@ def decide_form_by_rotations(
     rectified_bgr: np.ndarray,
     angles: list[float],
     max_workers: int = 8,
+    marker_preproc: str = "none",
+    unknown_score_threshold: float = 0.0,
+    unknown_margin: float = 0.0,
 ) -> FormDecision:
-    """Try all angles in parallel; return best valid decision.
+    """Coarse-to-fine rotation scan; return best valid decision.
 
     NOTE:
-    - QR の robust 検出は重く、全角度×並列で回すと極端に遅くなる/環境により不安定。
-      そのため、ここでは
-        1) 全角度を並列で FAST 判定（QRの角度候補を絞る）
-        2) FASTで最良だった角度（+近傍）だけ ROBUST で再検証
-      の二段階にする。
+    - まず 0/90/180/270 の 4 回で大まかな向き（縦横/上下逆）を推定し、
+      その近傍だけ細かく探索する（計算量削減）。
+    - QR の robust 検出は重いため、候補角度のみ robust で再検証する。
+    - A/B どちらもスコアが低い（閾値未満） or 近すぎる場合は Unknown 扱い。
     """
 
     def _eval(angle: float) -> dict[str, Any]:
@@ -657,7 +954,7 @@ def decide_form_by_rotations(
         if h > w:
             return {"angle": float(angle), "skip": True}
 
-        okA, scoreA, detA = score_formA(rotated)
+        okA, scoreA, detA = score_formA(rotated, marker_preproc=marker_preproc)
         okBf, scoreBf, detBf = score_formB_fast(rotated)
 
         return {
@@ -667,12 +964,61 @@ def decide_form_by_rotations(
             "B_fast": {"ok": bool(okBf), "score": float(scoreBf), "detail": detBf},
         }
 
+    def _wrap_angle(a: float) -> float:
+        return float(a) % 360.0
+
+    def _circular_dist_deg(a: float, b: float) -> float:
+        d = abs((_wrap_angle(a) - _wrap_angle(b)) % 360.0)
+        return float(min(d, 360.0 - d))
+
+    # ----------------------------------
+    # Coarse pass: 0/90/180/270 only
+    # ----------------------------------
+
+    coarse = [0.0, 90.0, 180.0, 270.0]
+    coarse_results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(coarse))) as ex:
+        futures = [ex.submit(_eval, a) for a in coarse]
+        for fut in as_completed(futures):
+            r = fut.result()
+            if not r or r.get("skip"):
+                continue
+            coarse_results.append(r)
+
+    if not coarse_results:
+        return FormDecision(False, None, None, 0.0, {"reason": "coarse_all_skipped"})
+
+    # pick top-2 coarse angles by max(A_score, B_fast_score)
+    coarse_sorted = sorted(
+        coarse_results,
+        key=lambda rr: max(float(rr["A"]["score"]), float(rr["B_fast"]["score"])),
+        reverse=True,
+    )
+    coarse_top = coarse_sorted[:2]
+    base_angles = [float(r["angle"]) for r in coarse_top]
+
+    # ----------------------------------
+    # Fine pass: only near base angles (union)
+    # ----------------------------------
+
+    window = 50.0  # a bit wider to avoid missing due to detection sensitivity
+
+    # Align fine angles to the user-provided angle list (0..350 step N),
+    # rather than generating new angles like 355.
+    fine_set: set[float] = set()
+    for ba in base_angles:
+        for a in angles:
+            if _circular_dist_deg(a, ba) <= window:
+                fine_set.add(float(a))
+    fine = sorted(fine_set)
+    if not fine:
+        # fallback to full list
+        fine = list(angles)
+
     bestA: Optional[FormDecision] = None
     bestB_fast: Optional[FormDecision] = None
-    b_fast_angles: list[float] = []
-
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(_eval, a) for a in angles]
+        futures = [ex.submit(_eval, a) for a in fine]
         for fut in as_completed(futures):
             r = fut.result()
             if not r or r.get("skip"):
@@ -680,18 +1026,81 @@ def decide_form_by_rotations(
 
             angle = float(r["angle"])
 
-            # Track best A
             if r["A"]["ok"]:
-                candA = FormDecision(True, "A", angle, float(r["A"]["score"]), {"A": r["A"]["detail"]})
+                candA = FormDecision(True, "A", angle, float(r["A"]["score"]), {"A": r["A"]["detail"], "phase": "fine"})
                 if bestA is None or candA.score > bestA.score:
                     bestA = candA
 
-            # Track best B (fast)
             if r["B_fast"]["ok"]:
-                b_fast_angles.append(angle)
-                candB = FormDecision(True, "B", angle, float(r["B_fast"]["score"]), {"B_fast": r["B_fast"]["detail"]})
+                candB = FormDecision(True, "B", angle, float(r["B_fast"]["score"]), {"B_fast": r["B_fast"]["detail"], "phase": "fine"})
                 if bestB_fast is None or candB.score > bestB_fast.score:
                     bestB_fast = candB
+
+    # If none found (fine pass), fallback to full scan (original behaviour)
+    if bestA is None and bestB_fast is None:
+        # Full scan is still just 36 angles by default; this prevents regression.
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_eval, a) for a in angles]
+            for fut in as_completed(futures):
+                r = fut.result()
+                if not r or r.get("skip"):
+                    continue
+                angle = float(r["angle"])
+                if r["A"]["ok"]:
+                    candA = FormDecision(True, "A", angle, float(r["A"]["score"]), {"A": r["A"]["detail"], "phase": "fallback_full"})
+                    if bestA is None or candA.score > bestA.score:
+                        bestA = candA
+                if r["B_fast"]["ok"]:
+                    candB = FormDecision(True, "B", angle, float(r["B_fast"]["score"]), {"B_fast": r["B_fast"]["detail"], "phase": "fallback_full"})
+                    if bestB_fast is None or candB.score > bestB_fast.score:
+                        bestB_fast = candB
+
+        if bestA is None and bestB_fast is None:
+            # FAST で全く検出できない場合でも、robust 側だと拾えるケースがある。
+            # まずは 0/90/180/270 のみ robust rescue を実施して、
+            # 見つかれば B として確定する。
+            rescue_angles = [0.0, 90.0, 180.0, 270.0]
+            bestB_rescue: Optional[FormDecision] = None
+            for aa in rescue_angles:
+                rotated = rotate_image_bound(rectified_bgr, aa)
+                rotated, _ = enforce_landscape(rotated)
+                if rotated.shape[0] > rotated.shape[1]:
+                    continue
+                okB, scoreB, detB = score_formB(rotated)
+                if not okB:
+                    continue
+                cand = FormDecision(True, "B", float(aa), float(scoreB), {"B": detB, "rescue": True, "phase": "no_detection_rescue"})
+                if bestB_rescue is None or cand.score > bestB_rescue.score:
+                    bestB_rescue = cand
+            if bestB_rescue is not None:
+                return bestB_rescue
+
+            return FormDecision(
+                False,
+                None,
+                None,
+                0.0,
+                {
+                    "reason": "no_detection",
+                    "coarse": coarse_results,
+                    "fine_angles": fine,
+                },
+            )
+
+    # Unknown decision: low score or ambiguous
+    # (If either is None, treat score as -inf for margin comparison)
+    a_score = float(bestA.score) if bestA is not None else float("-inf")
+    b_score = float(bestB_fast.score) if bestB_fast is not None else float("-inf")
+
+    # Threshold: if the top score is below threshold, declare Unknown.
+    top_score = max(a_score, b_score)
+    if float(unknown_score_threshold) > 0 and top_score < float(unknown_score_threshold):
+        return FormDecision(False, None, None, float(top_score), {"reason": "below_threshold", "a_score": a_score, "b_score": b_score})
+
+    # Margin: if too close, declare Unknown.
+    if float(unknown_margin) > 0 and bestA is not None and bestB_fast is not None:
+        if abs(a_score - b_score) < float(unknown_margin):
+            return FormDecision(False, None, None, float(top_score), {"reason": "ambiguous", "a_score": a_score, "b_score": b_score})
 
     # If A found and it looks reliable, prefer A.
     if bestA is not None and (bestB_fast is None or bestA.score >= bestB_fast.score):
@@ -753,6 +1162,201 @@ def decide_form_by_rotations(
 
 
 # ------------------------------------------------------------
+# Template caching + global prefilter
+# ------------------------------------------------------------
+
+
+def compute_global_descriptor(image_bgr: np.ndarray, size: int = 256) -> np.ndarray:
+    """Compute a cheap global descriptor for template pre-filtering.
+
+    Current design:
+      - resize to fixed max side
+      - grayscale histogram (64 bins)
+      - HSV histogram (H:24, S:16)
+
+    Returns: 1D float32 vector normalized to unit length.
+    """
+
+    img, _ = resize_keep_aspect(image_bgr, max_side=int(size))
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    h_hist = cv2.calcHist([hsv], [0], None, [24], [0, 180]).reshape(-1)
+    s_hist = cv2.calcHist([hsv], [1], None, [16], [0, 256]).reshape(-1)
+    g_hist = cv2.calcHist([gray], [0], None, [64], [0, 256]).reshape(-1)
+    v = np.concatenate([h_hist, s_hist, g_hist]).astype(np.float32)
+    n = float(np.linalg.norm(v))
+    if n > 1e-6:
+        v /= n
+    return v
+
+
+@dataclass
+class CachedRef:
+    template_path: str
+    ref_small: np.ndarray
+    s_ref: float
+    out0: dict[str, Any]
+    global_desc: np.ndarray
+
+
+class CachedXFeatMatcher:
+    """XFeat matcher with cached template features."""
+
+    def __init__(self, base: XFeatMatcher):
+        self.base = base
+        self.xfeat = base.xfeat
+        self.top_k = int(base.top_k)
+        self.match_max_side = int(base.match_max_side)
+        self.device = str(base.device)
+
+    def prepare_ref(self, template_bgr: np.ndarray, template_path: str) -> CachedRef:
+        ref_small, s_ref = resize_keep_aspect(template_bgr, self.match_max_side)
+        out0 = self.xfeat.detectAndCompute(ref_small, top_k=self.top_k)[0]
+        out0.update({"image_size": (ref_small.shape[1], ref_small.shape[0])})
+        g = compute_global_descriptor(template_bgr)
+        return CachedRef(template_path=str(template_path), ref_small=ref_small, s_ref=float(s_ref), out0=out0, global_desc=g)
+
+    def match_with_cached_ref(
+        self,
+        ref: CachedRef,
+        tgt_bgr: np.ndarray,
+    ) -> tuple[Any, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        """Return (XFeatHomographyResult-like, H_full, mkpts0, mkpts1)."""
+
+        # Resize target for matching stability/speed (then scale H back)
+        tgt_small, s_tgt = resize_keep_aspect(tgt_bgr, self.match_max_side)
+        out1 = self.xfeat.detectAndCompute(tgt_small, top_k=self.top_k)[0]
+        out1.update({"image_size": (tgt_small.shape[1], tgt_small.shape[0])})
+
+        matches = self.xfeat.match_lighterglue(ref.out0, out1)
+        if isinstance(matches, (list, tuple)) and len(matches) >= 2:
+            mkpts0, mkpts1 = matches[0], matches[1]
+        elif isinstance(matches, dict) and "mkpts0" in matches and "mkpts1" in matches:
+            mkpts0, mkpts1 = matches["mkpts0"], matches["mkpts1"]
+        else:
+            return (
+                # minimal shape-compatible object (reuse dataclass from test_recovery_paper is heavy to import here)
+                type("Res", (), {"ok": False, "inliers": 0, "matches": 0, "inlier_ratio": 0.0, "H_ref_to_tgt": None})(),
+                None,
+                None,
+                None,
+            )
+
+        mkpts0 = np.asarray(mkpts0, dtype=np.float32)
+        mkpts1 = np.asarray(mkpts1, dtype=np.float32)
+        if len(mkpts0) < 4:
+            return (
+                type("Res", (), {"ok": False, "inliers": 0, "matches": int(len(mkpts0)), "inlier_ratio": 0.0, "H_ref_to_tgt": None})(),
+                None,
+                mkpts0,
+                mkpts1,
+            )
+
+        H_small, mask = cv2.findHomography(
+            mkpts0,
+            mkpts1,
+            cv2.USAC_MAGSAC,
+            3.5,
+            maxIters=1_000,
+            confidence=0.999,
+        )
+        if H_small is None or mask is None:
+            return (
+                type("Res", (), {"ok": False, "inliers": 0, "matches": int(len(mkpts0)), "inlier_ratio": 0.0, "H_ref_to_tgt": None})(),
+                None,
+                mkpts0,
+                mkpts1,
+            )
+
+        mask = mask.reshape(-1).astype(bool)
+        inliers = int(mask.sum())
+        matches_n = int(len(mask))
+        inlier_ratio = float(inliers) / float(matches_n) if matches_n else 0.0
+
+        # scale H back to full resolution: H_full = inv(S_tgt) * H_small * S_ref
+        S_ref = scale_matrix(float(ref.s_ref))
+        S_tgt = scale_matrix(float(s_tgt))
+        H_full = np.linalg.inv(S_tgt) @ H_small @ S_ref
+
+        return (
+            type(
+                "Res",
+                (),
+                {
+                    "ok": True,
+                    "inliers": inliers,
+                    "matches": matches_n,
+                    "inlier_ratio": float(inlier_ratio),
+                    "H_ref_to_tgt": H_full.astype(float).tolist(),
+                },
+            )(),
+            H_full,
+            mkpts0,
+            mkpts1,
+        )
+
+
+def select_top_templates(
+    target_desc: np.ndarray,
+    templates: list[CachedRef],
+    top_n: int,
+) -> list[CachedRef]:
+    if top_n <= 0 or top_n >= len(templates):
+        return templates
+    dists = []
+    for t in templates:
+        d = float(np.linalg.norm(target_desc - t.global_desc))
+        dists.append((d, t))
+    dists.sort(key=lambda x: x[0])
+    return [t for _, t in dists[:top_n]]
+
+
+# ------------------------------------------------------------
+# Homography inversion safety
+# ------------------------------------------------------------
+
+
+def safe_invert_homography(
+    H: np.ndarray,
+    inliers: int,
+    inlier_ratio: float,
+    min_inliers: int,
+    min_inlier_ratio: float,
+    max_cond: float,
+) -> tuple[bool, Optional[np.ndarray], str]:
+    """Safely invert homography.
+
+    - reject if inliers too small
+    - reject if inlier ratio too small
+    - reject if matrix is near singular (det close to 0 or cond too large)
+    """
+
+    if int(inliers) < int(min_inliers):
+        return False, None, f"inliers<{min_inliers} ({inliers})"
+    if float(inlier_ratio) < float(min_inlier_ratio):
+        return False, None, f"inlier_ratio<{min_inlier_ratio:.3f} ({inlier_ratio:.3f})"
+
+    H = np.asarray(H, dtype=np.float64)
+    det = float(np.linalg.det(H))
+    if not math.isfinite(det) or abs(det) < 1e-12:
+        return False, None, f"det too small ({det:.3e})"
+    try:
+        cond = float(np.linalg.cond(H))
+        if not math.isfinite(cond) or (max_cond > 0 and cond > float(max_cond)):
+            return False, None, f"cond too large ({cond:.3e})"
+    except Exception:
+        # cond computation can fail; still try inversion with exception handling
+        cond = float("nan")
+
+    try:
+        H_inv = np.linalg.inv(H)
+        return True, H_inv, "ok"
+    except Exception as e:
+        return False, None, f"inv failed: {e}"
+
+
+# ------------------------------------------------------------
 # IO helpers
 # ------------------------------------------------------------
 
@@ -802,16 +1406,77 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--docaligner-type", choices=["point", "heatmap"], default="heatmap")
     # 透視補正後の紙画像が小さすぎると QR が潰れて検出しづらいので、デフォルトは少し大きめ。
     p.add_argument("--docaligner-max-side", type=int, default=2400, help="Max side length for rectified paper")
+    # (1) polygon margin: ratio-based to be robust across resolutions
     p.add_argument(
-        "--polygon-margin",
+        "--polygon-margin-ratio",
         type=float,
-        default=80.0,
-        help="DocAligner polygon を外側に広げるマージン(px)。端のQR/マーカー欠け対策。",
+        default=0.03,
+        help=(
+            "DocAligner polygon を外側に広げるマージン（紙サイズに対する比率）。"
+            " 例: 0.03 は紙の長辺の 3% をマージンにする。"
+        ),
+    )
+    p.add_argument(
+        "--polygon-margin-min-px",
+        type=float,
+        default=10.0,
+        help="ratio-based マージンの下限(px)",
+    )
+    p.add_argument(
+        "--polygon-margin-max-px",
+        type=float,
+        default=200.0,
+        help="ratio-based マージンの上限(px)（0以下で無制限）",
+    )
+    p.add_argument(
+        "--polygon-margin-px",
+        type=float,
+        default=0.0,
+        help="互換用: 固定pxマージン（>0 の場合 ratio を上書き）",
+    )
+
+    # (2) logging
+    p.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
+    p.add_argument("--console-log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
+
+    # (3) extra preprocessing
+    p.add_argument(
+        "--marker-preproc",
+        choices=["none", "basic", "morph"],
+        default="basic",
+        help="フォームAマーカー検出の前処理（照明ムラ対策）",
+    )
+
+    # (4) template caching / prefilter
+    p.add_argument(
+        "--template-topn",
+        type=int,
+        default=3,
+        help="グローバル特徴で候補テンプレを絞り込む上位N（0で全探索）",
     )
 
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="cpu")
     p.add_argument("--top-k", type=int, default=1024, help="XFeatの特徴点数（大きいほど高精度だが遅い）")
     p.add_argument("--match-max-side", type=int, default=1200, help="XFeat用にリサイズする最大辺(px)（大きいほど高精度だが遅い）")
+
+    # (6) Unknown threshold
+    p.add_argument(
+        "--unknown-score-threshold",
+        type=float,
+        default=1.2,
+        help="フォーム判定スコアがこの値未満なら Unknown 扱い",
+    )
+    p.add_argument(
+        "--unknown-margin",
+        type=float,
+        default=0.15,
+        help="A/B スコア差がこの値未満なら Unknown 扱い（曖昧）",
+    )
+
+    # (7) homography stability
+    p.add_argument("--min-inliers-for-warp", type=int, default=10, help="warp を許可する最小 inlier 数")
+    p.add_argument("--min-inlier-ratio-for-warp", type=float, default=0.15, help="warp を許可する最小 inlier_ratio")
+    p.add_argument("--max-h-cond", type=float, default=1e6, help="Homography 行列の条件数上限（大きいと不安定）")
 
     p.add_argument("--out", type=str, default=str(Path(__file__).resolve().parent / "output_pipeline"))
     p.add_argument("--limit", type=int, default=0, help="Debug: limit number of source images per form (0=all)")
@@ -841,24 +1506,36 @@ def print_explain() -> None:
         f"  --degrade-w/--degrade-h  改悪画像の出力サイズ [default: {defaults.degrade_w}x{defaults.degrade_h}]",
         "",
         "【DocAligner】",
-        f"  --docaligner-model    使用モデル（精度/速度のトレードオフ） [default: {defaults.docaligner_model}]",
+        f"  --docaligner-model    使用モデル（精度/速度のトレードオフ） (lcnet050/lcnet100/fastvit_t8/fastvit_sa24) [default: {defaults.docaligner_model}]",
+        f"  --docaligner-type     推論タイプ (point/heatmap) [default: {defaults.docaligner_type}]",
         f"  --docaligner-max-side 透視補正後の紙画像の最大辺(px) [default: {defaults.docaligner_max_side}]",
-        f"  --polygon-margin      polygon を外側に広げる(px)。端のQR/マーカー欠け対策 [default: {defaults.polygon_margin}]",
+        "  --polygon-margin-ratio 紙サイズ比で polygon を外側に広げる（解像度差に強い）",
+        f"    default: {defaults.polygon_margin_ratio} (min={defaults.polygon_margin_min_px}px, max={defaults.polygon_margin_max_px}px)",
+        f"  --polygon-margin-px    固定pxで polygon を外側に広げる（>0で ratio を上書き） [default: {defaults.polygon_margin_px}]",
         "",
         "【フォーム判定】",
         f"  --rotation-step       0..350度を何度刻みで回して判定するか（例: 10） [default: {defaults.rotation_step}]",
         f"  --rotation-max-workers 回転スキャンの並列数（スレッド） [default: {defaults.rotation_max_workers}]",
+        f"  --rotation-mode       改悪生成の回転モード (uniform/snap) [default: {defaults.rotation_mode}]",
+        f"  --marker-preproc      フォームAマーカー前処理 (none/basic/morph) [default: {defaults.marker_preproc}]",
+        f"  --unknown-score-threshold スコアが低ければ Unknown 扱い [default: {defaults.unknown_score_threshold}]",
+        f"  --unknown-margin      A/B のスコア差が小さければ Unknown 扱い [default: {defaults.unknown_margin}]",
         "",
         "【XFeat（位置合わせ）】",
-        f"  --device              XFeatの実行デバイス（cpu/cuda/auto） [default: {defaults.device}]",
+        f"  --device              XFeatの実行デバイス (auto/cpu/cuda) [default: {defaults.device}]",
         f"  --top-k               特徴点数（大きいほど高精度だが遅い） [default: {defaults.top_k}]",
         f"  --match-max-side      マッチング前にリサイズする最大辺(px)（大きいほど高精度だが遅い） [default: {defaults.match_max_side}]",
+        f"  --template-topn       グローバル特徴でテンプレ候補を絞る上位N（0で全探索） [default: {defaults.template_topn}]",
+        "",
+        "【ログ】",
+        f"  --log-level           ログレベル (DEBUG/INFO/WARNING/ERROR) [default: {defaults.log_level}]",
+        f"  --console-log-level   コンソールログレベル (DEBUG/INFO/WARNING/ERROR) [default: {defaults.console_log_level}]",
         "",
         "【出力】",
         f"  --out                 出力ディレクトリ（run_... が作成される） [default: {defaults.out}]",
         "",
         "最小コマンド例（おすすめデフォルト使用）:",
-        r"  C:\Users\takumi\develop\miniconda3\python.exe APA\paper_pipeline.py --limit 1",
+        r"  C:\Users\takumi\develop\miniconda3\python.exe APA\paper_pipeline_v2.py --limit 1",
         "",
     ]
     print("\n".join(lines))
@@ -873,7 +1550,15 @@ def print_config(args: argparse.Namespace) -> None:
     print(f"  degrade-n           : {args.degrade_n}")
     print(f"  rotation-step       : {args.rotation_step} deg")
     print(f"  rotation-max-workers: {args.rotation_max_workers}")
-    print(f"  polygon-margin      : {args.polygon_margin} px")
+    if float(getattr(args, "polygon_margin_px", 0.0)) > 0:
+        print(f"  polygon-margin      : {args.polygon_margin_px} px (fixed)")
+    else:
+        print(
+            f"  polygon-margin      : ratio={args.polygon_margin_ratio} (min={args.polygon_margin_min_px}px, max={args.polygon_margin_max_px}px)"
+        )
+    print(f"  marker-preproc      : {args.marker_preproc}")
+    print(f"  template-topn       : {args.template_topn}")
+    print(f"  unknown-threshold   : {args.unknown_score_threshold} / margin={args.unknown_margin}")
     print(f"  device              : {args.device}")
     print(f"  top-k               : {args.top_k}")
     print(f"  match-max-side      : {args.match_max_side} px")
@@ -889,6 +1574,258 @@ def load_docaligner_model(model_name: str, model_type: str) -> tuple[Any, Any]:
     return model, cb
 
 
+# ------------------------------------------------------------
+# main pipeline split
+# ------------------------------------------------------------
+
+
+@dataclass
+class StageTimes:
+    degrade_s: float = 0.0
+    docaligner_s: float = 0.0
+    rectify_s: float = 0.0
+    decide_s: float = 0.0
+    match_s: float = 0.0
+    warp_s: float = 0.0
+
+
+def process_one_case(
+    *,
+    logger: logging.Logger,
+    args: argparse.Namespace,
+    model: Any,
+    cb: Any,
+    matcher: XFeatMatcher,
+    cached_matcher: Optional[CachedXFeatMatcher],
+    templates_A: list[CachedRef],
+    templates_B: list[CachedRef],
+    src_form: str,
+    src_path: Path,
+    src_bgr: np.ndarray,
+    k: int,
+    angles: list[float],
+    out_dirs: dict[str, Path],
+) -> tuple[dict[str, Any], StageTimes]:
+    """Process one degraded variant of one source image."""
+
+    case_id = f"{src_form}_{src_path.stem}_deg{k:02d}"
+    item: dict[str, Any] = {
+        "source_form": src_form,
+        "source_path": str(src_path),
+        "case": case_id,
+        "ok": False,
+        "stage": "start",
+    }
+    times = StageTimes()
+
+    # stable RNG per case
+    stable = zlib.crc32(f"{src_form}/{src_path.name}".encode("utf-8")) & 0xFFFFFFFF
+    case_seed = (int(args.seed) * 1_000_000) + int(stable) * 100 + int(k)
+    rng = random.Random(case_seed)
+
+    # 1) degrade
+    t0 = time.perf_counter()
+    degraded_bgr, H_src_to_deg, degrade_meta = warp_template_to_random_view(
+        src_bgr,
+        out_size=(int(args.degrade_w), int(args.degrade_h)),
+        rng=rng,
+        max_rotation_deg=float(args.max_rot),
+        min_abs_rotation_deg=float(args.min_abs_rot),
+        rotation_mode=str(args.rotation_mode),
+        snap_step_deg=float(args.snap_step_deg),
+        perspective_jitter=float(args.perspective),
+        min_visible_area_ratio=float(args.min_visible_area_ratio),
+        max_attempts=int(args.max_attempts),
+    )
+    times.degrade_s = time.perf_counter() - t0
+    cv2.imwrite(str(out_dirs["degraded"] / f"{case_id}.jpg"), degraded_bgr)
+    item["stage"] = "degraded"
+    item["degrade"] = degrade_meta
+    item["H_src_to_degraded"] = H_src_to_deg.astype(float).tolist()
+
+    # 2) DocAligner
+    t0 = time.perf_counter()
+    poly = detect_polygon_docaligner(model, cb, degraded_bgr)
+    times.docaligner_s = time.perf_counter() - t0
+    if poly is None:
+        item["stage"] = "docaligner_failed"
+        return item, times
+
+    item["stage"] = "docaligner_ok"
+    item["polygon"] = poly.astype(float).tolist()
+
+    # (1) polygon margin: ratio-based by default
+    if float(getattr(args, "polygon_margin_px", 0.0)) > 0:
+        margin_px = float(args.polygon_margin_px)
+        item["polygon_margin"] = {"mode": "fixed_px", "value": margin_px}
+    else:
+        margin_px = polygon_margin_px_from_ratio(
+            poly,
+            ratio=float(args.polygon_margin_ratio),
+            min_px=float(args.polygon_margin_min_px),
+            max_px=float(args.polygon_margin_max_px),
+        )
+        item["polygon_margin"] = {
+            "mode": "ratio",
+            "ratio": float(args.polygon_margin_ratio),
+            "min_px": float(args.polygon_margin_min_px),
+            "max_px": float(args.polygon_margin_max_px),
+            "computed_px": float(margin_px),
+        }
+
+    poly_exp = expand_polygon(
+        poly,
+        margin_px=float(margin_px),
+        img_w=int(degraded_bgr.shape[1]),
+        img_h=int(degraded_bgr.shape[0]),
+    )
+    overlay = draw_polygon_overlay(degraded_bgr, poly_exp)
+    cv2.imwrite(str(out_dirs["doc"] / f"{case_id}_doc.jpg"), overlay)
+
+    # 3) Rectify
+    t0 = time.perf_counter()
+    rectified, H_deg_to_rect = polygon_to_rectified(
+        degraded_bgr,
+        poly_exp,
+        out_max_side=int(args.docaligner_max_side),
+    )
+    rectified, _ = enforce_landscape(rectified)
+    times.rectify_s = time.perf_counter() - t0
+    cv2.imwrite(str(out_dirs["rect"] / f"{case_id}_rect.jpg"), rectified)
+    item["stage"] = "rectified"
+    item["H_degraded_to_rectified"] = H_deg_to_rect.astype(float).tolist()
+
+    # 4) decide form by rotations
+    t0 = time.perf_counter()
+    decision = decide_form_by_rotations(
+        rectified,
+        angles=angles,
+        max_workers=int(args.rotation_max_workers),
+        marker_preproc=str(args.marker_preproc),
+        unknown_score_threshold=float(args.unknown_score_threshold),
+        unknown_margin=float(args.unknown_margin),
+    )
+    times.decide_s = time.perf_counter() - t0
+    item["form_decision"] = asdict(decision)
+    if not decision.ok or decision.form not in ("A", "B") or decision.angle_deg is None:
+        item["stage"] = "form_unknown"
+        return item, times
+    item["stage"] = "form_found"
+
+    chosen = rotate_image_bound(rectified, float(decision.angle_deg))
+    chosen, _ = enforce_landscape(chosen)
+
+    # visualize decision evidence
+    if decision.form == "A":
+        markers = ((decision.detail or {}).get("A") or {}).get("markers") or []
+        rot_vis = draw_formA_markers_overlay(chosen, markers)
+    else:
+        qrs = ((decision.detail or {}).get("B") or {}).get("qrs")
+        if not qrs:
+            qrs = detect_qr_codes_robust(chosen)
+        rot_vis = draw_formB_qr_overlay(chosen, qrs)
+    cv2.imwrite(str(out_dirs["rot"] / f"{case_id}_rot.jpg"), rot_vis)
+
+    # 5) XFeat matching (template caching + prefilter)
+    t0 = time.perf_counter()
+    templates = templates_A if decision.form == "A" else templates_B
+    best: Optional[dict[str, Any]] = None
+
+    # prefilter templates by global descriptor
+    target_desc = compute_global_descriptor(chosen)
+    candidates = select_top_templates(target_desc, templates, top_n=int(args.template_topn))
+    item["template_prefilter"] = {
+        "topn": int(args.template_topn),
+        "candidates": [c.template_path for c in candidates],
+        "total": len(templates),
+    }
+
+    for ref in candidates:
+        tp = Path(ref.template_path)
+        tpl_bgr = cv2.imread(str(tp))
+        if tpl_bgr is None:
+            continue
+
+        if cached_matcher is not None:
+            res, H_tpl_to_img, mk0, mk1 = cached_matcher.match_with_cached_ref(ref, chosen)
+        else:
+            res, H_tpl_to_img, mk0, mk1 = matcher.match_and_estimate_h(tpl_bgr, chosen)
+
+        ok = bool(getattr(res, "ok", False)) and H_tpl_to_img is not None
+        cand = {
+            "template": str(tp),
+            "ok": ok,
+            "inliers": int(getattr(res, "inliers", 0)),
+            "matches": int(getattr(res, "matches", 0)),
+            "inlier_ratio": float(getattr(res, "inlier_ratio", 0.0)),
+        }
+        if ok and getattr(res, "H_ref_to_tgt", None) is not None:
+            cand["H_ref_to_tgt"] = getattr(res, "H_ref_to_tgt")
+        if best is None:
+            best = cand
+        else:
+            if int(cand.get("inliers", 0)) > int(best.get("inliers", 0)):
+                best = cand
+            elif int(cand.get("inliers", 0)) == int(best.get("inliers", 0)):
+                if float(cand.get("inlier_ratio", 0.0)) > float(best.get("inlier_ratio", 0.0)):
+                    best = cand
+
+    times.match_s = time.perf_counter() - t0
+    item["best_match"] = best
+    if best is None or not best.get("ok"):
+        item["stage"] = "xfeat_failed"
+        return item, times
+
+    tpl_path = Path(str(best["template"]))
+    tpl_bgr = cv2.imread(str(tpl_path))
+    if tpl_bgr is None:
+        item["stage"] = "template_read_failed"
+        return item, times
+
+    # (7) inverse homography stability
+    t0 = time.perf_counter()
+    H_tpl_to_img = np.asarray(best.get("H_ref_to_tgt"), dtype=np.float64)
+    ok_inv, H_img_to_tpl, inv_reason = safe_invert_homography(
+        H_tpl_to_img,
+        inliers=int(best.get("inliers", 0)),
+        inlier_ratio=float(best.get("inlier_ratio", 0.0)),
+        min_inliers=int(args.min_inliers_for_warp),
+        min_inlier_ratio=float(args.min_inlier_ratio_for_warp),
+        max_cond=float(args.max_h_cond),
+    )
+    item["homography_inv"] = {"ok": bool(ok_inv), "reason": inv_reason}
+    if not ok_inv or H_img_to_tpl is None:
+        item["stage"] = "homography_unstable"
+        return item, times
+
+    warped = cv2.warpPerspective(chosen, H_img_to_tpl, (tpl_bgr.shape[1], tpl_bgr.shape[0]))
+    cv2.imwrite(str(out_dirs["aligned"] / f"{case_id}_aligned.jpg"), warped)
+    times.warp_s = time.perf_counter() - t0
+
+    # debug matches (best effort)
+    try:
+        res2, _, mk0, mk1 = matcher.match_and_estimate_h(tpl_bgr, chosen)
+        if getattr(res2, "ok", False) and mk0 is not None and mk1 is not None:
+            dbg = draw_inlier_matches(tpl_bgr, chosen, mk0, mk1, args.match_max_side)
+            cv2.imwrite(str(out_dirs["debug_matches"] / f"{case_id}_matches.jpg"), dbg)
+    except Exception:
+        pass
+
+    item["stage"] = "done"
+    item["ok"] = True
+    logger.info(
+        "[OK] %s form=%s angle=%.1f best=%s inliers=%s (%.3f) time=%.2fs",
+        case_id,
+        decision.form,
+        float(decision.angle_deg),
+        tpl_path.name,
+        best.get("inliers"),
+        float(best.get("inlier_ratio", 0.0)),
+        (times.degrade_s + times.docaligner_s + times.rectify_s + times.decide_s + times.match_s + times.warp_s),
+    )
+    return item, times
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
 
@@ -896,60 +1833,113 @@ def main(argv=None) -> int:
         print_explain()
         return 0
 
-    print("=" * 70)
-    print("paper_pipeline")
-    print("=" * 70)
-    print(f"OpenCV: {cv2.__version__}")
-    print(f"torch: {torch.__version__}")
-    print(f"src-forms: {args.src_forms}")
+    # Output root (create early so we can place log file)
+    out_root = mkdir(Path(args.out) / f"run_{now_run_id()}")
+    logger = setup_logging(out_root, level=str(args.log_level), console_level=str(args.console_log_level))
+
+    logger.info("=" * 70)
+    logger.info("paper_pipeline_v2")
+    logger.info("=" * 70)
+    logger.info("OpenCV: %s", cv2.__version__)
+    logger.info("torch : %s", torch.__version__)
+    logger.info("src-forms: %s", args.src_forms)
     print_config(args)
 
     # Setup device for XFeat
     device = "cuda" if args.device == "auto" and torch.cuda.is_available() else (args.device if args.device != "auto" else "cpu")
     ensure_portable_git_on_path()
 
-    # Output directories
-    out_root = mkdir(Path(args.out) / f"run_{now_run_id()}")
-    # 出力は「処理順が分かる」ように番号付きフォルダ名にする
-    degraded_dir = mkdir(out_root / "1_degraded")
-    doc_dir = mkdir(out_root / "2_doc")
-    rect_dir = mkdir(out_root / "3_rectified")
-    rot_dir = mkdir(out_root / "4_rectified_rot")
-    debug_matches_dir = mkdir(out_root / "5_debug_matches")
-    aligned_dir = mkdir(out_root / "6_aligned")
+    # Output directories (numbered)
+    out_dirs = {
+        "degraded": mkdir(out_root / "1_degraded"),
+        "doc": mkdir(out_root / "2_doc"),
+        "rect": mkdir(out_root / "3_rectified"),
+        "rot": mkdir(out_root / "4_rectified_rot"),
+        "debug_matches": mkdir(out_root / "5_debug_matches"),
+        "aligned": mkdir(out_root / "6_aligned"),
+    }
 
     # Load heavy models
-    print("[INFO] Loading DocAligner...")
+    logger.info("[INFO] Loading DocAligner...")
     model, cb = load_docaligner_model(args.docaligner_model, args.docaligner_type)
-    print("[OK] DocAligner loaded")
+    logger.info("[OK] DocAligner loaded")
 
-    print("[INFO] Loading XFeat...")
+    logger.info("[INFO] Loading XFeat...")
     matcher = XFeatMatcher(top_k=args.top_k, device=device, match_max_side=args.match_max_side)
-    print("[OK] XFeat loaded")
+    logger.info("[OK] XFeat loaded")
+
+    # (4) template cache
+    cached_matcher: Optional[CachedXFeatMatcher] = None
+    try:
+        cached_matcher = CachedXFeatMatcher(matcher)
+        logger.info("[OK] CachedXFeatMatcher enabled")
+    except Exception as e:
+        logger.warning("[WARN] CachedXFeatMatcher disabled: %s", e)
+        cached_matcher = None
 
     # Prepare angles for form detection
     step = float(args.rotation_step)
     angles = [float(a) for a in np.arange(0.0, 360.0, step) if a < 360.0 - 1e-6]
     angles = [a for a in angles if a <= 350.0 + 1e-6]  # enforce 0..350
     if not angles:
-        print("[ERROR] rotation angles list is empty")
+        logger.error("rotation angles list is empty")
         return 1
 
     src_forms = [s.strip() for s in args.src_forms.split(",") if s.strip()]
     src_forms = [s for s in src_forms if s in ("A", "B", "C")]
     if not src_forms:
-        print("[ERROR] src-forms must contain at least one of A,B,C")
+        logger.error("src-forms must contain at least one of A,B,C")
         return 1
 
     # Templates for final alignment (A/B only)
-    templates_A = list_images("A")
-    templates_B = list_images("B")
-    if not templates_A or not templates_B:
-        print("[ERROR] templates not found. Expected APA/image/A and APA/image/B")
+    template_paths_A = list_images("A")
+    template_paths_B = list_images("B")
+    if not template_paths_A or not template_paths_B:
+        logger.error("templates not found. Expected APA/image/A and APA/image/B")
         return 1
 
+    # warm-up template cache
+    templates_A: list[CachedRef] = []
+    templates_B: list[CachedRef] = []
+    if cached_matcher is not None:
+        for pth in template_paths_A:
+            img = cv2.imread(str(pth))
+            if img is None:
+                continue
+            templates_A.append(cached_matcher.prepare_ref(img, str(pth)))
+        for pth in template_paths_B:
+            img = cv2.imread(str(pth))
+            if img is None:
+                continue
+            templates_B.append(cached_matcher.prepare_ref(img, str(pth)))
+        logger.info("[OK] template cache built: A=%d B=%d", len(templates_A), len(templates_B))
+    else:
+        # still need global desc for prefilter: build minimal cache
+        for pth in template_paths_A:
+            img = cv2.imread(str(pth))
+            if img is None:
+                continue
+            templates_A.append(CachedRef(str(pth), img, 1.0, {}, compute_global_descriptor(img)))
+        for pth in template_paths_B:
+            img = cv2.imread(str(pth))
+            if img is None:
+                continue
+            templates_B.append(CachedRef(str(pth), img, 1.0, {}, compute_global_descriptor(img)))
+        logger.info("[OK] template global-desc cache built: A=%d B=%d", len(templates_A), len(templates_B))
+
     summary: list[dict[str, Any]] = []
-    t_all0 = time.time()
+    t_all0 = time.perf_counter()
+
+    # stage aggregates
+    stage_counts: dict[str, int] = {}
+    stage_times: dict[str, float] = {
+        "degrade_s": 0.0,
+        "docaligner_s": 0.0,
+        "rectify_s": 0.0,
+        "decide_s": 0.0,
+        "match_s": 0.0,
+        "warp_s": 0.0,
+    }
 
     for sf in src_forms:
         sources = list_images(sf)
@@ -957,179 +1947,56 @@ def main(argv=None) -> int:
             sources = sources[: int(args.limit)]
 
         if not sources:
-            print(f"[WARN] no sources: APA/image/{sf}")
+            logger.warning("no sources: APA/image/%s", sf)
             continue
 
-        print(f"\n[INFO] Processing sources from form {sf}: {len(sources)} images")
+        logger.info("Processing sources from form %s: %d images", sf, len(sources))
         for sp in sources:
             src_bgr = cv2.imread(str(sp))
             if src_bgr is None:
-                print(f"[WARN] failed to read: {sp}")
+                logger.warning("failed to read: %s", sp)
                 continue
 
             for k in range(int(args.degrade_n)):
-                case_id = f"{sf}_{sp.stem}_deg{k:02d}"
-                item: dict[str, Any] = {
-                    "source_form": sf,
-                    "source_path": str(sp),
-                    "case": case_id,
-                    "ok": False,
-                    "stage": "start",
-                }
-
-                # Make per-case RNG so that results are reproducible and independent of processing order.
-                # NOTE: Python の hash() は実行ごとに値が変わり得るため、
-                # 安定なハッシュ（crc32）を使って seed を作る。
-                stable = zlib.crc32(f"{sf}/{sp.name}".encode("utf-8")) & 0xFFFFFFFF
-                case_seed = (int(args.seed) * 1_000_000) + int(stable) * 100 + int(k)
-                rng = random.Random(case_seed)
-
-                degraded_bgr, H_src_to_deg, degrade_meta = warp_template_to_random_view(
-                    src_bgr,
-                    out_size=(int(args.degrade_w), int(args.degrade_h)),
-                    rng=rng,
-                    max_rotation_deg=float(args.max_rot),
-                    min_abs_rotation_deg=float(args.min_abs_rot),
-                    rotation_mode=str(args.rotation_mode),
-                    snap_step_deg=float(args.snap_step_deg),
-                    perspective_jitter=float(args.perspective),
-                    min_visible_area_ratio=float(args.min_visible_area_ratio),
-                    max_attempts=int(args.max_attempts),
-                )
-                cv2.imwrite(str(degraded_dir / f"{case_id}.jpg"), degraded_bgr)
-                item["stage"] = "degraded"
-                item["degrade"] = degrade_meta
-                item["H_src_to_degraded"] = H_src_to_deg.astype(float).tolist()
-
-                # DocAligner polygon
-                poly = detect_polygon_docaligner(model, cb, degraded_bgr)
-                if poly is None:
-                    item["stage"] = "docaligner_failed"
-                    summary.append(item)
-                    continue
-
-                item["stage"] = "docaligner_ok"
-                item["polygon"] = poly.astype(float).tolist()
-                # Expand polygon slightly to avoid clipping markers/QR near the paper edge
-                poly_exp = expand_polygon(
-                    poly,
-                    margin_px=float(args.polygon_margin),
-                    img_w=int(degraded_bgr.shape[1]),
-                    img_h=int(degraded_bgr.shape[0]),
-                )
-
-                overlay = draw_polygon_overlay(degraded_bgr, poly_exp)
-                cv2.imwrite(str(doc_dir / f"{case_id}_doc.jpg"), overlay)
-
-                # Rectify (perspective)
-                rectified, H_deg_to_rect = polygon_to_rectified(
-                    degraded_bgr,
-                    poly_exp,
-                    out_max_side=int(args.docaligner_max_side),
-                )
-                # ユーザー要望: 透視補正後は横長（landscape）に統一
-                rectified, _ = enforce_landscape(rectified)
-                cv2.imwrite(str(rect_dir / f"{case_id}_rect.jpg"), rectified)
-                item["stage"] = "rectified"
-                item["H_degraded_to_rectified"] = H_deg_to_rect.astype(float).tolist()
-
-                # Decide form by rotations
-                decision = decide_form_by_rotations(
-                    rectified,
-                    angles=angles,
-                    max_workers=int(args.rotation_max_workers),
-                )
-                item["form_decision"] = asdict(decision)
-                if not decision.ok or decision.form not in ("A", "B") or decision.angle_deg is None:
-                    item["stage"] = "form_not_found"
-                    summary.append(item)
-                    continue
-
-                item["stage"] = "form_found"
-                # Create the chosen rotated image used for matching
-                chosen = rotate_image_bound(rectified, float(decision.angle_deg))
-                chosen, _ = enforce_landscape(chosen)
-
-                # 4_rectified_rot は「フォーム判定に使った回転後画像」なので、
-                # 判定に使った特徴（A=3点マーカー / B=QR）を可視化して保存する。
-                if decision.form == "A":
-                    markers = ((decision.detail or {}).get("A") or {}).get("markers") or []
-                    rot_vis = draw_formA_markers_overlay(chosen, markers)
-                else:
-                    # B の場合、ROBUSTで確定した情報があればそれを優先。
-                    qrs = ((decision.detail or {}).get("B") or {}).get("qrs")
-                    if not qrs:
-                        qrs = detect_qr_codes_robust(chosen)
-                    rot_vis = draw_formB_qr_overlay(chosen, qrs)
-
-                cv2.imwrite(str(rot_dir / f"{case_id}_rot.jpg"), rot_vis)
-
-                # Match against all templates of the decided form
-                templates = templates_A if decision.form == "A" else templates_B
-                best: Optional[dict[str, Any]] = None
-                for tp in templates:
-                    tpl_bgr = cv2.imread(str(tp))
-                    if tpl_bgr is None:
-                        continue
-                    res, H_tpl_to_img, mk0, mk1 = matcher.match_and_estimate_h(tpl_bgr, chosen)
-                    if not res.ok or H_tpl_to_img is None or mk0 is None or mk1 is None:
-                        cand = {
-                            "template": str(tp),
-                            "ok": False,
-                            "inliers": int(getattr(res, "inliers", 0)),
-                            "matches": int(getattr(res, "matches", 0)),
-                            "inlier_ratio": float(getattr(res, "inlier_ratio", 0.0)),
-                        }
-                    else:
-                        cand = {
-                            "template": str(tp),
-                            "ok": True,
-                            "H_template_to_image": H_tpl_to_img.astype(float).tolist(),
-                            **asdict(res),
-                        }
-                    if best is None:
-                        best = cand
-                    else:
-                        # choose by inliers (対応点の一致数として採用)
-                        if int(cand.get("inliers", 0)) > int(best.get("inliers", 0)):
-                            best = cand
-                        elif int(cand.get("inliers", 0)) == int(best.get("inliers", 0)):
-                            if float(cand.get("inlier_ratio", 0.0)) > float(best.get("inlier_ratio", 0.0)):
-                                best = cand
-
-                item["best_match"] = best
-                if best is None or not best.get("ok"):
-                    item["stage"] = "xfeat_failed"
-                    summary.append(item)
-                    continue
-
-                # Warp chosen image to template plane
-                tpl_path = Path(str(best["template"]))
-                tpl_bgr = cv2.imread(str(tpl_path))
-                if tpl_bgr is None:
-                    item["stage"] = "template_read_failed"
-                    summary.append(item)
-                    continue
-
-                H_tpl_to_img = np.asarray(best["H_ref_to_tgt"], dtype=np.float64)
-                H_img_to_tpl = np.linalg.inv(H_tpl_to_img)
-                warped = cv2.warpPerspective(chosen, H_img_to_tpl, (tpl_bgr.shape[1], tpl_bgr.shape[0]))
-                cv2.imwrite(str(aligned_dir / f"{case_id}_aligned.jpg"), warped)
-
-                # debug matches (visualization uses internal resized coords)
                 try:
-                    # recompute mkpts for visualization
-                    res2, _, mk0, mk1 = matcher.match_and_estimate_h(tpl_bgr, chosen)
-                    if res2.ok and mk0 is not None and mk1 is not None:
-                        dbg = draw_inlier_matches(tpl_bgr, chosen, mk0, mk1, args.match_max_side)
-                        cv2.imwrite(str(debug_matches_dir / f"{case_id}_matches.jpg"), dbg)
-                except Exception:
-                    pass
+                    item, st = process_one_case(
+                        logger=logger,
+                        args=args,
+                        model=model,
+                        cb=cb,
+                        matcher=matcher,
+                        cached_matcher=cached_matcher,
+                        templates_A=templates_A,
+                        templates_B=templates_B,
+                        src_form=sf,
+                        src_path=sp,
+                        src_bgr=src_bgr,
+                        k=k,
+                        angles=angles,
+                        out_dirs=out_dirs,
+                    )
+                except Exception as e:
+                    item = {
+                        "source_form": sf,
+                        "source_path": str(sp),
+                        "case": f"{sf}_{sp.stem}_deg{k:02d}",
+                        "ok": False,
+                        "stage": "exception",
+                        "error": str(e),
+                        "traceback": traceback.format_exc(),
+                    }
+                    st = StageTimes()
+                    logger.error("[ERROR] case failed: %s\n%s", item.get("case"), item.get("traceback"))
 
-                item["stage"] = "done"
-                item["ok"] = True
                 summary.append(item)
-                print(f"  [OK] {case_id}: form={decision.form} angle={decision.angle_deg} best={tpl_path.name} inliers={best.get('inliers')}")
+                stage = str(item.get("stage", ""))
+                stage_counts[stage] = int(stage_counts.get(stage, 0)) + 1
+                stage_times["degrade_s"] += float(st.degrade_s)
+                stage_times["docaligner_s"] += float(st.docaligner_s)
+                stage_times["rectify_s"] += float(st.rectify_s)
+                stage_times["decide_s"] += float(st.decide_s)
+                stage_times["match_s"] += float(st.match_s)
+                stage_times["warp_s"] += float(st.warp_s)
 
     # Save summary
     with open(out_root / "summary.json", "w", encoding="utf-8") as f:
@@ -1167,9 +2034,22 @@ def main(argv=None) -> int:
             ]
             f.write(",".join(row) + "\n")
 
-    dt = time.time() - t_all0
-    print(f"\n[DONE] outputs: {out_root}")
-    print(f"[DONE] elapsed: {dt:.1f}s")
+    dt = time.perf_counter() - t_all0
+
+    # (2) stage summary
+    total_cases = len(summary)
+    ok_cases = sum(1 for s in summary if bool(s.get("ok")))
+    logger.info("=" * 70)
+    logger.info("[SUMMARY] total=%d ok=%d (%.1f%%)", total_cases, ok_cases, (ok_cases / total_cases * 100.0) if total_cases else 0.0)
+    logger.info("[SUMMARY] stage counts:")
+    for k, v in sorted(stage_counts.items(), key=lambda x: (-x[1], x[0])):
+        logger.info("  %-20s : %d", k, v)
+    logger.info("[SUMMARY] stage time totals (s):")
+    for k, v in stage_times.items():
+        logger.info("  %-12s : %.2f", k, float(v))
+
+    logger.info("[DONE] outputs: %s", out_root)
+    logger.info("[DONE] elapsed: %.1fs", dt)
     return 0
 
 
