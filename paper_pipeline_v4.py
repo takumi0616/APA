@@ -2,7 +2,11 @@
 # -*- coding: utf-8 -*-
 """paper_pipeline_v4.py
 
-C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v4.py --degrade-n 3 --template-topn 0
+[windows]
+C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v4.py --degrade-n 3
+
+[mac]
+.venv/bin/python paper_pipeline_v4.py --degrade-n 3
 
 目的
 ----
