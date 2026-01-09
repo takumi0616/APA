@@ -30,15 +30,19 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v4.py --degrade
 2) DocAligner により紙領域 polygon（4点）を推定
    - 失敗したら `stage=docaligner_failed` で終了
 3) polygon を（紙サイズ比の margin で）外側に拡張 → 透視補正（rectify）
+   - 透視補正後の画像は横長に統一（`enforce_landscape`）
+   - `--polygon-margin-px > 0` の場合は固定pxマージンで上書き可能
 4) フォーム判定（回転探索）
    - 角度リストは仕様として `0..350` を `--rotation-step` 刻みで作成
    - 実処理は高速化のため Coarse-to-Fine（0/90/180/270 で粗探索→近傍のみ探索）
    - フォームA: 3点マーク（TL/TR/BL）が検出できる（`--marker-preproc` で前処理オプション）
-   - フォームB: QRコードが検出できる（robust前処理 + マルチスケール）
+   - フォームB: QRコードが検出できる
+     - まず高速（軽量）検出で角度候補を絞り、最後に robust 検出で確定
+     - `--wechat-model-dir` にモデルがあり、opencv-contrib が入っていれば WeChat QR エンジンを優先（小さいQRに強い）
    - 判定不能/曖昧なら `stage=form_unknown`（Unknown）で終了
 5) XFeat matching によるテンプレ照合
    - テンプレは `APA/image/A` または `APA/image/B`（`1.jpg`〜`6.jpg`）
-   - グローバル特徴で上位 `--template-topn` 枚へ絞り込み→局所特徴で精密推定
+   - グローバル特徴で上位 `--template-topn` 枚へ絞り込み→局所特徴で精密推定（`--template-topn 0` で全探索）
 6) Homography を信頼度チェックの上で逆行列化し、テンプレ座標へ warp
    - 不安定なら `stage=homography_unstable` で終了
 
@@ -59,6 +63,10 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v4.py --degrade
 ----
 - torch.hub 経由の XFeat 読み込みで git が必要になることがあるため、
   portable git を PATH に追加する処理を `test_recovery_paper` から流用する。
+- QR 検出は OpenCV 標準の `QRCodeDetector` を基本にしつつ、
+  条件により WeChat QR エンジン（`cv2.wechat_qrcode_WeChatQRCode`）も利用する。
+  - WeChat を使うには opencv-contrib のビルドと、4つのモデルファイル
+    （detect/sr の prototxt/caffemodel）が必要
 - 日本語ラベル描画は Pillow を使用（OpenCV putText は日本語非対応のため）。
   - `APA_FONT_PATH` を設定すると任意フォントを優先可能
 
@@ -194,7 +202,7 @@ def init_wechat_qr_detector(model_dir: str, logger: Optional[logging.Logger] = N
 
 
 # --- reuse implementations from previous work ---
-# NOTE: このスクリプトは `python APA/paper_pipeline_v2.py ...` の形で実行される想定。
+# NOTE: このスクリプトは `python APA/paper_pipeline_v4.py ...` の形で実行される想定。
 # その場合 sys.path[0] は `.../APA` になるため、同ディレクトリのモジュールは
 # `from test_recovery_paper import ...` の形で import する（`import APA.xxx` は失敗しやすい）。
 from test_recovery_paper import (
@@ -2090,7 +2098,7 @@ def print_explain() -> None:
         f"  --out                 出力ディレクトリ（run_... が作成される） [default: {defaults.out}]",
         "",
         "最小コマンド例（おすすめデフォルト使用）:",
-        r"  C:\Users\takumi\develop\miniconda3\python.exe APA\paper_pipeline_v3.py --limit 1",
+        r"  C:\Users\takumi\develop\miniconda3\python.exe APA\paper_pipeline_v4.py --limit 1",
         "",
     ]
     print("\n".join(lines))
@@ -2660,7 +2668,7 @@ def main(argv=None) -> int:
     logger = setup_logging(out_root, level=str(args.log_level), console_level=str(args.console_log_level))
 
     logger.info("=" * 70)
-    logger.info("paper_pipeline_v3")
+    logger.info("paper_pipeline_v4")
     logger.info("=" * 70)
     logger.info("OpenCV: %s", cv2.__version__)
     logger.info("torch : %s", torch.__version__)
