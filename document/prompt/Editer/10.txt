@@ -1,0 +1,30 @@
+# タスク（プロンプト）を行う前に必ず以下の資料を読んでください
+
+この資料は環境がどう構築されたかを記しておりコマンド実行などの際は必ず参考にしてください
+@/git_installation_guide.md
+@/miniconda_installation_guide.md
+
+タスクを行った際は、タスク成功後に、行ったことをマークダウン記法でまとめたものを@/APA\document\report の中にファイルを作成してください
+ファイル名のルール：番号_年月日_行ったことを日本語.md（例：1_20260106_環境構築）
+番号は@/APA\document\report の中を精査して確認してください
+これまでのreportも読み込んでからタスクを行ってください
+---
+# プロンプト
+
+@/APA\paper_pipeline_v4.py 
+現在私は上記のプログラムの精度向上に努めています
+以下のログを見てほしいのですが、正解はフォームAなのですが認識に失敗している事例があります
+stage=form_unknownのように書いているのですが、具体的にどのチェックに引っかかったのかわからないのでそれをログに残すようにしてほしいです
+csvの方のログにも出してください
+```
+2026-01-09 15:36:08 [WARNING] [CASE] id=A_4_deg01 ok=FALSE ok_warp=FALSE stage=form_unknown gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=22.562778 (1_degrade=1.041847,2_doc=0.197494,3_rectify=0.006298,4_decide=21.257634,5_match=0.000000,6_warp=0.000000) src=4.jpg
+2026-01-09 15:36:31 [WARNING] [CASE] id=A_4_deg02 ok=FALSE ok_warp=FALSE stage=form_unknown gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=22.619900 (1_degrade=0.692482,2_doc=0.229396,3_rectify=0.006975,4_decide=21.618901,5_match=0.000000,6_warp=0.000000) src=4.jpg
+2026-01-09 15:36:41 [INFO] [CASE] id=A_5_deg00 ok=TRUE ok_warp=TRUE stage=done gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=383 inlier_ratio=0.8114406779661016 time_total_s=9.881593 (1_degrade=0.769115,2_doc=0.223101,3_rectify=0.008689,4_decide=4.939644,5_match=2.866174,6_warp=0.072324) src=5.jpg
+2026-01-09 15:36:49 [INFO] [CASE] id=A_5_deg01 ok=TRUE ok_warp=TRUE stage=done gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=423 inlier_ratio=0.8376237623762376 time_total_s=8.461404 (1_degrade=0.685443,2_doc=0.207305,3_rectify=0.007031,4_decide=3.722117,5_match=2.939291,6_warp=0.063928) src=5.jpg
+2026-01-09 15:37:10 [WARNING] [CASE] id=A_5_deg02 ok=FALSE ok_warp=FALSE stage=form_unknown gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=20.985540 (1_degrade=0.710191,2_doc=0.207348,3_rectify=0.007913,4_decide=20.000932,5_match=0.000000,6_warp=0.000000) src=5.jpg
+2026-01-09 15:37:18 [INFO] [CASE] id=A_6_deg00 ok=TRUE ok_warp=TRUE stage=done gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=432 inlier_ratio=0.8470588235294118 time_total_s=7.856286 (1_degrade=0.606708,2_doc=0.203186,3_rectify=0.010124,4_decide=3.372617,5_match=2.648424,6_warp=0.071907) src=6.jpg
+2026-01-09 15:37:41 [WARNING] [CASE] id=A_6_deg01 ok=FALSE ok_warp=FALSE stage=form_unknown gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=23.327906 (1_degrade=1.434576,2_doc=0.232368,3_rectify=0.007076,4_decide=21.578581,5_match=0.000000,6_warp=0.000000) src=6.jpg
+```
+プログラムを改善してください
+
+日本語で解説

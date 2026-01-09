@@ -42,7 +42,7 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v4.py --degrade
    - 実処理は高速化のため Coarse-to-Fine
      - coarse: 0/45/90/.../315 の 8 方向で粗探索し、上位2角度を選ぶ
      - fine  : 上位角度の近傍（±50度）だけ、上記の角度リスト内で細かく探索
-     - fallback: fine で何も見つからなければ全角度探索
+     - フォールバック: fine で何も見つからなければ全角度探索
    - フォームA: 3点マーク（TL/TR/BL）が検出できる（`--marker-preproc` で前処理オプション）
    - フォームB: QRコードが検出できる
      - まず高速（軽量）検出で角度候補を絞り、最後に robust 検出で確定
@@ -110,29 +110,192 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 
 
+# ============================================================
+# 変更しやすい設定値（デフォルトのハイパーパラメータ集約）
+# ============================================================
+#
+# 方針:
+# - argparse の default 値や、コード中のハードコード値（しきい値/スケール/角度など）をここに集約する。
+# - まとまりのあるものは配列（list/tuple）や辞書にまとめ、上部だけ見れば調整できるようにする。
+# - ここを変えると「CLI引数のデフォルト」も同時に変わる（引数で上書きも可能）。
+
+
+PIPELINE_DEFAULTS: dict[str, Any] = {
+    # 入力
+    "src_forms": ["A", "B", "C"],  # 入力元フォーム（カンマ区切りで指定される想定）
+    "limit": 0,  # デバッグ用：各フォームで先頭N枚だけ処理（0=全て）
+    "template_numbers": [1, 2, 3, 4, 5, 6],  # テンプレ/入力画像の対象番号（例: 1.jpg〜6.jpg）
+
+    # 改悪生成（degrade）
+    "degrade": {
+        "n": 1,  # 1枚の入力から何枚の改悪画像を作るか
+        "out_size_wh": [2400, 1800],  # 改悪画像の出力サイズ（幅, 高さ）
+        "max_rot_deg": 180.0,  # 改悪生成の回転強度（>=180で0..360の一様回転モード）
+        "min_abs_rot_deg": 0.0,  # 最小回転量（0なら小さな回転も許可）
+        "rotation_mode": "uniform",  # 回転角の出し方（"uniform" または "snap"）
+        "snap_step_deg": 90.0,  # rotation_mode="snap" の場合の角度刻み
+        "perspective_jitter": 0.08,  # 射影ゆがみ量（大きいほど難しい）
+        "min_visible_area_ratio": 0.25,  # 生成画像でテンプレが見えている最小比率
+        "max_attempts": 50,  # 改悪生成の最大試行回数
+        "seed": 42,  # 乱数シード（再現性）
+    },
+
+    # WeChat QRモデル
+    "wechat": {
+        "model_dir": str(Path(__file__).resolve().parent / "models" / "wechat_qrcode"),  # WeChat QRモデル配置ディレクトリ
+    },
+
+    # XFeat（テンプレマッチング）
+    "xfeat": {
+        "device_default": "cpu",  # 既定の実行デバイス（auto/cpu/cuda のうち default に使う）
+        "top_k": 1024,  # 特徴点数（大きいほど高精度だが遅い）
+        "match_max_side_px": 1200,  # マッチング前にリサイズする最大辺(px)
+    },
+
+    # フォーム判定（回転スキャン）
+    "rotation_scan": {
+        "step_deg": 10.0,  # 回転スキャンの角度刻み（0..350 をこの刻みで生成）
+        "max_workers": 8,  # 回転スキャンの並列数（スレッド）
+        "coarse_angles_deg": [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0],  # 粗探索の角度（向きの当たりを付ける）
+        "fine_window_deg": 50.0,  # 粗探索の上位角度から±何度を細探索するか
+        "rescue_angles_deg": [0.0, 90.0, 180.0, 270.0],  # 検出ゼロの場合の救済で試す角度
+    },
+
+    # DocAligner（紙領域検出）
+    "docaligner": {
+        "model": "fastvit_sa24",  # DocAlignerのモデル名
+        "type": "heatmap",  # 推論タイプ（"point" / "heatmap"）
+        "rectified_max_side_px": 2400,  # 透視補正後の紙画像の最大辺(px)
+        "pad_px": 100,  # DocAligner入力前に周囲へ足すパディング(px)
+        "polygon_margin": {
+            "ratio": 0.03,  # polygonを外側に広げる比率（紙の長辺に対する割合）
+            "min_px": 10.0,  # ratio計算の下限(px)
+            "max_px": 200.0,  # ratio計算の上限(px)（0以下なら無制限）
+            "fixed_px": 0.0,  # 固定pxマージン（>0の場合 ratio を上書き）
+        },
+    },
+
+    # マーカー検出（フォームA）向け前処理
+    "marker": {
+        "preproc_mode": "basic",  # マーカー検出前処理の強さ（"none" / "basic" / "morph"）
+        "clahe": {"clipLimit": 2.0, "tileGridSize": [8, 8]},  # CLAHE設定（照明ムラ対策）
+        "adaptive_threshold": {"block_size": 51, "C": 5},  # 自適応二値化の設定
+        "morph": {
+            # 画像短辺に対する比率でカーネルサイズを決める
+            "kernel_ratio": 0.004,  # カーネルサイズ = 短辺 * 比率（概算）
+            "kernel_min": 3,  # カーネルサイズの最小値
+        },
+    },
+
+    # フォームA判定の追加制約（C->A誤判定の抑制）
+    "formA": {
+        "geometry": {
+            # 既存: 面積/アスペクト等の幾何制約
+            "max_marker_area_ratio": 3.0,  # max(area)/min(area) が大きすぎるケースを除外
+            "min_marker_area_page_ratio": 5e-5,  # マーカーが小さすぎる場合を除外（ノイズ対策）
+            "max_marker_area_page_ratio": 5e-3,  # マーカーが大きすぎる場合を除外（誤検出対策）
+            "max_dist_ratio_relative_error": 0.35,  # 三角形の距離比がページ比率から外れすぎる場合を除外
+
+            # 追加: マーカー周辺が「ほぼ白地」であること
+            # 目的: フォームCの文字（例: 「記」など四角っぽい漢字）がマーカー誤検出になるのを抑える。
+            # 考え方:
+            # - 正しいフォームAのマーカー周辺は、ほぼ何もなく真っ白に近い
+            # - マーカー周辺に文字/線（=濃い画素）が多い場合はフォームAではない可能性が高い
+            "surround_pad_ratio": 2.0,  # bbox外側に見る幅 = max(w,h)*ratio（周辺の評価範囲）
+            "surround_pad_px_min": 8,  # 周辺評価の最小パディング(px)
+            "surround_pad_px_max": 120,  # 周辺評価の最大パディング(px)
+            "surround_min_mean_gray": 200.0,  # 周辺領域の平均輝度がこの値未満なら「汚れている」とみなす
+            "surround_max_ink_ratio": 0.03,  # 周辺領域の「非白（インク）」比率の上限
+            "surround_adaptive_block_size": 31,  # 周辺領域のインク抽出（二値化）のblock size（奇数）
+            "surround_adaptive_C": 7,  # 周辺領域のインク抽出（二値化）のC（大きいほどインク判定が厳しい）
+        }
+    },
+
+    # QR 検出（フォームB）向け設定
+    "qr": {
+        "min_test_side_px": 120,  # QR検出で試す画像サイズの最小辺(px)
+        "max_test_side_px": 6000,  # QR検出で試す画像サイズの最大辺(px)
+        "robust": {
+            "base_scales": [1.0, 0.75, 0.5, 0.25],  # robust検出で試す基本スケール（縮小中心）
+            "up_scales_small_image": [1.5, 2.0],  # 入力が小さいときだけ追加で試す拡大スケール
+            "up_scale_enable_max_side_px": 1800,  # 最大辺がこの値未満なら拡大も試す
+            "adaptive_morph_kernel": [5, 5],  # 二値化後のモルフォロジーカーネル
+        },
+        "fast": {
+            "scales": [1.0, 0.5, 0.25, 0.75],  # fast検出で試すスケール
+            "extra_up_scales_small_image": [1.5],  # 入力が小さい場合のみ追加で試す拡大スケール
+            "up_scale_enable_max_side_px": 1400,  # 最大辺がこの値未満なら拡大も試す
+        },
+        "wechat": {
+            "fast": {
+                "scales": [1.0, 0.75, 0.5, 1.25, 1.5],  # WeChat fast のスケール
+                "up_scale_enable_max_side_px": 1600,  # 最大辺がこの値以上なら拡大は無効化
+            },
+            "robust": {
+                "scales": [1.0, 0.75, 0.5, 0.25, 1.25, 1.5, 2.0],  # WeChat robust のスケール
+                "up_scale_enable_max_side_px": 1800,  # 最大辺がこの値以上なら拡大は無効化
+            },
+            "max_test_side_px": 6500,  # WeChat で試す画像の最大辺(px)
+        },
+    },
+
+    # Homography（特徴点マッチングの射影変換）
+    "homography": {
+        "find": {
+            "ransac_reproj_threshold_px": 3.5,  # RANSACの再投影誤差しきい値(px)
+            "max_iters": 1500,  # RANSACの最大反復回数
+            "confidence": 0.999,  # RANSACの信頼度
+        },
+        "invert": {
+            "det_abs_min": 1e-12,  # 逆行列化を許可する最小 |det|（小さいと不安定）
+        },
+    },
+
+    # 可視化（デバッグ画像）
+    "visual": {
+        "polygon_line_thickness": 6,  # polygon枠線の太さ
+        "polygon_point_radius": 10,  # 角点の半径
+        "polygon_label_font_scale": 1.0,  # 角ラベル（TL/TR...）のフォント倍率
+        "polygon_label_thickness": 2,  # 角ラベルの太さ
+    },
+
+    # Unknown 判定（フォームA/Bのどちらでもない扱い）
+    "unknown": {
+        "score_threshold": 1.2,  # 最大スコアがこの値未満なら Unknown 扱い
+        "margin": 0.15,  # A/Bスコア差がこの値未満なら Unknown 扱い（曖昧）
+    },
+
+    # warp 許可条件（テンプレ座標へのワープを行うための条件）
+    "warp": {
+        "min_inliers": 10,  # warpを許可する最小inlier数
+        "min_inlier_ratio": 0.15,  # warpを許可する最小inlier_ratio
+        "max_h_cond": 1e6,  # Homographyの条件数上限（大きいと不安定）
+    },
+}
+
+
 # ------------------------------------------------------------
-# WeChat QRCode Engine (cv2.wechat_qrcode_WeChatQRCode)
+# WeChat QRCode エンジン（cv2.wechat_qrcode_WeChatQRCode）
 # ------------------------------------------------------------
 
 
 class WeChatQRDetector:
-    """WeChat QR code detector wrapper.
+    """WeChat QRコード検出器の薄いラッパー。
 
-    Why:
-      OpenCV's default QRCodeDetector sometimes fails on tiny/low-res QR codes.
-      WeChat engine includes a CNN detector + super-resolution model.
+    目的:
+      OpenCV標準の QRCodeDetector が「小さい/低解像度QR」で失敗することがあるため、
+      CNN検出器 + 超解像モデルを含む WeChat エンジンを使えるようにする。
 
-    Note:
-      Requires opencv-contrib build and 4 model files.
-      We keep this wrapper small and cache the heavy detector instance.
+    注意:
+      opencv-contrib のビルドと、4つのモデルファイルが必要。
+      重い detector インスタンスは生成を1回に抑える。
     """
 
     def __init__(self, model_dir: str):
         self.model_dir = str(model_dir)
         self.detector = self._init_detector(self.model_dir)
-        # NOTE: OpenCV wechat_qrcode_WeChatQRCode is not guaranteed thread-safe.
-        # We protect detectAndDecode with a lock because this pipeline uses ThreadPoolExecutor
-        # during rotation scan.
+        # 注意: OpenCV の wechat_qrcode_WeChatQRCode はスレッドセーフが保証されない。
+        # 本パイプラインは回転スキャンで ThreadPoolExecutor を使うため、Lock で保護する。
         self._lock = threading.Lock()
 
     @staticmethod
@@ -157,15 +320,15 @@ class WeChatQRDetector:
         return cv2.wechat_qrcode_WeChatQRCode(detect_proto, detect_caffe, sr_proto, sr_caffe)
 
     def detect(self, image_bgr: np.ndarray) -> list[dict[str, Any]]:
-        """Detect and decode QR codes.
+        """QRコードを検出してデコードする。
 
-        Returns:
-          List of dicts: [{data, points, engine}]
+        戻り値:
+          dict のリスト: [{data, points, engine}]
         """
 
         if image_bgr is None:
             return []
-        # Guard native call for thread-safety.
+        # ネイティブ呼び出しをスレッド安全にする
         with self._lock:
             res, points = self.detector.detectAndDecode(image_bgr)
 
@@ -173,7 +336,7 @@ class WeChatQRDetector:
         if res is None or points is None:
             return out
 
-        # OpenCV returns tuple/list of strings and a list/np array of points.
+        # OpenCV は（文字列のタプル/リスト）と（points の配列）を返すことがある
         try:
             res_list = list(res)
         except Exception:
@@ -198,9 +361,9 @@ _WECHAT_QR: Optional[WeChatQRDetector] = None
 
 
 def init_wechat_qr_detector(model_dir: str, logger: Optional[logging.Logger] = None) -> Optional[WeChatQRDetector]:
-    """Initialize global WeChat QR detector (heavy) once.
+    """グローバルな WeChat QR detector（重い）を1回だけ初期化する。
 
-    Returns None if unavailable.
+    利用できない場合は None を返す。
     """
 
     global _WECHAT_QR
@@ -216,8 +379,8 @@ def init_wechat_qr_detector(model_dir: str, logger: Optional[logging.Logger] = N
         return None
 
 
-# --- reuse implementations from previous work ---
-# NOTE: このスクリプトは `python APA/paper_pipeline_v4.py ...` の形で実行される想定。
+# --- 既存実装の流用 ---
+# 注意: このスクリプトは `python APA/paper_pipeline_v4.py ...` の形で実行される想定。
 # その場合 sys.path[0] は `.../APA` になるため、同ディレクトリのモジュールは
 # `from test_recovery_paper import ...` の形で import する（`import APA.xxx` は失敗しやすい）。
 from test_recovery_paper import (
@@ -251,7 +414,7 @@ if sys.stderr:
 
 
 # ------------------------------------------------------------
-# logging
+# ロギング
 # ------------------------------------------------------------
 
 
@@ -260,10 +423,10 @@ def setup_logging(
     level: str = "INFO",
     console_level: Optional[str] = None,
 ) -> logging.Logger:
-    """Configure logging.
+    """logging の設定。
 
-    - console: INFO by default (or console_level)
-    - file: same as level, saved to out_root/run.log
+    - console: デフォルトINFO（または console_level）
+    - file   : level と同じレベルで out_root/run.log に保存
     """
 
     logger = logging.getLogger("paper_pipeline")
@@ -288,19 +451,19 @@ def setup_logging(
             fh.setLevel(getattr(logging, level.upper(), logging.INFO))
             logger.addHandler(fh)
         except Exception:
-            # Keep running even if file handler fails
+            # ファイルハンドラの作成に失敗しても処理は継続する
             pass
 
     return logger
 
 
 # ------------------------------------------------------------
-# DocAligner helpers (adapted from test_docaligner_camera_v3.py)
+# DocAligner 補助関数（test_docaligner_camera_v3.py を元に調整）
 # ------------------------------------------------------------
 
 
 def patch_capybara_exports() -> None:
-    """Expose expected symbols on capybara namespace package (Windows workaround)."""
+    """capybara の namespace package に期待されるシンボルを追加する（Windows回避策）。"""
 
     import capybara as cb
 
@@ -333,7 +496,7 @@ def patch_capybara_exports() -> None:
 
 
 def order_quad_tl_tr_br_bl(pts: np.ndarray) -> np.ndarray:
-    """Order 4 points to TL/TR/BR/BL."""
+    """4点を TL/TR/BR/BL の順に並べる。"""
 
     pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
     s = pts.sum(axis=1)
@@ -346,7 +509,7 @@ def order_quad_tl_tr_br_bl(pts: np.ndarray) -> np.ndarray:
 
 
 def expand_polygon(polygon_xy: np.ndarray, margin_px: float, img_w: int, img_h: int) -> np.ndarray:
-    """Expand polygon outward by margin_px (best-effort)."""
+    """polygon を margin_px だけ外側に広げる（可能な範囲で）。"""
 
     poly = np.asarray(polygon_xy, dtype=np.float32).reshape(4, 2)
     if margin_px <= 0:
@@ -372,10 +535,10 @@ def polygon_margin_px_from_ratio(
     min_px: float,
     max_px: float,
 ) -> float:
-    """Compute margin in px from polygon size ratio.
+    """polygon サイズ比からマージン(px)を計算する。
 
-    We use the polygon's estimated paper size (max(edge lengths)) as the reference.
-    This makes behaviour more stable across different image resolutions.
+    polygon から推定した紙サイズ（辺長の最大）を基準にすることで、
+    入力解像度が変わっても挙動が安定しやすい。
     """
 
     poly = order_quad_tl_tr_br_bl(polygon_xy)
@@ -396,15 +559,15 @@ def polygon_to_rectified(
     polygon_xy: np.ndarray,
     out_max_side: int = 1800,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Warp polygon region to a fronto-parallel rectified image.
+    """polygon 領域を正面視（透視補正済み）の画像へワープする。
 
-    Returns:
+    戻り値:
         rectified_bgr, H_src_to_rect
     """
 
     poly = order_quad_tl_tr_br_bl(polygon_xy)
 
-    # Estimate output size based on polygon edges
+    # polygon の辺長から出力サイズを概算
     w_top = np.linalg.norm(poly[1] - poly[0])
     w_bottom = np.linalg.norm(poly[2] - poly[3])
     h_left = np.linalg.norm(poly[3] - poly[0])
@@ -414,7 +577,7 @@ def polygon_to_rectified(
     out_w = max(320, out_w)
     out_h = max(320, out_h)
 
-    # Limit size for speed
+    # 速度のため、最大辺を制限
     scale = 1.0
     m = max(out_w, out_h)
     if m > out_max_side:
@@ -432,7 +595,7 @@ def polygon_to_rectified(
 
 
 def rotate_image_bound(image_bgr: np.ndarray, angle_deg: float) -> np.ndarray:
-    """Rotate without cropping by expanding canvas (similar to imutils.rotate_bound)."""
+    """切り取りが起きないようにキャンバスを拡張して回転する（imutils.rotate_bound 相当）。"""
 
     h, w = image_bgr.shape[:2]
     center = (w / 2.0, h / 2.0)
@@ -447,17 +610,17 @@ def rotate_image_bound(image_bgr: np.ndarray, angle_deg: float) -> np.ndarray:
 
 
 def enforce_landscape(image_bgr: np.ndarray) -> tuple[np.ndarray, bool]:
-    """Ensure long side is horizontal (landscape). Returns (image, rotated_flag)."""
+    """長辺が横になるように統一する（横長化）。戻り値: (image, rotated_flag)"""
 
     h, w = image_bgr.shape[:2]
     if w >= h:
         return image_bgr, False
-    # rotate 90deg clockwise
+    # 90度（時計回り）回転
     return cv2.rotate(image_bgr, cv2.ROTATE_90_CLOCKWISE), True
 
 
 def _thickness_params(image_bgr: np.ndarray) -> tuple[int, float, int]:
-    """Return (thickness, font_scale, font_thickness) based on image size."""
+    """画像サイズに応じた (thickness, font_scale, font_thickness) を返す。"""
 
     h, w = image_bgr.shape[:2]
     scale = min(w, h) / 1000.0
@@ -468,16 +631,16 @@ def _thickness_params(image_bgr: np.ndarray) -> tuple[int, float, int]:
 
 
 def _get_japanese_font(size_px: int) -> ImageFont.FreeTypeFont:
-    """Get a Japanese-capable font for Pillow drawing.
+    """Pillow 描画用の「日本語対応フォント」を取得する。
 
-    OpenCV's cv2.putText cannot render Japanese, so we use Pillow.
+    OpenCV の cv2.putText は日本語描画ができないため、Pillow を使う。
     """
 
-    # NOTE:
+    # 注意:
     # 以前は Windows フォントパスをハードコードしていたが、
     # Linux/Mac/Docker では存在しないため、可能な限り OS 非依存で解決する。
 
-    # 1) user override
+    # 1) ユーザー指定（環境変数）
     font_path = os.environ.get("APA_FONT_PATH")
     if font_path:
         try:
@@ -486,7 +649,7 @@ def _get_japanese_font(size_px: int) -> ImageFont.FreeTypeFont:
         except Exception:
             pass
 
-    # 2) common OS fonts
+    # 2) OSでよくあるフォント
     candidates: list[str] = []
     sysname = platform.system().lower()
     if "windows" in sysname:
@@ -517,11 +680,11 @@ def _get_japanese_font(size_px: int) -> ImageFont.FreeTypeFont:
         except Exception:
             pass
 
-    # 3) matplotlib font_manager (best effort)
+    # 3) matplotlib font_manager（可能なら）
     try:
         import matplotlib.font_manager as fm
 
-        # try a couple of known JP-capable family names; if not installed, findfont falls back.
+        # 日本語対応が期待できるファミリ名を試す（無ければ findfont がフォールバック）
         for fam in ["Meiryo", "MS Gothic", "Noto Sans CJK JP", "Noto Sans CJK", "IPAPGothic", "DejaVu Sans"]:
             try:
                 p = fm.findfont(fm.FontProperties(family=fam), fallback_to_default=True)
@@ -532,7 +695,7 @@ def _get_japanese_font(size_px: int) -> ImageFont.FreeTypeFont:
     except Exception:
         pass
 
-    # 4) fallback: default (may not support Japanese, but keep running)
+    # 4) 最後の手段: デフォルト（日本語が出ない可能性はあるが、処理継続を優先）
     return ImageFont.load_default()
 
 
@@ -544,7 +707,7 @@ def draw_text_pil(
     font_size: int,
     outline: bool = True,
 ) -> np.ndarray:
-    """Draw text using Pillow so that Japanese doesn't become '???'."""
+    """Pillow で文字を描画する（OpenCV で日本語が '???' になる問題の回避）。"""
 
     # BGR -> RGB
     img_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
@@ -556,7 +719,7 @@ def draw_text_pil(
 
     x, y = int(xy[0]), int(xy[1])
     if outline:
-        # black outline for readability
+        # 視認性のため黒縁取り
         for dx in (-2, -1, 0, 1, 2):
             for dy in (-2, -1, 0, 1, 2):
                 if dx == 0 and dy == 0:
@@ -576,7 +739,7 @@ def draw_text_ascii_cv2(
     font_scale: float,
     thickness: int,
 ) -> np.ndarray:
-    """ASCII-only fallback when no Japanese-capable font is available."""
+    """日本語フォントが見つからない場合のASCII限定フォールバック。"""
 
     out = image_bgr.copy()
     cv2.putText(
@@ -593,14 +756,14 @@ def draw_text_ascii_cv2(
 
 
 def _marker_center_xy(marker: dict[str, Any]) -> tuple[float, float]:
-    """Get marker center from bbox."""
+    """bbox からマーカー中心を計算する。"""
 
     x, y, w, h = marker.get("bbox", [0, 0, 0, 0])
     return float(x) + float(w) * 0.5, float(y) + float(h) * 0.5
 
 
 def draw_formA_markers_overlay(image_bgr: np.ndarray, markers: list[dict[str, Any]]) -> np.ndarray:
-    """Draw A markers with red boxes and JP corner labels."""
+    """フォームAのマーカーを赤枠 + 角ラベル（日本語）で描画する。"""
 
     out = image_bgr.copy()
     thickness, font_scale, font_thickness = _thickness_params(out)
@@ -611,7 +774,7 @@ def draw_formA_markers_overlay(image_bgr: np.ndarray, markers: list[dict[str, An
         corner = str(m.get("corner", ""))
         label = f"{corner}({jp.get(corner, corner)})"
         cv2.rectangle(out, (int(x), int(y)), (int(x + w), int(y + h)), (0, 0, 255), thickness)
-        # Prefer JP label if possible, otherwise fallback to ASCII.
+        # 可能なら日本語ラベル、無理ならASCIIへフォールバック
         try:
             out = draw_text_pil(
                 out,
@@ -634,7 +797,7 @@ def draw_formA_markers_overlay(image_bgr: np.ndarray, markers: list[dict[str, An
 
 
 def draw_formB_qr_overlay(image_bgr: np.ndarray, qrs: list[dict[str, Any]]) -> np.ndarray:
-    """Draw B QR with blue box and '右上' label."""
+    """フォームBのQRを青枠 + 「右上」ラベルで描画する。"""
 
     out = image_bgr.copy()
     thickness, font_scale, font_thickness = _thickness_params(out)
@@ -648,7 +811,7 @@ def draw_formB_qr_overlay(image_bgr: np.ndarray, qrs: list[dict[str, Any]]) -> n
     x, y, w, h = cv2.boundingRect(pts_i)
     cv2.rectangle(out, (x, y), (x + w, y + h), (255, 0, 0), thickness)
 
-    # choose QR top-right point to place label
+    # QR の右上点付近にラベルを置く
     tr_idx = int(np.argmax(pts[:, 0] - pts[:, 1]))
     tr = pts[tr_idx]
     try:
@@ -678,15 +841,29 @@ def draw_polygon_overlay(image_bgr: np.ndarray, polygon_xy: np.ndarray) -> np.nd
     overlay = result.copy()
     cv2.fillPoly(overlay, [poly], (0, 255, 0))
     cv2.addWeighted(overlay, 0.2, result, 0.8, 0, result)
-    cv2.polylines(result, [poly], True, (0, 255, 0), 6)
+    vis = PIPELINE_DEFAULTS["visual"]
+    cv2.polylines(result, [poly], True, (0, 255, 0), int(vis["polygon_line_thickness"]))
     labels = ["TL", "TR", "BR", "BL"]
     for i, pt in enumerate(poly):
-        cv2.circle(result, tuple(pt), 10, (0, 0, 255), -1)
-        cv2.putText(result, labels[i], (int(pt[0] + 10), int(pt[1] + 5)), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+        cv2.circle(result, tuple(pt), int(vis["polygon_point_radius"]), (0, 0, 255), -1)
+        cv2.putText(
+            result,
+            labels[i],
+            (int(pt[0] + 10), int(pt[1] + 5)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            float(vis["polygon_label_font_scale"]),
+            (255, 255, 255),
+            int(vis["polygon_label_thickness"]),
+        )
     return result
 
 
-def detect_polygon_docaligner(model: Any, cb: Any, image_bgr: np.ndarray, pad_px: int = 100) -> Optional[np.ndarray]:
+def detect_polygon_docaligner(
+    model: Any,
+    cb: Any,
+    image_bgr: np.ndarray,
+    pad_px: int = int(PIPELINE_DEFAULTS["docaligner"]["pad_px"]),
+) -> Optional[np.ndarray]:
     padded = cb.pad(image_bgr, pad_px)
     poly = model(img=padded, do_center_crop=False)
     if poly is None:
@@ -699,12 +876,12 @@ def detect_polygon_docaligner(model: Any, cb: Any, image_bgr: np.ndarray, pad_px
 
 
 # ------------------------------------------------------------
-# marker detection wrapper (optional extra preprocessing)
+# マーカー検出ラッパー（前処理オプション付き）
 # ------------------------------------------------------------
 
 
 def _preprocess_variants_for_markers(image_bgr: np.ndarray, mode: str) -> list[tuple[str, np.ndarray]]:
-    """Generate preprocessed variants to improve marker detection robustness."""
+    """マーカー検出を安定させるための前処理バリエーションを作る。"""
 
     if mode == "none":
         return [("bgr", image_bgr)]
@@ -714,22 +891,27 @@ def _preprocess_variants_for_markers(image_bgr: np.ndarray, mode: str) -> list[t
     variants.append(("gray", cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)))
 
     if mode in ("basic", "morph"):
-        # illumination-robust contrast
+        # 照明ムラに強いコントラスト補正（CLAHE）
         try:
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            clahe_cfg = PIPELINE_DEFAULTS["marker"]["clahe"]
+            clahe = cv2.createCLAHE(
+                clipLimit=float(clahe_cfg["clipLimit"]),
+                tileGridSize=tuple(int(x) for x in clahe_cfg["tileGridSize"]),
+            )
             g2 = clahe.apply(gray)
             variants.append(("clahe", cv2.cvtColor(g2, cv2.COLOR_GRAY2BGR)))
         except Exception:
             pass
-        # adaptive threshold (contour-based)
+        # 自適応二値化（輪郭ベースの検出で効くことがある）
         try:
+            at = PIPELINE_DEFAULTS["marker"]["adaptive_threshold"]
             bw = cv2.adaptiveThreshold(
                 gray,
                 255,
                 cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                 cv2.THRESH_BINARY,
-                51,
-                5,
+                int(at["block_size"]),
+                int(at["C"]),
             )
             variants.append(("adaptive", cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)))
         except Exception:
@@ -737,12 +919,21 @@ def _preprocess_variants_for_markers(image_bgr: np.ndarray, mode: str) -> list[t
 
     if mode == "morph":
         try:
-            # Morphological closing/opening to reduce noise and connect marker blobs
-            k = max(3, int(round(min(image_bgr.shape[:2]) * 0.004)))
+            # モルフォロジー処理でノイズ除去 + ブロブ結合を狙う
+            morph_cfg = PIPELINE_DEFAULTS["marker"]["morph"]
+            k = max(int(morph_cfg["kernel_min"]), int(round(min(image_bgr.shape[:2]) * float(morph_cfg["kernel_ratio"]))))
             if k % 2 == 0:
                 k += 1
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
-            bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 51, 5)
+            at = PIPELINE_DEFAULTS["marker"]["adaptive_threshold"]
+            bw = cv2.adaptiveThreshold(
+                gray,
+                255,
+                cv2.ADAPTIVE_THRESH_MEAN_C,
+                cv2.THRESH_BINARY,
+                int(at["block_size"]),
+                int(at["C"]),
+            )
             bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel)
             bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel)
             variants.append(("adaptive_morph", cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)))
@@ -753,18 +944,18 @@ def _preprocess_variants_for_markers(image_bgr: np.ndarray, mode: str) -> list[t
 
 
 def detect_formA_marker_boxes(image_bgr: np.ndarray, preproc_mode: str = "none") -> list[dict[str, Any]]:
-    """Try marker detection with optional preprocessing variants."""
+    """前処理バリエーションを試しながらマーカー検出を行う。"""
 
     best: list[dict[str, Any]] = []
     best_score = -1.0
     for name, var in _preprocess_variants_for_markers(image_bgr, preproc_mode):
         markers = _detect_formA_marker_boxes_base(var)
-        # prefer complete detection
+        # 3点揃ったケースを強く優先
         ok = len(markers) == 3
         score = float(sum(m.get("score", 0.0) for m in markers))
         if ok:
             score += 10.0
-        # prefer later preprocessing only slightly
+        # 前処理ありを僅かに優先（同点回避）
         if name != "bgr":
             score += 0.05
         if score > best_score:
@@ -774,15 +965,15 @@ def detect_formA_marker_boxes(image_bgr: np.ndarray, preproc_mode: str = "none")
 
 
 # ------------------------------------------------------------
-# QR detection (robust)
+# QR検出（robust / 安定性重視）
 # ------------------------------------------------------------
 
 
 def _try_decode_qr(qr: cv2.QRCodeDetector, img: np.ndarray) -> Optional[tuple[str, np.ndarray]]:
-    """Return (data, points) if detected."""
+    """検出できたら (data, points) を返す。"""
 
     try:
-        # Multi first (some builds behave better)
+        # multi の方が安定するビルドがあるため先に試す
         ok_multi, decoded_info, points, _ = qr.detectAndDecodeMulti(img)
         if ok_multi and decoded_info and points is not None and len(decoded_info) >= 1:
             for data, pts in zip(decoded_info, points):
@@ -820,40 +1011,48 @@ def detect_qr_codes_robust(image_bgr: np.ndarray) -> list[dict[str, Any]]:
 
     # CLAHE
     try:
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe_cfg = PIPELINE_DEFAULTS["marker"]["clahe"]
+        clahe = cv2.createCLAHE(
+            clipLimit=float(clahe_cfg["clipLimit"]),
+            tileGridSize=tuple(int(x) for x in clahe_cfg["tileGridSize"]),
+        )
         g2 = clahe.apply(gray)
         candidates.append(("clahe", cv2.cvtColor(g2, cv2.COLOR_GRAY2BGR)))
     except Exception:
         pass
 
-    # Otsu binarize
+    # 大津の二値化
     try:
         _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         candidates.append(("otsu", cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)))
     except Exception:
         pass
 
-    # Adaptive + Morphology (uneven lighting / blur)
+    # 自適応二値化 + モルフォロジー（照明ムラ / ブレ対策）
     try:
+        at = PIPELINE_DEFAULTS["marker"]["adaptive_threshold"]
+        kernel_xy = PIPELINE_DEFAULTS["qr"]["robust"]["adaptive_morph_kernel"]
         bw = cv2.adaptiveThreshold(
             gray,
             255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY,
-            51,
-            5,
+            int(at["block_size"]),
+            int(at["C"]),
         )
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, tuple(int(x) for x in kernel_xy))
         bw2 = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel)
         bw2 = cv2.morphologyEx(bw2, cv2.MORPH_OPEN, kernel)
         candidates.append(("adaptive_morph", cv2.cvtColor(bw2, cv2.COLOR_GRAY2BGR)))
     except Exception:
         pass
 
-    # scales: include upscales (QR may become too small after rectification/rotation)
-    base_scales = [1.0, 0.75, 0.5, 0.25]
-    up_scales = [1.5, 2.0]
-    scales = base_scales + (up_scales if max(h0, w0) < 1800 else [])
+    # スケール（透視補正/回転でQRが小さくなることがあるので、必要に応じて拡大も試す）
+    qr_cfg = PIPELINE_DEFAULTS["qr"]["robust"]
+    base_scales = list(qr_cfg["base_scales"])
+    up_scales = list(qr_cfg["up_scales_small_image"])
+    enable_up = max(h0, w0) < int(qr_cfg["up_scale_enable_max_side_px"])
+    scales = base_scales + (up_scales if enable_up else [])
 
     for prep_name, img in candidates:
         h, w = img.shape[:2]
@@ -863,9 +1062,9 @@ def detect_qr_codes_robust(image_bgr: np.ndarray) -> list[dict[str, Any]]:
             else:
                 new_w = int(round(w * s))
                 new_h = int(round(h * s))
-                if new_w < 120 or new_h < 120:
+                if new_w < int(PIPELINE_DEFAULTS["qr"]["min_test_side_px"]) or new_h < int(PIPELINE_DEFAULTS["qr"]["min_test_side_px"]):
                     continue
-                if new_w > 6000 or new_h > 6000:
+                if new_w > int(PIPELINE_DEFAULTS["qr"]["max_test_side_px"]) or new_h > int(PIPELINE_DEFAULTS["qr"]["max_test_side_px"]):
                     continue
                 interp = cv2.INTER_CUBIC if s > 1.0 else cv2.INTER_AREA
                 test = cv2.resize(img, (new_w, new_h), interpolation=interp)
@@ -892,9 +1091,9 @@ def detect_qr_codes_wechat(
     image_bgr: np.ndarray,
     wechat: Optional[WeChatQRDetector],
 ) -> list[dict[str, Any]]:
-    """WeChat engine based detection (best for tiny/low-res QR).
+    """WeChat エンジンによるQR検出（小さい/低解像度QRに強い）。
 
-    Returns empty list if detector is not available.
+    detector が利用できない場合は空リストを返す。
     """
 
     if wechat is None:
@@ -906,11 +1105,10 @@ def detect_qr_codes_wechat(
 
 
 def _preprocess_variants_for_qr(image_bgr: np.ndarray) -> list[tuple[str, np.ndarray]]:
-    """Generate preprocessed variants for QR detection.
+    """QR検出のための前処理バリエーションを作る。
 
-    WeChat QR detector accepts BGR input. We still try a few BGR variants
-    (gray/clahe/adaptive) converted back to BGR, because it can improve
-    detection under low contrast or lighting changes.
+    WeChat QR detector は BGR 入力を受け付けるため、前処理を施した結果も BGR に戻して渡す。
+    低コントラストや照明変動のケースで検出率が上がることがある。
     """
 
     if image_bgr is None:
@@ -923,23 +1121,29 @@ def _preprocess_variants_for_qr(image_bgr: np.ndarray) -> list[tuple[str, np.nda
 
         # CLAHE
         try:
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            clahe_cfg = PIPELINE_DEFAULTS["marker"]["clahe"]
+            clahe = cv2.createCLAHE(
+                clipLimit=float(clahe_cfg["clipLimit"]),
+                tileGridSize=tuple(int(x) for x in clahe_cfg["tileGridSize"]),
+            )
             g2 = clahe.apply(gray)
             variants.append(("clahe", cv2.cvtColor(g2, cv2.COLOR_GRAY2BGR)))
         except Exception:
             pass
 
-        # Adaptive + Morphology
+        # 自適応二値化 + モルフォロジー
         try:
+            at = PIPELINE_DEFAULTS["marker"]["adaptive_threshold"]
+            kernel_xy = PIPELINE_DEFAULTS["qr"]["robust"]["adaptive_morph_kernel"]
             bw = cv2.adaptiveThreshold(
                 gray,
                 255,
                 cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                 cv2.THRESH_BINARY,
-                51,
-                5,
+                int(at["block_size"]),
+                int(at["C"]),
             )
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, tuple(int(x) for x in kernel_xy))
             bw2 = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel)
             bw2 = cv2.morphologyEx(bw2, cv2.MORPH_OPEN, kernel)
             variants.append(("adaptive_morph", cv2.cvtColor(bw2, cv2.COLOR_GRAY2BGR)))
@@ -957,11 +1161,11 @@ def detect_qr_codes_wechat_multiscale(
     *,
     mode: str = "fast",
 ) -> list[dict[str, Any]]:
-    """WeChat-based QR detection with optional preprocessing + multiscale.
+    """WeChatエンジンによるQR検出（前処理 + マルチスケール）。
 
     mode:
-      - fast  : fewer scales (used during rotation scan)
-      - robust: more scales and preprocessing variants
+      - fast  : スキャン中に使う想定の軽量モード（試すスケールが少ない）
+      - robust: 安定性重視（前処理バリエーション + スケール多め）
     """
 
     if wechat is None or image_bgr is None:
@@ -969,22 +1173,24 @@ def detect_qr_codes_wechat_multiscale(
 
     h0, w0 = image_bgr.shape[:2]
 
-    # Keep it lightweight during scan, but still include a mild upscale.
+    # スキャン時は軽量にしつつ、必要なら軽い拡大も試す。
     if mode == "fast":
         variants = [("bgr", image_bgr)]
-        scales = [1.0, 0.75, 0.5]
-        if max(h0, w0) < 1600:
-            scales += [1.25, 1.5]
+        cfg = PIPELINE_DEFAULTS["qr"]["wechat"]["fast"]
+        scales = [float(s) for s in cfg["scales"]]
+        if max(h0, w0) >= int(cfg["up_scale_enable_max_side_px"]):
+            scales = [s for s in scales if s <= 1.0]
     else:
         variants = _preprocess_variants_for_qr(image_bgr)
-        scales = [1.0, 0.75, 0.5, 0.25]
-        if max(h0, w0) < 1800:
-            scales += [1.25, 1.5, 2.0]
+        cfg = PIPELINE_DEFAULTS["qr"]["wechat"]["robust"]
+        scales = [float(s) for s in cfg["scales"]]
+        if max(h0, w0) >= int(cfg["up_scale_enable_max_side_px"]):
+            scales = [s for s in scales if s <= 1.0]
 
     best: list[dict[str, Any]] = []
     best_score = float("-inf")
 
-    # WeChat detector may return multiple QR codes; we score them later.
+    # WeChat detector は複数QRを返すことがあるため、後段でスコアリングする
     for prep_name, src in variants:
         h, w = src.shape[:2]
         for s in scales:
@@ -993,9 +1199,9 @@ def detect_qr_codes_wechat_multiscale(
             else:
                 new_w = int(round(w * s))
                 new_h = int(round(h * s))
-                if new_w < 120 or new_h < 120:
+                if new_w < int(PIPELINE_DEFAULTS["qr"]["min_test_side_px"]) or new_h < int(PIPELINE_DEFAULTS["qr"]["min_test_side_px"]):
                     continue
-                if new_w > 6500 or new_h > 6500:
+                if new_w > int(PIPELINE_DEFAULTS["qr"]["wechat"]["max_test_side_px"]) or new_h > int(PIPELINE_DEFAULTS["qr"]["wechat"]["max_test_side_px"]):
                     continue
                 interp = cv2.INTER_CUBIC if s > 1.0 else cv2.INTER_AREA
                 test = cv2.resize(src, (new_w, new_h), interpolation=interp)
@@ -1004,7 +1210,7 @@ def detect_qr_codes_wechat_multiscale(
             if not qrs:
                 continue
 
-            # scale points back to original image coordinates
+            # points を元画像座標に戻す
             if abs(s - 1.0) > 1e-9:
                 for q in qrs:
                     try:
@@ -1014,14 +1220,15 @@ def detect_qr_codes_wechat_multiscale(
                     except Exception:
                         continue
 
-            # annotate how we found it
+            # どう見つけたか（前処理・スケール）を記録
             for q in qrs:
                 q.setdefault("engine", "wechat")
                 q["prep"] = prep_name
                 q["scale"] = float(s)
 
-            # Use a simple heuristic to keep the best set among variants:
-            # prefer results with larger QR area (more reliable) and higher top-rightness.
+            # 簡単なヒューリスティックで best を選ぶ:
+            # - QRの面積が大きいほど安定
+            # - 右上に寄っているほど望ましい
             score = float("-inf")
             try:
                 score, _ = score_best_qr_candidate(test if abs(s - 1.0) < 1e-9 else src, qrs)
@@ -1032,7 +1239,7 @@ def detect_qr_codes_wechat_multiscale(
                 best_score = score
                 best = qrs
 
-            # In fast mode, return immediately on first success.
+            # fast モードでは最初に見つかった時点で即返す
             if mode == "fast":
                 return best
 
@@ -1043,12 +1250,12 @@ def score_best_qr_candidate(
     image_bgr: np.ndarray,
     qrs: list[dict[str, Any]],
 ) -> tuple[float, dict[str, Any]]:
-    """Pick the single best QR from possibly multiple detections.
+    """複数候補の中から最良のQRを1つ選ぶ。
 
-    Goal: keep QR at top-right after choosing rotation.
-    We score each QR by:
-      - closeness to top-right (primary)
-      - relative area (secondary; helps stability)
+    目的: 回転角を選んだ後に QR が「右上」に来るようにしたい。
+    スコアは以下で構成する:
+      - 右上に近いほど高得点（主）
+      - QR面積が大きいほど高得点（副：安定性向上）
     """
 
     h, w = image_bgr.shape[:2]
@@ -1061,7 +1268,7 @@ def score_best_qr_candidate(
             pts = np.asarray(q.get("points"), dtype=np.float32).reshape(-1, 2)
             cx = float(pts[:, 0].mean())
             cy = float(pts[:, 1].mean())
-            # points order can vary by detector; use abs() to avoid negative area.
+            # detector によって points 順が違うため、abs() で負の面積を避ける
             area = float(abs(cv2.contourArea(pts.astype(np.float32))))
             rel = area / float(max(1, w * h))
 
@@ -1069,7 +1276,7 @@ def score_best_qr_candidate(
             y_score = 1.0 - (cy / float(max(1, h)))
             pos_score = 0.6 * x_score + 0.4 * y_score
 
-            # Strongly prefer top-rightness, then QR area.
+            # 右上らしさを強く優先し、次に面積を評価
             score = (pos_score * 3.0) + (rel * 12.0)
 
             if score > best_score:
@@ -1086,7 +1293,7 @@ def score_best_qr_candidate(
     if best is None:
         return 0.0, {"qrs": []}
 
-    # Put best QR first for downstream drawing.
+    # 後段の描画で使いやすいよう、best を先頭にする
     reordered = [best] + [q for q in (qrs or []) if q is not best]
     detail = {
         "qrs": reordered,
@@ -1115,10 +1322,11 @@ def detect_qr_codes_fast(image_bgr: np.ndarray) -> list[dict[str, Any]]:
 
     candidates: list[tuple[str, np.ndarray]] = [("bgr", image_bgr), ("gray", gray_bgr)]
 
-    # Minimum set (fast). Prefer downscales for stability.
-    scales = [1.0, 0.5, 0.25, 0.75]
-    if max(h, w) < 1400:
-        scales = scales + [1.5]
+    # 最小限（fast）。安定性のため、基本は縮小を優先。
+    cfg = PIPELINE_DEFAULTS["qr"]["fast"]
+    scales = [float(s) for s in cfg["scales"]]
+    if max(h, w) < int(cfg["up_scale_enable_max_side_px"]):
+        scales = scales + [float(s) for s in cfg["extra_up_scales_small_image"]]
 
     for prep, src in candidates:
         for s in scales:
@@ -1127,7 +1335,7 @@ def detect_qr_codes_fast(image_bgr: np.ndarray) -> list[dict[str, Any]]:
             else:
                 new_w = int(round(w * s))
                 new_h = int(round(h * s))
-                if new_w < 120 or new_h < 120:
+                if new_w < int(PIPELINE_DEFAULTS["qr"]["min_test_side_px"]) or new_h < int(PIPELINE_DEFAULTS["qr"]["min_test_side_px"]):
                     continue
                 interp = cv2.INTER_CUBIC if s > 1.0 else cv2.INTER_AREA
                 test = cv2.resize(src, (new_w, new_h), interpolation=interp)
@@ -1144,7 +1352,7 @@ def detect_qr_codes_fast(image_bgr: np.ndarray) -> list[dict[str, Any]]:
 
 
 # ------------------------------------------------------------
-# Form decision
+# フォーム判定
 # ------------------------------------------------------------
 
 
@@ -1159,18 +1367,31 @@ class FormDecision:
 
 @dataclass
 class MarkerGeometryConfig:
-    """Constraints to reduce false-positive Form A detections (e.g. Form C misread as A)."""
+    """フォームA判定の誤検出を減らすための制約（例: フォームCをAと誤認しない）。"""
 
-    # Marker bbox areas should be similar (avoid cases where 1 big blob + 2 tiny noise boxes)
+    # マーカーbboxの面積が似ていること（巨大1つ + 微小ノイズ2つ、のようなケースを避ける）
     max_marker_area_ratio: float = 3.0  # max(area)/min(area)
 
-    # Marker size relative to page (rectified image)
+    # ページ（透視補正後画像）に対するマーカーの相対サイズ
     min_marker_area_page_ratio: float = 5e-5
     max_marker_area_page_ratio: float = 5e-3
 
-    # Triangle shape constraint (TL-TR vs TL-BL)
-    # Expect dist(TL,TR) / dist(TL,BL) ~= (page_w / page_h)
+    # 三角形の形状制約（TL-TR と TL-BL）
+    # dist(TL,TR) / dist(TL,BL) ≒ (page_w / page_h) を期待
     max_dist_ratio_relative_error: float = 0.35
+
+    # --- 追加: マーカー周辺が白地であること ---
+    # bbox を少し拡張した領域（bbox自身は除外）に対し、
+    # - 平均輝度が高い（白い）
+    # - 黒っぽい画素（文字/線）が少ない
+    # ことを要求する。
+    surround_pad_ratio: float = 2.0
+    surround_pad_px_min: int = 8
+    surround_pad_px_max: int = 120
+    surround_min_mean_gray: float = 200.0
+    surround_max_ink_ratio: float = 0.03
+    surround_adaptive_block_size: int = 31
+    surround_adaptive_C: int = 7
 
 
 def validate_formA_marker_geometry(
@@ -1178,9 +1399,9 @@ def validate_formA_marker_geometry(
     markers: list[dict[str, Any]],
     cfg: MarkerGeometryConfig,
 ) -> tuple[bool, dict[str, Any]]:
-    """Apply additional geometric/scale constraints for Form A markers.
+    """フォームAマーカーに追加の幾何/スケール制約を適用する。
 
-    Returns:
+    戻り値:
       (ok, detail)
     """
 
@@ -1217,7 +1438,7 @@ def validate_formA_marker_geometry(
     if mean_area_ratio > float(cfg.max_marker_area_page_ratio):
         detail["reasons"].append("marker_too_large_for_page")
 
-    # Triangle distance ratio: require TL/TR/BL centers exist
+    # 三角形の距離比: TL/TR/BL の中心が揃っていることが前提
     need = ["top_left", "top_right", "bottom_left"]
     if all(k in corner_to_center for k in need):
         tl = np.array(corner_to_center["top_left"], dtype=np.float32)
@@ -1243,6 +1464,111 @@ def validate_formA_marker_geometry(
     else:
         detail["reasons"].append("missing_required_corners")
 
+    # ------------------------------------------------------------
+    # 追加制約: マーカー周辺が白地であること
+    # ------------------------------------------------------------
+
+    def _check_surrounding_blankness(
+        *,
+        gray_img: np.ndarray,
+        bbox_xywh: tuple[float, float, float, float],
+        cfg: MarkerGeometryConfig,
+    ) -> tuple[bool, dict[str, Any]]:
+        """マーカーbboxの周辺（bboxを除外したリング領域）が白いかどうかを判定する。"""
+
+        x, y, bw, bh = bbox_xywh
+        x = float(x)
+        y = float(y)
+        bw = float(bw)
+        bh = float(bh)
+
+        if bw <= 1 or bh <= 1:
+            return False, {"ok": False, "reason": "bbox_too_small"}
+
+        pad = float(max(bw, bh)) * float(cfg.surround_pad_ratio)
+        pad = max(float(cfg.surround_pad_px_min), pad)
+        pad = min(float(cfg.surround_pad_px_max), pad)
+
+        H, W = gray_img.shape[:2]
+        x0 = int(max(0, math.floor(x - pad)))
+        y0 = int(max(0, math.floor(y - pad)))
+        x1 = int(min(W, math.ceil(x + bw + pad)))
+        y1 = int(min(H, math.ceil(y + bh + pad)))
+
+        if (x1 - x0) < 10 or (y1 - y0) < 10:
+            return False, {"ok": False, "reason": "roi_too_small", "roi": [x0, y0, x1, y1]}
+
+        roi = gray_img[y0:y1, x0:x1]
+        if roi.size == 0:
+            return False, {"ok": False, "reason": "roi_empty", "roi": [x0, y0, x1, y1]}
+
+        # ROI内のbbox座標
+        bx0 = int(max(0, math.floor(x - x0)))
+        by0 = int(max(0, math.floor(y - y0)))
+        bx1 = int(min(roi.shape[1], math.ceil(x - x0 + bw)))
+        by1 = int(min(roi.shape[0], math.ceil(y - y0 + bh)))
+
+        # リング領域（bbox外側）をマスクで作る
+        mask = np.ones_like(roi, dtype=np.uint8)
+        if bx1 > bx0 and by1 > by0:
+            mask[by0:by1, bx0:bx1] = 0
+
+        ring_area = int(mask.sum())
+        if ring_area <= 0:
+            return False, {"ok": False, "reason": "ring_area_zero", "roi": [x0, y0, x1, y1]}
+
+        # 平均輝度（白地なら高いはず）
+        mean_gray = float((roi.astype(np.float32) * mask.astype(np.float32)).sum() / float(ring_area))
+
+        # インク量（文字/線）を推定: adaptive threshold で黒っぽい画素を抽出
+        blk = int(cfg.surround_adaptive_block_size)
+        if blk < 3:
+            blk = 3
+        if blk % 2 == 0:
+            blk += 1
+        bw_img = cv2.adaptiveThreshold(
+            roi,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            blk,
+            int(cfg.surround_adaptive_C),
+        )
+        ink = ((bw_img > 0) & (mask > 0)).astype(np.uint8)
+        ink_ratio = float(int(ink.sum())) / float(ring_area)
+
+        ok_blank = (mean_gray >= float(cfg.surround_min_mean_gray)) and (ink_ratio <= float(cfg.surround_max_ink_ratio))
+        return bool(ok_blank), {
+            "ok": bool(ok_blank),
+            "pad_px": float(pad),
+            "roi": [int(x0), int(y0), int(x1), int(y1)],
+            "ring_area": int(ring_area),
+            "mean_gray": float(mean_gray),
+            "ink_ratio": float(ink_ratio),
+            "threshold": {
+                "min_mean_gray": float(cfg.surround_min_mean_gray),
+                "max_ink_ratio": float(cfg.surround_max_ink_ratio),
+                "adaptive_block_size": int(blk),
+                "adaptive_C": int(cfg.surround_adaptive_C),
+            },
+        }
+
+    # 全マーカーに対して周辺チェック
+    try:
+        gray_img = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        surround_details: dict[str, Any] = {}
+        for m in markers:
+            corner = str(m.get("corner", ""))
+            x, y, bw, bh = m.get("bbox", [0, 0, 0, 0])
+            ok_blank, sdet = _check_surrounding_blankness(gray_img=gray_img, bbox_xywh=(x, y, bw, bh), cfg=cfg)
+            surround_details[corner or "unknown"] = sdet
+            if not ok_blank:
+                detail["reasons"].append(f"marker_surrounding_not_blank:{corner or 'unknown'}")
+        detail["surrounding_blankness"] = surround_details
+    except Exception as e:
+        # 周辺チェック自体が失敗する場合は、安全側（Aと認めない）に倒す
+        detail["reasons"].append(f"surrounding_blankness_check_failed:{e}")
+
     ok = len(detail["reasons"]) == 0
     detail["ok"] = ok
     return ok, detail
@@ -1264,8 +1590,15 @@ def score_formA(
     if not ok:
         return False, 0.0, {"markers": markers}
 
-    # Extra constraints to suppress C->A false positives
-    cfg = geom_cfg or MarkerGeometryConfig()
+    # 追加制約で C->A の誤検出を抑える
+    # （設定値は PIPELINE_DEFAULTS["formA"]["geometry"] で調整可能）
+    if geom_cfg is not None:
+        cfg = geom_cfg
+    else:
+        cfg_dict = (PIPELINE_DEFAULTS.get("formA") or {}).get("geometry") or {}
+        # dataclass のフィールド判定は __dataclass_fields__ を使う（hasattr(class, field) では取れない）
+        allowed = set(getattr(MarkerGeometryConfig, "__dataclass_fields__", {}).keys())
+        cfg = MarkerGeometryConfig(**{k: v for k, v in cfg_dict.items() if k in allowed})
     geom_ok, geom_detail = validate_formA_marker_geometry(image_bgr, markers, cfg)
     if not geom_ok:
         return False, 0.0, {"markers": markers, "geometry": geom_detail}
@@ -1289,7 +1622,7 @@ def score_formA(
         ny = cy / float(max(1, h))
         ex, ey = expected[corner]
         dist = float(np.hypot(nx - ex, ny - ey))
-        # dist in [0..sqrt(2)] -> normalize to [0..1]
+        # dist in [0..sqrt(2)] -> [0..1] に正規化
         closeness = max(0.0, 1.0 - (dist / 1.41421356))
         per_corner[corner] = float(closeness)
         pos_scores.append(float(closeness))
@@ -1313,8 +1646,8 @@ def score_formB(image_bgr: np.ndarray) -> tuple[bool, float, dict[str, Any]]:
     wechat = getattr(score_formB, "_wechat", None)
     qrs: list[dict[str, Any]] = []
 
-    # User request: do everything with WeChatQR from the start, including adjustment.
-    # If WeChat is not available, fallback to the existing OpenCV robust detector.
+    # ユーザー要望: 可能なら最初から WeChatQR を使う（微調整も含めて）。
+    # WeChat が無い場合は OpenCV の robust 検出にフォールバック。
     if wechat is not None:
         qrs = detect_qr_codes_wechat_multiscale(image_bgr, wechat, mode="robust")
     if not qrs:
@@ -1323,7 +1656,7 @@ def score_formB(image_bgr: np.ndarray) -> tuple[bool, float, dict[str, Any]]:
         return False, 0.0, {"qrs": []}
 
     best_score, detail = score_best_qr_candidate(image_bgr, qrs)
-    # Keep old score scale roughly compatible with the threshold (>=1.2 default)
+    # 既存のしきい値（デフォルト>=1.2）と大きくズレないようスケールを合わせる
     score = 1.0 + float(best_score)
     return True, float(score), detail
 
@@ -1336,7 +1669,7 @@ def score_formB_fast(image_bgr: np.ndarray) -> tuple[bool, float, dict[str, Any]
     if wechat is not None:
         qrs = detect_qr_codes_wechat_multiscale(image_bgr, wechat, mode="fast")
     else:
-        # fallback (kept for environments without opencv-contrib)
+        # フォールバック（opencv-contrib が無い環境向け）
         qrs = detect_qr_codes_fast(image_bgr)
 
     if not qrs:
@@ -1356,9 +1689,9 @@ def decide_form_by_rotations(
     unknown_score_threshold: float = 0.0,
     unknown_margin: float = 0.0,
 ) -> FormDecision:
-    """Coarse-to-fine rotation scan; return best valid decision.
+    """Coarse-to-fine の回転スキャンで、最良の判定（A/B/Unknown）を返す。
 
-    NOTE:
+    注意:
     - まず 0/45/90/.../315 の 8 回で大まかな向き（縦横/上下逆）を推定し、
       その近傍だけ細かく探索する（計算量削減）。
     - QR の robust 検出は重いため、候補角度のみ robust で再検証する。
@@ -1367,7 +1700,7 @@ def decide_form_by_rotations(
 
     def _eval(angle: float) -> dict[str, Any]:
         rotated = rotate_image_bound(rectified_bgr, angle)
-        # Enforce landscape after rotation (ユーザー要望: 横長に統一)
+        # 回転後も横長に統一（ユーザー要望）
         rotated, _ = enforce_landscape(rotated)
         h, w = rotated.shape[:2]
         if h > w:
@@ -1391,10 +1724,10 @@ def decide_form_by_rotations(
         return float(min(d, 360.0 - d))
 
     # ----------------------------------
-    # Coarse pass: 8 directions (0/45/..../315)
+    # coarse: 8方向で粗探索（0/45/..../315）
     # ----------------------------------
 
-    coarse = [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0]
+    coarse = [float(a) for a in PIPELINE_DEFAULTS["rotation_scan"]["coarse_angles_deg"]]
     coarse_results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=min(max_workers, len(coarse))) as ex:
         futures = [ex.submit(_eval, a) for a in coarse]
@@ -1407,7 +1740,7 @@ def decide_form_by_rotations(
     if not coarse_results:
         return FormDecision(False, None, None, 0.0, {"reason": "coarse_all_skipped"})
 
-    # pick top-2 coarse angles by max(A_score, B_fast_score)
+    # coarse 結果から、max(A_score, B_fast_score) が高い上位2角度を選ぶ
     coarse_sorted = sorted(
         coarse_results,
         key=lambda rr: max(float(rr["A"]["score"]), float(rr["B_fast"]["score"])),
@@ -1417,13 +1750,13 @@ def decide_form_by_rotations(
     base_angles = [float(r["angle"]) for r in coarse_top]
 
     # ----------------------------------
-    # Fine pass: only near base angles (union)
+    # fine: coarse上位の近傍だけ探索
     # ----------------------------------
 
-    window = 50.0  # a bit wider to avoid missing due to detection sensitivity
+    window = float(PIPELINE_DEFAULTS["rotation_scan"]["fine_window_deg"])  # 取り逃し防止のため少し広め
 
-    # Align fine angles to the user-provided angle list (0..350 step N),
-    # rather than generating new angles like 355.
+    # fine の角度候補は、ユーザー指定の角度リスト（0..350, step=N）に揃える。
+    # （355 のように新規生成はしない）
     fine_set: set[float] = set()
     for ba in base_angles:
         for a in angles:
@@ -1431,7 +1764,7 @@ def decide_form_by_rotations(
                 fine_set.add(float(a))
     fine = sorted(fine_set)
     if not fine:
-        # fallback to full list
+        # フォールバック: 全角度探索
         fine = list(angles)
 
     bestA: Optional[FormDecision] = None
@@ -1455,9 +1788,9 @@ def decide_form_by_rotations(
                 if bestB_fast is None or candB.score > bestB_fast.score:
                     bestB_fast = candB
 
-    # If none found (fine pass), fallback to full scan (original behaviour)
+    # fine で見つからなければ全角度探索（元の挙動へのフォールバック）
     if bestA is None and bestB_fast is None:
-        # Full scan is still just 36 angles by default; this prevents regression.
+        # デフォルトでも 36 角度程度なので、これで回帰を避ける
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = [ex.submit(_eval, a) for a in angles]
             for fut in as_completed(futures):
@@ -1476,9 +1809,8 @@ def decide_form_by_rotations(
 
         if bestA is None and bestB_fast is None:
             # FAST で全く検出できない場合でも、robust 側だと拾えるケースがある。
-            # まずは 0/90/180/270 のみ robust rescue を実施して、
-            # 見つかれば B として確定する。
-            rescue_angles = [0.0, 90.0, 180.0, 270.0]
+            # まずは 0/90/180/270 のみ rescue を実施して、見つかれば B として確定する。
+            rescue_angles = [float(a) for a in PIPELINE_DEFAULTS["rotation_scan"]["rescue_angles_deg"]]
             bestB_rescue: Optional[FormDecision] = None
             for aa in rescue_angles:
                 rotated = rotate_image_bound(rectified_bgr, aa)
@@ -1506,22 +1838,22 @@ def decide_form_by_rotations(
                 },
             )
 
-    # Unknown decision: low score or ambiguous
-    # (If either is None, treat score as -inf for margin comparison)
+    # Unknown 判定: スコアが低すぎる / A-Bが近すぎる
+    # （どちらかが None の場合は -inf として扱う）
     a_score = float(bestA.score) if bestA is not None else float("-inf")
     b_score = float(bestB_fast.score) if bestB_fast is not None else float("-inf")
 
-    # Threshold: if the top score is below threshold, declare Unknown.
+    # しきい値: 最大スコアが一定未満なら Unknown
     top_score = max(a_score, b_score)
     if float(unknown_score_threshold) > 0 and top_score < float(unknown_score_threshold):
         return FormDecision(False, None, None, float(top_score), {"reason": "below_threshold", "a_score": a_score, "b_score": b_score})
 
-    # Margin: if too close, declare Unknown.
+    # マージン: A/B の差が小さすぎたら Unknown
     if float(unknown_margin) > 0 and bestA is not None and bestB_fast is not None:
         if abs(a_score - b_score) < float(unknown_margin):
             return FormDecision(False, None, None, float(top_score), {"reason": "ambiguous", "a_score": a_score, "b_score": b_score})
 
-    # If A found and it looks reliable, prefer A.
+    # A があり、B_fast より良ければ A を優先
     if bestA is not None and (bestB_fast is None or bestA.score >= bestB_fast.score):
         return bestA
 
@@ -1529,7 +1861,7 @@ def decide_form_by_rotations(
         # FAST で QR が全く見つからない場合でも、
         # 透視補正/回転で QR が小さくなり FAST が落ちるケースがある。
         # ここでは最低限の角度（90度刻み）だけ ROBUST を試して救済する。
-        rescue_angles = [0.0, 90.0, 180.0, 270.0]
+        rescue_angles = [float(a) for a in PIPELINE_DEFAULTS["rotation_scan"]["rescue_angles_deg"]]
         bestB_rescue: Optional[FormDecision] = None
         for aa in rescue_angles:
             rotated = rotate_image_bound(rectified_bgr, aa)
@@ -1547,8 +1879,7 @@ def decide_form_by_rotations(
 
         return FormDecision(False, None, None, 0.0, {})
 
-    # Refine B with robust detection only for a few angles.
-    # Start from bestB_fast, then try its neighbours (±step).
+    # B を robust 検出で絞り込み（bestB_fast とその近傍だけ）
     step = float(angles[1] - angles[0]) if len(angles) >= 2 else 10.0
     candidates = [bestB_fast.angle_deg]
     if bestB_fast.angle_deg is not None:
@@ -1558,7 +1889,7 @@ def decide_form_by_rotations(
     for a in candidates:
         if a is None:
             continue
-        # normalize to 0..360
+        # 0..360 に正規化
         aa = float(a) % 360.0
         rotated = rotate_image_bound(rectified_bgr, aa)
         rotated, _ = enforce_landscape(rotated)
@@ -1574,13 +1905,13 @@ def decide_form_by_rotations(
     if bestB is not None:
         return bestB
 
-    # fallback: if A exists, return it, else fail
+    # 最後のフォールバック: A があるなら A、なければ失敗
     if bestA is not None:
         return bestA
     return FormDecision(False, None, None, 0.0, {})
 
 
-"""(template-topn / global prefilter)
+"""（template-topn / グローバル特徴による事前絞り込み）
 
 v4 ではユーザー要望により「フォーム確定後は全テンプレを XFeat で照合」します。
 そのため、旧版にあったグローバル特徴によるテンプレ候補絞り込み機能は削除しました。
@@ -1596,7 +1927,7 @@ class CachedRef:
 
 
 class CachedXFeatMatcher:
-    """XFeat matcher with cached template features."""
+    """テンプレ側の特徴をキャッシュして高速化した XFeat マッチャー。"""
 
     def __init__(self, base: XFeatMatcher):
         self.base = base
@@ -1616,9 +1947,9 @@ class CachedXFeatMatcher:
         ref: CachedRef,
         tgt_bgr: np.ndarray,
     ) -> tuple[Any, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
-        """Return (XFeatHomographyResult-like, H_full, mkpts0, mkpts1)."""
+        """(XFeatHomographyResult相当, H_full, mkpts0, mkpts1) を返す。"""
 
-        # Resize target for matching stability/speed (then scale H back)
+        # マッチング安定性/速度のためターゲットをリサイズ（後でHを元スケールへ戻す）
         tgt_small, s_tgt = resize_keep_aspect(tgt_bgr, self.match_max_side)
         out1 = self.xfeat.detectAndCompute(tgt_small, top_k=self.top_k)[0]
         out1.update({"image_size": (tgt_small.shape[1], tgt_small.shape[0])})
@@ -1630,7 +1961,7 @@ class CachedXFeatMatcher:
             mkpts0, mkpts1 = matches["mkpts0"], matches["mkpts1"]
         else:
             return (
-                # minimal shape-compatible object (reuse dataclass from test_recovery_paper is heavy to import here)
+                # 形だけ合わせた最小オブジェクト（test_recovery_paper の dataclass は重いのでここでは避ける）
                 type("Res", (), {"ok": False, "inliers": 0, "matches": 0, "inlier_ratio": 0.0, "H_ref_to_tgt": None})(),
                 None,
                 None,
@@ -1651,9 +1982,9 @@ class CachedXFeatMatcher:
             mkpts0,
             mkpts1,
             cv2.USAC_MAGSAC,
-            3.5,
-            maxIters=1_000,
-            confidence=0.999,
+            float(PIPELINE_DEFAULTS["homography"]["find"]["ransac_reproj_threshold_px"]),
+            maxIters=int(PIPELINE_DEFAULTS["homography"]["find"]["max_iters"]),
+            confidence=float(PIPELINE_DEFAULTS["homography"]["find"]["confidence"]),
         )
         if H_small is None or mask is None:
             return (
@@ -1668,7 +1999,7 @@ class CachedXFeatMatcher:
         matches_n = int(len(mask))
         inlier_ratio = float(inliers) / float(matches_n) if matches_n else 0.0
 
-        # Refine H by least-squares on inliers for better warp quality.
+        # inlier の最小二乗でHを微調整し、ワープ品質を改善する
         reproj = None
         if inliers >= 4:
             try:
@@ -1679,7 +2010,7 @@ class CachedXFeatMatcher:
             except Exception:
                 reproj = None
 
-        # scale H back to full resolution: H_full = inv(S_tgt) * H_small * S_ref
+        # フル解像度に戻す: H_full = inv(S_tgt) * H_small * S_ref
         S_ref = scale_matrix(float(ref.s_ref))
         S_tgt = scale_matrix(float(s_tgt))
         H_full = np.linalg.inv(S_tgt) @ H_small @ S_ref
@@ -1715,7 +2046,7 @@ def select_top_templates(
 
 
 # ------------------------------------------------------------
-# Homography inversion safety
+# Homography 逆行列化の安全性チェック
 # ------------------------------------------------------------
 
 
@@ -1727,11 +2058,11 @@ def safe_invert_homography(
     min_inlier_ratio: float,
     max_cond: float,
 ) -> tuple[bool, Optional[np.ndarray], str, float, float]:
-    """Safely invert homography.
+    """Homography の逆行列化を安全に行う。
 
-    - reject if inliers too small
-    - reject if inlier ratio too small
-    - reject if matrix is near singular (det close to 0 or cond too large)
+    - inlier 数が少なすぎる場合は却下
+    - inlier_ratio が小さすぎる場合は却下
+    - 行列が特異に近い場合（detが小さい / condが大きい）は却下
     """
 
     if int(inliers) < int(min_inliers):
@@ -1741,14 +2072,14 @@ def safe_invert_homography(
 
     H = np.asarray(H, dtype=np.float64)
     det = float(np.linalg.det(H))
-    if not math.isfinite(det) or abs(det) < 1e-12:
+    if not math.isfinite(det) or abs(det) < float(PIPELINE_DEFAULTS["homography"]["invert"]["det_abs_min"]):
         return False, None, f"det too small ({det:.3e})", float("nan"), float(det)
     try:
         cond = float(np.linalg.cond(H))
         if not math.isfinite(cond) or (max_cond > 0 and cond > float(max_cond)):
             return False, None, f"cond too large ({cond:.3e})", float(cond), float(det)
     except Exception:
-        # cond computation can fail; still try inversion with exception handling
+        # cond 計算が失敗することがあるため、例外は握りつぶして inversion は試す
         cond = float("nan")
 
     try:
@@ -1759,7 +2090,7 @@ def safe_invert_homography(
 
 
 # ------------------------------------------------------------
-# CSV helpers
+# CSV補助関数
 # ------------------------------------------------------------
 
 
@@ -1770,7 +2101,7 @@ def _bool_to_str(v: Any) -> str:
 
 
 def _to_json_cell(v: Any) -> str:
-    """Serialize a complex python object for a single CSV cell."""
+    """CSVセルに入れるため、複雑なオブジェクトをJSON文字列化する。"""
 
     if v is None:
         return ""
@@ -1781,7 +2112,7 @@ def _to_json_cell(v: Any) -> str:
 
 
 def _filename_only(p: Any) -> str:
-    """Return only the filename part (no directory)."""
+    """パスからファイル名部分だけを返す（ディレクトリは落とす）。"""
 
     if not p:
         return ""
@@ -1792,7 +2123,7 @@ def _filename_only(p: Any) -> str:
 
 
 def _filenames_only_list(v: Any) -> list[str]:
-    """Convert list of paths -> list of filenames."""
+    """パスのリストを、ファイル名のリストへ変換する。"""
 
     if not v:
         return []
@@ -1840,11 +2171,11 @@ def _template_filename_from_path(p: str) -> str:
 
 
 def _case_truth(src_form: str, src_path: Path) -> dict[str, Any]:
-    """Ground-truth definition for this pipeline.
+    """このパイプラインにおける Ground Truth（正解）の定義。
 
-    - If src_form is A/B, the expected decided form is same.
-    - Expected template is the same file stem (1..6) within that form.
-    - If src_form is C (or others), ground truth is unknown.
+    - src_form が A/B の場合、正解フォームは同じ
+    - 正解テンプレは同じファイル名（stem=1..6）
+    - src_form が C（またはそれ以外）の場合、正解は未定義（unknown扱い）
     """
 
     gt_form = src_form if src_form in ("A", "B") else ""
@@ -1866,9 +2197,9 @@ def build_csv_row(
     item: dict[str, Any],
     times: "StageTimes",
 ) -> dict[str, Any]:
-    """Build a rich, analysis-friendly CSV row.
+    """解析しやすいCSV行を構築する。
 
-    Column names are intentionally verbose so that anyone can understand them.
+    カラム名は「誰が見ても分かる」ことを優先して冗長にしている。
     """
 
     dec = (item.get("form_decision") or {})
@@ -1900,7 +2231,7 @@ def build_csv_row(
         except Exception:
             is_template_correct = False
 
-    # NOTE: CSV は「フルパス禁止」の要望に従い、原則 filename のみ出力する。
+    # 注意: CSV は「フルパス禁止」の要望に従い、原則 filename のみ出力する。
     src_filename = _filename_only(item.get("source_path"))
 
     expected_behavior_label = ""
@@ -1912,36 +2243,36 @@ def build_csv_row(
         expected_behavior_label = "unknown_source_form"
 
     row: dict[str, Any] = {
-        # ---- identity (short, human-friendly) ----
+        # ---- 識別情報（短く・人間向け） ----
         "case_id": str(item.get("case") or ""),
         "source_form_folder_name(A_or_B_or_C)": src_form,
         "source_image_filename": src_filename,
         "source_image_filename_stem": str(src_path.stem) if src_path else "",
         "degraded_variant_index": str(item.get("degraded_variant_index") or ""),
 
-        # ---- ground truth (A/B only) ----
+        # ---- 正解ラベル（A/Bのみ） ----
         "ground_truth_source_form(A_or_B)": gt_form,
         "ground_truth_source_template_filename(if_A_or_B)": gt_template_filename,
         "ground_truth_source_template_number(if_A_or_B)": gt_template_number,
 
-        # ---- predictions ----
+        # ---- 予測 ----
         "predicted_decided_form(A_or_B_or_empty)": predicted_form,
         "predicted_decided_rotation_angle_deg": "" if predicted_angle is None else str(predicted_angle),
         "predicted_best_template_filename": best_template_filename,
         "predicted_best_template_number": best_template_number,
 
-        # ---- correctness (A/B only) ----
+        # ---- 正誤（A/Bのみ） ----
         "is_predicted_form_correct": _bool_to_str(is_form_correct) if gt_form else "",
         "is_predicted_best_template_correct": _bool_to_str(is_template_correct) if gt_form else "",
 
-        # ---- pipeline status ----
+        # ---- パイプライン状態 ----
         "pipeline_final_ok(warp_done)": _bool_to_str(item.get("ok_warp")),
         "pipeline_final_ok(expected_behavior)": _bool_to_str(item.get("ok")),
         "pipeline_stop_stage": str(item.get("stage") or ""),
         "pipeline_expected_behavior_label": expected_behavior_label,
         "pipeline_predicted_form_raw(A_or_B_or_empty)": str(item.get("predicted_form") or ""),
 
-        # ---- timings ----
+        # ---- 所要時間 ----
         "elapsed_time_total_one_case_seconds": f"{float(item.get('case_total_s', 0.0)):.6f}",
         "elapsed_time_stage_1_degrade_seconds": f"{times.degrade_s:.6f}",
         "elapsed_time_stage_2_docaligner_seconds": f"{times.docaligner_s:.6f}",
@@ -1950,12 +2281,12 @@ def build_csv_row(
         "elapsed_time_stage_5_xfeat_matching_seconds": f"{times.match_s:.6f}",
         "elapsed_time_stage_6_warp_seconds": f"{times.warp_s:.6f}",
 
-        # ---- run metadata (no full paths) ----
+        # ---- 実行メタ情報（フルパスなし） ----
         "run_id": str(item.get("run_id") or ""),
         "run_output_root_directory_name": _filename_only(item.get("run_output_root_directory")),
         "run_elapsed_time_total_seconds": str(item.get("run_elapsed_time_total_seconds") or ""),
 
-        # ---- output filenames (no full paths) ----
+        # ---- 出力ファイル名（フルパスなし） ----
         "output_degraded_image_filename": _filename_only(item.get("output_degraded_image_path")),
         "output_doc_overlay_image_filename": _filename_only(item.get("output_doc_overlay_image_path")),
         "output_rectified_image_filename": _filename_only(item.get("output_rectified_image_path")),
@@ -1963,7 +2294,7 @@ def build_csv_row(
         "output_debug_matches_image_filename": _filename_only(item.get("output_debug_matches_image_path")),
         "output_aligned_image_filename": _filename_only(item.get("output_aligned_image_path")),
 
-        # ---- images: resolutions ----
+        # ---- 画像サイズ（解像度） ----
         "source_image_resolution_width_px": str(item.get("source_w") or ""),
         "source_image_resolution_height_px": str(item.get("source_h") or ""),
         "degraded_image_resolution_width_px": str(item.get("degraded_w") or ""),
@@ -1977,7 +2308,7 @@ def build_csv_row(
         "aligned_output_resolution_width_px": str(item.get("aligned_w") or ""),
         "aligned_output_resolution_height_px": str(item.get("aligned_h") or ""),
 
-        # ---- degradation parameters (rich) ----
+        # ---- 改悪パラメータ（詳細） ----
         "degradation_generated_rotation_angle_deg": str(degrade.get("angle_deg") or ""),
         "degradation_rotation_mode(uniform_or_snap)": str(degrade.get("rotation_mode") or ""),
         "degradation_snap_step_deg": str(degrade.get("snap_step_deg") or ""),
@@ -1990,17 +2321,17 @@ def build_csv_row(
         "degradation_template_projected_base_height_px": str(degrade.get("base_h") or ""),
         "degradation_parameters_json": _to_json_cell(degrade),
 
-        # ---- DocAligner ----
+        # ---- 紙領域検出（DocAligner） ----
         "docaligner_polygon_xy_json": _to_json_cell(item.get("polygon")),
         "docaligner_polygon_margin_mode(ratio_or_fixed_px)": str(poly_margin.get("mode") or ""),
         "docaligner_polygon_margin_computed_px": str(poly_margin.get("computed_px") or poly_margin.get("value") or ""),
         "docaligner_polygon_margin_details_json": _to_json_cell(poly_margin),
 
-        # ---- form decision debug ----
+        # ---- フォーム判定のデバッグ ----
         "form_decision_score": str(dec.get("score") or ""),
         "form_decision_detail_json": _to_json_cell(dec.get("detail")),
 
-        # ---- XFeat best match ----
+        # ---- XFeat 最良マッチ ----
         "xfeat_best_inliers": str(best.get("inliers") or ""),
         "xfeat_best_matches": str(best.get("matches") or ""),
         "xfeat_best_inlier_ratio": str(best.get("inlier_ratio") or ""),
@@ -2018,13 +2349,13 @@ def build_csv_row(
         ),
         "xfeat_all_template_candidate_results_json": _to_json_cell(_sanitize_template_candidate_results(item.get("template_match_candidates"))),
 
-        # ---- homography stability ----
+        # ---- homography の安定性 ----
         "homography_inversion_ok": _bool_to_str(inv.get("ok")),
         "homography_inversion_reject_reason": str(inv.get("reason") or ""),
         "homography_matrix_condition_number": str(inv.get("cond") or ""),
         "homography_matrix_determinant": str(inv.get("det") or ""),
 
-        # ---- run configuration (selected, for quick filtering) ----
+        # ---- 実行設定（主要なものだけ抜粋） ----
         "run_config_rotation_step_deg": str(getattr(args, "rotation_step", "")),
         # v4 では template-topn は廃止（常に全テンプレ照合）
         "run_config_template_topn": "",
@@ -2050,7 +2381,7 @@ def build_csv_row(
         "run_config_seed": str(getattr(args, "seed", "")),
     }
 
-    # exception info (if any)
+    # 例外情報（例外が発生した場合のみ）
     if item.get("stage") == "exception":
         row["exception_error_message"] = str(item.get("error") or "")
         row["exception_traceback"] = str(item.get("traceback") or "")
@@ -2062,7 +2393,7 @@ def build_csv_row(
 
 
 # ------------------------------------------------------------
-# IO helpers
+# 入出力（IO）補助
 # ------------------------------------------------------------
 
 
@@ -2074,7 +2405,9 @@ def mkdir(p: Path) -> Path:
 def list_images(form: str) -> list[Path]:
     base = Path(__file__).resolve().parent / "image" / form
     paths: list[Path] = []
-    for i in range(1, 7):
+    # 1.jpg〜6.jpg を対象（必要なら PIPELINE_DEFAULTS 側で変更）
+    nums = list(PIPELINE_DEFAULTS.get("template_numbers", [1, 2, 3, 4, 5, 6]))
+    for i in nums:
         p = base / f"{i}.jpg"
         if p.exists():
             paths.append(p)
@@ -2090,40 +2423,85 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="主要パラメータの意味（日本語）を出力して終了します",
     )
 
-    p.add_argument("--src-forms", type=str, default="A,B,C", help="Input forms to degrade from: comma separated (A,B,C)")
-    p.add_argument("--degrade-n", type=int, default=1, help="Number of degraded variants per source image")
-    p.add_argument("--degrade-w", type=int, default=2400)
-    p.add_argument("--degrade-h", type=int, default=1800)
-    p.add_argument("--max-rot", type=float, default=180.0, help="Degradation rotation. >=180 enables 0-360 uniform rotation.")
-    p.add_argument("--min-abs-rot", type=float, default=0.0)
-    p.add_argument("--rotation-mode", choices=["uniform", "snap"], default="uniform")
-    p.add_argument("--snap-step-deg", type=float, default=90.0)
-    p.add_argument("--perspective", type=float, default=0.08)
-    p.add_argument("--min-visible-area-ratio", type=float, default=0.25)
-    p.add_argument("--max-attempts", type=int, default=50)
-    p.add_argument("--seed", type=int, default=42)
+    # ----------------------------
+    # 入力/件数
+    # ----------------------------
+    p.add_argument(
+        "--src-forms",
+        type=str,
+        default=",".join(PIPELINE_DEFAULTS["src_forms"]),
+        help="入力元フォーム（A,B,C をカンマ区切り）",
+    )
+    p.add_argument(
+        "--degrade-n",
+        type=int,
+        default=int(PIPELINE_DEFAULTS["degrade"]["n"]),
+        help="1枚の入力から改悪画像を何枚作るか",
+    )
+    p.add_argument("--degrade-w", type=int, default=int(PIPELINE_DEFAULTS["degrade"]["out_size_wh"][0]))
+    p.add_argument("--degrade-h", type=int, default=int(PIPELINE_DEFAULTS["degrade"]["out_size_wh"][1]))
+    p.add_argument(
+        "--max-rot",
+        type=float,
+        default=float(PIPELINE_DEFAULTS["degrade"]["max_rot_deg"]),
+        help="改悪生成の回転強度（>=180で0..360一様回転モード）",
+    )
+    p.add_argument("--min-abs-rot", type=float, default=float(PIPELINE_DEFAULTS["degrade"]["min_abs_rot_deg"]))
+    p.add_argument(
+        "--rotation-mode",
+        choices=["uniform", "snap"],
+        default=str(PIPELINE_DEFAULTS["degrade"]["rotation_mode"]),
+    )
+    p.add_argument("--snap-step-deg", type=float, default=float(PIPELINE_DEFAULTS["degrade"]["snap_step_deg"]))
+    p.add_argument("--perspective", type=float, default=float(PIPELINE_DEFAULTS["degrade"]["perspective_jitter"]))
+    p.add_argument("--min-visible-area-ratio", type=float, default=float(PIPELINE_DEFAULTS["degrade"]["min_visible_area_ratio"]))
+    p.add_argument("--max-attempts", type=int, default=int(PIPELINE_DEFAULTS["degrade"]["max_attempts"]))
+    p.add_argument("--seed", type=int, default=int(PIPELINE_DEFAULTS["degrade"]["seed"]))
 
-    # WeChat QR models
+    # WeChat QRモデル
     p.add_argument(
         "--wechat-model-dir",
         type=str,
-        default=str(Path(__file__).resolve().parent / "models" / "wechat_qrcode"),
+        default=str(PIPELINE_DEFAULTS["wechat"]["model_dir"]),
         help="WeChat QRCode Engine のモデルディレクトリ（detect/sr の prototxt/caffemodel を配置）",
     )
 
     # 回転スキャン（ユーザー要件: 0..350 を10度刻み）
-    p.add_argument("--rotation-step", type=float, default=10.0, help="フォーム判定の回転スキャン刻み（度）")
-    p.add_argument("--rotation-max-workers", type=int, default=8, help="回転スキャンの並列数（スレッド）")
+    p.add_argument(
+        "--rotation-step",
+        type=float,
+        default=float(PIPELINE_DEFAULTS["rotation_scan"]["step_deg"]),
+        help="フォーム判定の回転スキャン刻み（度）",
+    )
+    p.add_argument(
+        "--rotation-max-workers",
+        type=int,
+        default=int(PIPELINE_DEFAULTS["rotation_scan"]["max_workers"]),
+        help="回転スキャンの並列数（スレッド）",
+    )
 
-    p.add_argument("--docaligner-model", choices=["lcnet050", "lcnet100", "fastvit_t8", "fastvit_sa24"], default="fastvit_sa24")
-    p.add_argument("--docaligner-type", choices=["point", "heatmap"], default="heatmap")
+    p.add_argument(
+        "--docaligner-model",
+        choices=["lcnet050", "lcnet100", "fastvit_t8", "fastvit_sa24"],
+        default=str(PIPELINE_DEFAULTS["docaligner"]["model"]),
+    )
+    p.add_argument(
+        "--docaligner-type",
+        choices=["point", "heatmap"],
+        default=str(PIPELINE_DEFAULTS["docaligner"]["type"]),
+    )
     # 透視補正後の紙画像が小さすぎると QR が潰れて検出しづらいので、デフォルトは少し大きめ。
-    p.add_argument("--docaligner-max-side", type=int, default=2400, help="Max side length for rectified paper")
-    # (1) polygon margin: ratio-based to be robust across resolutions
+    p.add_argument(
+        "--docaligner-max-side",
+        type=int,
+        default=int(PIPELINE_DEFAULTS["docaligner"]["rectified_max_side_px"]),
+        help="透視補正後の紙画像の最大辺(px)",
+    )
+    # (1) polygon margin: 解像度差に強い ratio ベース
     p.add_argument(
         "--polygon-margin-ratio",
         type=float,
-        default=0.03,
+        default=float(PIPELINE_DEFAULTS["docaligner"]["polygon_margin"]["ratio"]),
         help=(
             "DocAligner polygon を外側に広げるマージン（紙サイズに対する比率）。"
             " 例: 0.03 は紙の長辺の 3% をマージンにする。"
@@ -2132,59 +2510,93 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "--polygon-margin-min-px",
         type=float,
-        default=10.0,
+        default=float(PIPELINE_DEFAULTS["docaligner"]["polygon_margin"]["min_px"]),
         help="ratio-based マージンの下限(px)",
     )
     p.add_argument(
         "--polygon-margin-max-px",
         type=float,
-        default=200.0,
+        default=float(PIPELINE_DEFAULTS["docaligner"]["polygon_margin"]["max_px"]),
         help="ratio-based マージンの上限(px)（0以下で無制限）",
     )
     p.add_argument(
         "--polygon-margin-px",
         type=float,
-        default=0.0,
+        default=float(PIPELINE_DEFAULTS["docaligner"]["polygon_margin"]["fixed_px"]),
         help="互換用: 固定pxマージン（>0 の場合 ratio を上書き）",
     )
 
-    # (2) logging
+    # (2) ログ
     p.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     p.add_argument("--console-log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
 
-    # (3) extra preprocessing
+    # (3) 追加の前処理
     p.add_argument(
         "--marker-preproc",
         choices=["none", "basic", "morph"],
-        default="basic",
+        default=str(PIPELINE_DEFAULTS["marker"]["preproc_mode"]),
         help="フォームAマーカー検出の前処理（照明ムラ対策）",
     )
 
-    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="cpu")
-    p.add_argument("--top-k", type=int, default=1024, help="XFeatの特徴点数（大きいほど高精度だが遅い）")
-    p.add_argument("--match-max-side", type=int, default=1200, help="XFeat用にリサイズする最大辺(px)（大きいほど高精度だが遅い）")
+    p.add_argument(
+        "--device",
+        choices=["auto", "cpu", "cuda"],
+        default=str(PIPELINE_DEFAULTS["xfeat"]["device_default"]),
+    )
+    p.add_argument(
+        "--top-k",
+        type=int,
+        default=int(PIPELINE_DEFAULTS["xfeat"]["top_k"]),
+        help="XFeatの特徴点数（大きいほど高精度だが遅い）",
+    )
+    p.add_argument(
+        "--match-max-side",
+        type=int,
+        default=int(PIPELINE_DEFAULTS["xfeat"]["match_max_side_px"]),
+        help="XFeat用にリサイズする最大辺(px)（大きいほど高精度だが遅い）",
+    )
 
-    # (6) Unknown threshold
+    # (6) Unknown 判定しきい値
     p.add_argument(
         "--unknown-score-threshold",
         type=float,
-        default=1.2,
+        default=float(PIPELINE_DEFAULTS["unknown"]["score_threshold"]),
         help="フォーム判定スコアがこの値未満なら Unknown 扱い",
     )
     p.add_argument(
         "--unknown-margin",
         type=float,
-        default=0.15,
+        default=float(PIPELINE_DEFAULTS["unknown"]["margin"]),
         help="A/B スコア差がこの値未満なら Unknown 扱い（曖昧）",
     )
 
-    # (7) homography stability
-    p.add_argument("--min-inliers-for-warp", type=int, default=10, help="warp を許可する最小 inlier 数")
-    p.add_argument("--min-inlier-ratio-for-warp", type=float, default=0.15, help="warp を許可する最小 inlier_ratio")
-    p.add_argument("--max-h-cond", type=float, default=1e6, help="Homography 行列の条件数上限（大きいと不安定）")
+    # (7) ホモグラフィ安定性
+    p.add_argument(
+        "--min-inliers-for-warp",
+        type=int,
+        default=int(PIPELINE_DEFAULTS["warp"]["min_inliers"]),
+        help="warp を許可する最小 inlier 数",
+    )
+    p.add_argument(
+        "--min-inlier-ratio-for-warp",
+        type=float,
+        default=float(PIPELINE_DEFAULTS["warp"]["min_inlier_ratio"]),
+        help="warp を許可する最小 inlier_ratio",
+    )
+    p.add_argument(
+        "--max-h-cond",
+        type=float,
+        default=float(PIPELINE_DEFAULTS["warp"]["max_h_cond"]),
+        help="Homography 行列の条件数上限（大きいと不安定）",
+    )
 
     p.add_argument("--out", type=str, default=str(Path(__file__).resolve().parent / "output_pipeline"))
-    p.add_argument("--limit", type=int, default=0, help="Debug: limit number of source images per form (0=all)")
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=int(PIPELINE_DEFAULTS["limit"]),
+        help="デバッグ用：各フォームで先頭N枚だけ処理（0=全て）",
+    )
 
     return p.parse_args(argv)
 
@@ -2247,10 +2659,10 @@ def print_explain() -> None:
 
 
 def log_case_summary(logger: logging.Logger, row: dict[str, Any]) -> None:
-    """Always print one-line case summary for readability."""
+    """可読性のため、各ケースのサマリを必ず1行でログ出力する。"""
 
     case_id = str(row.get("case_id") or "")
-    # user-facing ok = expected-behavior success
+    # ユーザー向けの ok = 期待動作として成功したか
     ok = str(row.get("pipeline_final_ok(expected_behavior)") or "")
     ok_warp = str(row.get("pipeline_final_ok(warp_done)") or "")
     stage = str(row.get("pipeline_stop_stage") or "")
@@ -2274,7 +2686,7 @@ def log_case_summary(logger: logging.Logger, row: dict[str, Any]) -> None:
     t5 = str(row.get("elapsed_time_stage_5_xfeat_matching_seconds") or "")
     t6 = str(row.get("elapsed_time_stage_6_warp_seconds") or "")
 
-    # If ground truth is unavailable (e.g., C), keep correctness columns blank.
+    # Ground truth が無い場合（例: C）は、正誤カラムは空欄にする
     truth_part = f"gt_form={gt_form} pred_form={pred_form}"
     if gt_form:
         truth_part += f" form_ok={form_ok} template_ok={template_ok}"
@@ -2289,7 +2701,7 @@ def log_case_summary(logger: logging.Logger, row: dict[str, Any]) -> None:
     if ok == "TRUE":
         logger.info(msg)
     else:
-        # failure is important for later analysis
+        # 失敗は後段の解析で重要なので warning にする
         logger.warning(msg)
 
 
@@ -2317,14 +2729,14 @@ def _median(xs: list[float]) -> float:
 
 
 def summarize_results(logger: logging.Logger, summary: list[dict[str, Any]], stage_times: dict[str, float], dt_total: float) -> None:
-    """Print dataset-level statistics at the end of the log.
+    """ログ末尾に、データセット全体の統計を出力する。
 
-    Focus:
-      - expected-behavior success (ユーザー要望の主KPI)
-      - A/B form+template accuracy
-      - C rejection success rate (should be form_unknown)
-      - false positive analysis: C predicted as A/B
-      - stage time averages (mean/median)
+    主な集計観点:
+      - expected-behavior 成功率（ユーザー要望の主KPI）
+      - A/B のフォーム＋テンプレ正解率
+      - C の棄却成功率（stage=form_unknown になるべき）
+      - 誤検出分析（CがA/Bに誤判定された回数）
+      - ステージ別時間（平均/中央値）
     """
 
     total = len(summary)
@@ -2335,7 +2747,7 @@ def summarize_results(logger: logging.Logger, summary: list[dict[str, Any]], sta
     ok_warp = sum(1 for s in summary if bool(s.get("ok_warp")))
     ok_expected = sum(1 for s in summary if bool(s.get("ok")))
 
-    # Per source form buckets
+    # 入力フォーム別に集計
     by_src: dict[str, list[dict[str, Any]]] = {"A": [], "B": [], "C": [], "other": []}
     for s in summary:
         sf = str(s.get("source_form") or "")
@@ -2344,7 +2756,7 @@ def summarize_results(logger: logging.Logger, summary: list[dict[str, Any]], sta
         else:
             by_src["other"].append(s)
 
-    # A/B accuracy (form correct, template correct)
+    # A/B 正解数（フォーム正解・テンプレ正解）
     def _count_true(items: list[dict[str, Any]], key: str) -> int:
         return sum(1 for it in items if bool(it.get(key)))
 
@@ -2357,15 +2769,15 @@ def summarize_results(logger: logging.Logger, summary: list[dict[str, Any]], sta
     a_tpl_ok = _count_true(a_items, "is_predicted_best_template_correct")
     b_tpl_ok = _count_true(b_items, "is_predicted_best_template_correct")
 
-    # C should be rejected as form_unknown
+    # C は form_unknown で棄却されるべき
     c_reject_ok = sum(1 for it in c_items if str(it.get("stage")) == "form_unknown")
     c_fp_as_A = sum(1 for it in c_items if str(it.get("predicted_form") or "") == "A")
     c_fp_as_B = sum(1 for it in c_items if str(it.get("predicted_form") or "") == "B")
 
-    # Stage timing per-case (mean/median)
+    # ケース別の処理時間（mean/median）
     t_total_cases = [float(s.get("case_total_s", 0.0)) for s in summary if s.get("case_total_s") is not None]
     t1 = [float(s.get("stage_times", {}).get("degrade_s", 0.0)) for s in summary if isinstance(s.get("stage_times"), dict)]
-    # If stage_times are not embedded, fallback to overall sums / total.
+    # stage_times が埋まっていない場合は、集計値/総数から推定する
 
     logger.info("=" * 70)
     logger.info("[STATS] overall")
@@ -2389,17 +2801,17 @@ def summarize_results(logger: logging.Logger, summary: list[dict[str, Any]], sta
     logger.info("  false_positive_as_A                : %d (%.1f%%)", c_fp_as_A, _safe_div(c_fp_as_A * 100.0, len(c_items)))
     logger.info("  false_positive_as_B                : %d (%.1f%%)", c_fp_as_B, _safe_div(c_fp_as_B * 100.0, len(c_items)))
 
-    # Stage time aggregates
+    # ステージ別の合計時間
     logger.info("[STATS] stage time totals (s) (same as SUMMARY)")
     for k, v in stage_times.items():
         logger.info("  %-12s : %.2f", k, float(v))
 
-    # Means from aggregate totals
+    # 合計から平均を算出
     logger.info("[STATS] stage time mean per case (s)")
     for k, v in stage_times.items():
         logger.info("  %-12s : %.3f", k, float(v) / float(total))
 
-    # Total time mean/median
+    # 1ケース当たりの総時間（平均/中央値）
     logger.info("[STATS] per-case total time (s)")
     logger.info("  mean  : %.3f", _mean(t_total_cases))
     logger.info("  median: %.3f", _median(t_total_cases))
@@ -2439,7 +2851,7 @@ def load_docaligner_model(model_name: str, model_type: str) -> tuple[Any, Any]:
 
 
 # ------------------------------------------------------------
-# main pipeline split
+# メイン処理（パイプライン本体）
 # ------------------------------------------------------------
 
 
@@ -2470,7 +2882,7 @@ def process_one_case(
     angles: list[float],
     out_dirs: dict[str, Path],
 ) -> tuple[dict[str, Any], StageTimes]:
-    """Process one degraded variant of one source image."""
+    """1枚の入力画像から生成した「1枚の改悪画像（1バリアント）」を処理する。"""
 
     case_t0 = time.perf_counter()
     case_id = f"{src_form}_{src_path.stem}_deg{k:02d}"
@@ -2478,7 +2890,7 @@ def process_one_case(
         "source_form": src_form,
         "source_path": str(src_path),
         "case": case_id,
-        # NOTE:
+        # 注意:
         #   ユーザー要望に合わせて ok の意味を変更する：
         #     ok      = 期待動作として成功したか（C は form_unknown が成功）
         #     ok_warp = warp まで到達したか（aligned 出力が生成されたか）
@@ -2489,7 +2901,7 @@ def process_one_case(
     }
     times = StageTimes()
 
-    # source resolution
+    # 入力画像の解像度
     try:
         h0, w0 = src_bgr.shape[:2]
         item["source_w"] = int(w0)
@@ -2497,7 +2909,7 @@ def process_one_case(
     except Exception:
         pass
 
-    # stable RNG per case
+    # ケースごとに安定した乱数系列（同じ入力なら毎回同じ改悪になる）
     stable = zlib.crc32(f"{src_form}/{src_path.name}".encode("utf-8")) & 0xFFFFFFFF
     case_seed = (int(args.seed) * 1_000_000) + int(stable) * 100 + int(k)
     rng = random.Random(case_seed)
@@ -2542,7 +2954,7 @@ def process_one_case(
     item["stage"] = "docaligner_ok"
     item["polygon"] = poly.astype(float).tolist()
 
-    # (1) polygon margin: ratio-based by default
+    # (1) polygon margin: デフォルトは ratio ベース
     if float(getattr(args, "polygon_margin_px", 0.0)) > 0:
         margin_px = float(args.polygon_margin_px)
         item["polygon_margin"] = {"mode": "fixed_px", "value": margin_px}
@@ -2605,15 +3017,15 @@ def process_one_case(
     )
     times.decide_s = time.perf_counter() - t0
     item["form_decision"] = asdict(decision)
-    # quick access (for logging/statistics)
+    # すぐ参照する項目（ログ/集計向け）
     item["predicted_form"] = str(decision.form or "")
     item["predicted_angle_deg"] = "" if decision.angle_deg is None else float(decision.angle_deg)
 
     if not decision.ok or decision.form not in ("A", "B") or decision.angle_deg is None:
         item["stage"] = "form_unknown"
-        # Expected behaviour:
-        # - A/B: should NOT become form_unknown
-        # - C  : should become form_unknown (paper detected but not A/B)
+        # 期待動作:
+        # - A/B: form_unknown になってはいけない
+        # - C  : form_unknown になるべき（紙は検出できたが A/B ではない）
         item["ok"] = bool(src_form == "C")
         item["ok_warp"] = False
         item["case_total_s"] = float(time.perf_counter() - case_t0)
@@ -2635,14 +3047,14 @@ def process_one_case(
     except Exception:
         pass
 
-    # visualize decision evidence
+    # フォーム判定の根拠を可視化
     if decision.form == "A":
         markers = ((decision.detail or {}).get("A") or {}).get("markers") or []
         rot_vis = draw_formA_markers_overlay(chosen, markers)
     else:
         qrs = ((decision.detail or {}).get("B") or {}).get("qrs")
         if not qrs:
-            # Prefer WeChat-based detection for visualization too.
+            # 可視化でも WeChat ベース検出を優先
             wechat = getattr(score_formB, "_wechat", None)
             if wechat is not None:
                 qrs = detect_qr_codes_wechat_multiscale(chosen, wechat, mode="robust")
@@ -2661,7 +3073,7 @@ def process_one_case(
     templates = templates_A if decision.form == "A" else templates_B
     best: Optional[dict[str, Any]] = None
 
-    # NOTE: 絞り込みを廃止（常に全探索）
+    # 注意: 絞り込みを廃止（常に全探索）
     candidates = list(templates)
     item["template_prefilter"] = {
         "mode": "disabled",
@@ -2676,7 +3088,7 @@ def process_one_case(
     for ref in candidates:
         tp = Path(ref.template_path)
         if cached_matcher is not None:
-            # cached path: テンプレ画像の再読込は不要（特徴は事前計算済み）
+            # キャッシュ経路: テンプレ画像の再読込は不要（特徴は事前計算済み）
             res, H_tpl_to_img, mk0, mk1 = cached_matcher.match_with_cached_ref(ref, chosen)
         else:
             tpl_bgr = cv2.imread(str(tp))
@@ -2706,7 +3118,7 @@ def process_one_case(
                 if float(cand.get("inlier_ratio", 0.0)) > float(best.get("inlier_ratio", 0.0)):
                     best = cand
                 elif float(cand.get("inlier_ratio", 0.0)) == float(best.get("inlier_ratio", 0.0)):
-                    # Prefer smaller reprojection error if available.
+                    # reprojection error が小さい方を優先（取れない場合は無視）
                     try:
                         r0 = best.get("reproj_rms", None)
                         r1 = cand.get("reproj_rms", None)
@@ -2752,7 +3164,7 @@ def process_one_case(
     except Exception:
         pass
 
-    # (7) inverse homography stability
+    # (7) 逆ホモグラフィ（逆行列）安定性
     t0 = time.perf_counter()
     H_tpl_to_img = np.asarray(best.get("H_ref_to_tgt"), dtype=np.float64)
     ok_inv, H_img_to_tpl, inv_reason, h_cond, h_det = safe_invert_homography(
@@ -2783,8 +3195,8 @@ def process_one_case(
         pass
     times.warp_s = time.perf_counter() - t0
 
-    # debug matches (best effort)
-    # debug matches (best effort) + capture richer XFeat diagnostics for CSV
+    # デバッグ用のマッチ可視化（可能な範囲で）
+    # 追加: CSV 向けに XFeat の詳細診断も収集
     try:
         res2, H2, mk0, mk1 = matcher.match_and_estimate_h(tpl_bgr, chosen)
         if getattr(res2, "ok", False):
@@ -2807,9 +3219,9 @@ def process_one_case(
 
     item["stage"] = "done"
     item["ok_warp"] = True
-    # Expected-behaviour success:
-    # - A/B: form correct AND template correct AND warp done
-    # - C  : reaching "done" is actually a false-positive (should have been rejected)
+    # 期待動作としての成功条件:
+    # - A/B: フォーム正解 AND テンプレ正解 AND warp 完了
+    # - C  : "done" に到達したら誤検出（本来は棄却されるべき）
     if src_form in ("A", "B"):
         item["ok"] = bool(item.get("is_predicted_form_correct")) and bool(item.get("is_predicted_best_template_correct"))
     else:
@@ -2825,7 +3237,7 @@ def main(argv=None) -> int:
         print_explain()
         return 0
 
-    # Output root (create early so we can place log file)
+    # 出力ルート（ログファイルを置くため先に作る）
     run_id = now_run_id()
     out_root = mkdir(Path(args.out) / f"run_{run_id}")
     logger = setup_logging(out_root, level=str(args.log_level), console_level=str(args.console_log_level))
@@ -2838,11 +3250,11 @@ def main(argv=None) -> int:
     logger.info("src-forms: %s", args.src_forms)
     print_config(args)
 
-    # Setup device for XFeat
+    # XFeat 実行デバイスを決定
     device = "cuda" if args.device == "auto" and torch.cuda.is_available() else (args.device if args.device != "auto" else "cpu")
     ensure_portable_git_on_path()
 
-    # Output directories (numbered)
+    # 出力ディレクトリ（番号付き）
     out_dirs = {
         "degraded": mkdir(out_root / "1_degraded"),
         "doc": mkdir(out_root / "2_doc"),
@@ -2852,7 +3264,7 @@ def main(argv=None) -> int:
         "aligned": mkdir(out_root / "6_aligned"),
     }
 
-    # Load heavy models
+    # 重いモデルをロード
     logger.info("[INFO] Loading DocAligner...")
     model, cb = load_docaligner_model(args.docaligner_model, args.docaligner_type)
     logger.info("[OK] DocAligner loaded")
@@ -2861,12 +3273,12 @@ def main(argv=None) -> int:
     matcher = XFeatMatcher(top_k=args.top_k, device=device, match_max_side=args.match_max_side)
     logger.info("[OK] XFeat loaded")
 
-    # Initialize WeChat QR detector (optional)
+    # WeChat QR detector（利用可能なら）を初期化
     wechat = init_wechat_qr_detector(str(getattr(args, "wechat_model_dir", "")), logger=logger)
-    # Bind to score_formB via function attribute to avoid threading/arg plumbing
+    # 引数経由でスレッドに流すと取り回しが悪いので、score_formB に属性としてぶら下げる
     setattr(score_formB, "_wechat", wechat)
 
-    # (4) template cache
+    # (4) テンプレ特徴キャッシュ
     cached_matcher: Optional[CachedXFeatMatcher] = None
     try:
         cached_matcher = CachedXFeatMatcher(matcher)
@@ -2875,7 +3287,7 @@ def main(argv=None) -> int:
         logger.warning("[WARN] CachedXFeatMatcher disabled: %s", e)
         cached_matcher = None
 
-    # Prepare angles for form detection
+    # フォーム判定用の角度リストを準備
     step = float(args.rotation_step)
     angles = [float(a) for a in np.arange(0.0, 360.0, step) if a < 360.0 - 1e-6]
     angles = [a for a in angles if a <= 350.0 + 1e-6]  # enforce 0..350
@@ -2889,14 +3301,14 @@ def main(argv=None) -> int:
         logger.error("src-forms must contain at least one of A,B,C")
         return 1
 
-    # Templates for final alignment (A/B only)
+    # 最終位置合わせ用テンプレ（A/Bのみ）
     template_paths_A = list_images("A")
     template_paths_B = list_images("B")
     if not template_paths_A or not template_paths_B:
         logger.error("templates not found. Expected APA/image/A and APA/image/B")
         return 1
 
-    # warm-up template cache
+    # テンプレキャッシュをウォームアップ
     templates_A: list[CachedRef] = []
     templates_B: list[CachedRef] = []
     if cached_matcher is not None:
@@ -2921,7 +3333,7 @@ def main(argv=None) -> int:
     csv_rows: list[dict[str, Any]] = []
     t_all0 = time.perf_counter()
 
-    # stage aggregates
+    # ステージ別の件数/時間（集計用）
     stage_counts: dict[str, int] = {}
     stage_times: dict[str, float] = {
         "degrade_s": 0.0,
@@ -3000,7 +3412,7 @@ def main(argv=None) -> int:
                 try:
                     row = build_csv_row(args=args, item=item, times=st)
                 except Exception as e:
-                    # keep running even if a row build fails
+                    # CSV行の構築に失敗しても、処理全体は止めない
                     row = {
                         "case_id": str(item.get("case") or ""),
                         "pipeline_final_ok(warp_done)": "FALSE",
@@ -3020,7 +3432,7 @@ def main(argv=None) -> int:
                 stage_times["match_s"] += float(st.match_s)
                 stage_times["warp_s"] += float(st.warp_s)
 
-    # Save summary
+    # サマリ保存（JSON）
     with open(out_root / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
@@ -3030,10 +3442,10 @@ def main(argv=None) -> int:
     for r in csv_rows:
         r["run_elapsed_time_total_seconds"] = f"{dt:.6f}"
         r.setdefault("run_id", str(run_id))
-        # NOTE: ユーザー要望により CSV にフルパスは出さない。
+        # 注意: ユーザー要望により CSV にフルパスは出さない。
         # run 出力は run_id / run_output_root_directory_name で特定できる。
 
-    # Write rich summary.csv
+    # 詳細な summary.csv を出力
     csv_path = out_root / "summary.csv"
     fieldnames: list[str] = []
     seen: set[str] = set()
@@ -3054,7 +3466,7 @@ def main(argv=None) -> int:
         for r in csv_rows:
             w.writerow(r)
 
-    # (2) stage summary
+    # (2) ステージ別サマリ
     total_cases = len(summary)
     ok_expected_cases = sum(1 for s in summary if bool(s.get("ok")))
     ok_warp_cases = sum(1 for s in summary if bool(s.get("ok_warp")))
