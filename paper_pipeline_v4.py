@@ -6,7 +6,8 @@
 C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v4.py --degrade-n 3
 
 [mac]
-.venv/bin/python paper_pipeline_v4.py --degrade-n 3
+# リポジトリルートから実行する想定（`APA/` 配下のスクリプトを直接指定）
+.venv/bin/python APA/paper_pipeline_v4.py --degrade-n 3
 
 目的
 ----
@@ -18,7 +19,7 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v4.py --degrade
 - 解像度差に強い処理（polygon margin の比率化）
 - 大量処理時に原因追跡しやすいログ/サマリ（logging + stage集計 + 所要時間）
 - 検出率向上（マーカー/QR の前処理オプション）
-- 高速化（テンプレ特徴キャッシュ + グローバル特徴で候補絞り込み）
+- 高速化（テンプレ特徴キャッシュ。※グローバル特徴での候補絞り込みは互換用だが現在は無効）
 - 安定性（Unknown 判定、逆ホモグラフィの信頼度チェック）
 
 パイプライン概要
@@ -38,7 +39,10 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v4.py --degrade
    - `--polygon-margin-px > 0` の場合は固定pxマージンで上書き可能
 4) フォーム判定（回転探索）
    - 角度リストは仕様として `0..350` を `--rotation-step` 刻みで作成
-   - 実処理は高速化のため Coarse-to-Fine（0/90/180/270 で粗探索→近傍のみ探索）
+   - 実処理は高速化のため Coarse-to-Fine
+     - coarse: 0/45/90/.../315 の 8 方向で粗探索し、上位2角度を選ぶ
+     - fine  : 上位角度の近傍（±50度）だけ、上記の角度リスト内で細かく探索
+     - fallback: fine で何も見つからなければ全角度探索
    - フォームA: 3点マーク（TL/TR/BL）が検出できる（`--marker-preproc` で前処理オプション）
    - フォームB: QRコードが検出できる
      - まず高速（軽量）検出で角度候補を絞り、最後に robust 検出で確定
@@ -46,7 +50,7 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v4.py --degrade
    - 判定不能/曖昧なら `stage=form_unknown`（Unknown）で終了
 5) XFeat matching によるテンプレ照合
    - テンプレは `APA/image/A` または `APA/image/B`（`1.jpg`〜`6.jpg`）
-   - グローバル特徴で上位 `--template-topn` 枚へ絞り込み→局所特徴で精密推定（`--template-topn 0` で全探索）
+   - フォームAなら `APA/image/A` の全テンプレ、フォームBなら `APA/image/B` の全テンプレに対して局所特徴（XFeat）で照合する。
 6) Homography を信頼度チェックの上で逆行列化し、テンプレ座標へ warp
    - 不安定なら `stage=homography_unstable` で終了
 
@@ -90,6 +94,7 @@ import os
 import platform
 import random
 import sys
+import threading
 import time
 import traceback
 import zlib
@@ -125,6 +130,10 @@ class WeChatQRDetector:
     def __init__(self, model_dir: str):
         self.model_dir = str(model_dir)
         self.detector = self._init_detector(self.model_dir)
+        # NOTE: OpenCV wechat_qrcode_WeChatQRCode is not guaranteed thread-safe.
+        # We protect detectAndDecode with a lock because this pipeline uses ThreadPoolExecutor
+        # during rotation scan.
+        self._lock = threading.Lock()
 
     @staticmethod
     def _init_detector(model_dir: str) -> Any:
@@ -156,7 +165,9 @@ class WeChatQRDetector:
 
         if image_bgr is None:
             return []
-        res, points = self.detector.detectAndDecode(image_bgr)
+        # Guard native call for thread-safety.
+        with self._lock:
+            res, points = self.detector.detectAndDecode(image_bgr)
 
         out: list[dict[str, Any]] = []
         if res is None or points is None:
@@ -215,6 +226,7 @@ from test_recovery_paper import (
     draw_inlier_matches,
     ensure_portable_git_on_path,
     now_run_id,
+    refine_homography_least_squares,
     resize_keep_aspect,
     scale_matrix,
     warp_template_to_random_view,
@@ -432,16 +444,6 @@ def rotate_image_bound(image_bgr: np.ndarray, angle_deg: float) -> np.ndarray:
     M[0, 2] += (new_w / 2.0) - center[0]
     M[1, 2] += (new_h / 2.0) - center[1]
     return cv2.warpAffine(image_bgr, M, (new_w, new_h))
-
-
-def enforce_portrait(image_bgr: np.ndarray) -> tuple[np.ndarray, bool]:
-    """Ensure long side is vertical (portrait). Returns (image, rotated_flag)."""
-
-    h, w = image_bgr.shape[:2]
-    if w <= h:
-        return image_bgr, False
-    # rotate 90deg clockwise
-    return cv2.rotate(image_bgr, cv2.ROTATE_90_CLOCKWISE), True
 
 
 def enforce_landscape(image_bgr: np.ndarray) -> tuple[np.ndarray, bool]:
@@ -903,6 +905,199 @@ def detect_qr_codes_wechat(
         return []
 
 
+def _preprocess_variants_for_qr(image_bgr: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    """Generate preprocessed variants for QR detection.
+
+    WeChat QR detector accepts BGR input. We still try a few BGR variants
+    (gray/clahe/adaptive) converted back to BGR, because it can improve
+    detection under low contrast or lighting changes.
+    """
+
+    if image_bgr is None:
+        return []
+
+    variants: list[tuple[str, np.ndarray]] = [("bgr", image_bgr)]
+    try:
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        variants.append(("gray", cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)))
+
+        # CLAHE
+        try:
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            g2 = clahe.apply(gray)
+            variants.append(("clahe", cv2.cvtColor(g2, cv2.COLOR_GRAY2BGR)))
+        except Exception:
+            pass
+
+        # Adaptive + Morphology
+        try:
+            bw = cv2.adaptiveThreshold(
+                gray,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                51,
+                5,
+            )
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            bw2 = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel)
+            bw2 = cv2.morphologyEx(bw2, cv2.MORPH_OPEN, kernel)
+            variants.append(("adaptive_morph", cv2.cvtColor(bw2, cv2.COLOR_GRAY2BGR)))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    return variants
+
+
+def detect_qr_codes_wechat_multiscale(
+    image_bgr: np.ndarray,
+    wechat: Optional[WeChatQRDetector],
+    *,
+    mode: str = "fast",
+) -> list[dict[str, Any]]:
+    """WeChat-based QR detection with optional preprocessing + multiscale.
+
+    mode:
+      - fast  : fewer scales (used during rotation scan)
+      - robust: more scales and preprocessing variants
+    """
+
+    if wechat is None or image_bgr is None:
+        return []
+
+    h0, w0 = image_bgr.shape[:2]
+
+    # Keep it lightweight during scan, but still include a mild upscale.
+    if mode == "fast":
+        variants = [("bgr", image_bgr)]
+        scales = [1.0, 0.75, 0.5]
+        if max(h0, w0) < 1600:
+            scales += [1.25, 1.5]
+    else:
+        variants = _preprocess_variants_for_qr(image_bgr)
+        scales = [1.0, 0.75, 0.5, 0.25]
+        if max(h0, w0) < 1800:
+            scales += [1.25, 1.5, 2.0]
+
+    best: list[dict[str, Any]] = []
+    best_score = float("-inf")
+
+    # WeChat detector may return multiple QR codes; we score them later.
+    for prep_name, src in variants:
+        h, w = src.shape[:2]
+        for s in scales:
+            if abs(s - 1.0) < 1e-9:
+                test = src
+            else:
+                new_w = int(round(w * s))
+                new_h = int(round(h * s))
+                if new_w < 120 or new_h < 120:
+                    continue
+                if new_w > 6500 or new_h > 6500:
+                    continue
+                interp = cv2.INTER_CUBIC if s > 1.0 else cv2.INTER_AREA
+                test = cv2.resize(src, (new_w, new_h), interpolation=interp)
+
+            qrs = detect_qr_codes_wechat(test, wechat)
+            if not qrs:
+                continue
+
+            # scale points back to original image coordinates
+            if abs(s - 1.0) > 1e-9:
+                for q in qrs:
+                    try:
+                        pts = np.asarray(q.get("points"), dtype=np.float32).reshape(-1, 2)
+                        pts = pts / float(s)
+                        q["points"] = pts.tolist()
+                    except Exception:
+                        continue
+
+            # annotate how we found it
+            for q in qrs:
+                q.setdefault("engine", "wechat")
+                q["prep"] = prep_name
+                q["scale"] = float(s)
+
+            # Use a simple heuristic to keep the best set among variants:
+            # prefer results with larger QR area (more reliable) and higher top-rightness.
+            score = float("-inf")
+            try:
+                score, _ = score_best_qr_candidate(test if abs(s - 1.0) < 1e-9 else src, qrs)
+            except Exception:
+                score = 0.0
+
+            if score > best_score:
+                best_score = score
+                best = qrs
+
+            # In fast mode, return immediately on first success.
+            if mode == "fast":
+                return best
+
+    return best
+
+
+def score_best_qr_candidate(
+    image_bgr: np.ndarray,
+    qrs: list[dict[str, Any]],
+) -> tuple[float, dict[str, Any]]:
+    """Pick the single best QR from possibly multiple detections.
+
+    Goal: keep QR at top-right after choosing rotation.
+    We score each QR by:
+      - closeness to top-right (primary)
+      - relative area (secondary; helps stability)
+    """
+
+    h, w = image_bgr.shape[:2]
+    best = None
+    best_score = float("-inf")
+    best_detail: dict[str, Any] = {}
+
+    for q in (qrs or []):
+        try:
+            pts = np.asarray(q.get("points"), dtype=np.float32).reshape(-1, 2)
+            cx = float(pts[:, 0].mean())
+            cy = float(pts[:, 1].mean())
+            # points order can vary by detector; use abs() to avoid negative area.
+            area = float(abs(cv2.contourArea(pts.astype(np.float32))))
+            rel = area / float(max(1, w * h))
+
+            x_score = cx / float(max(1, w))
+            y_score = 1.0 - (cy / float(max(1, h)))
+            pos_score = 0.6 * x_score + 0.4 * y_score
+
+            # Strongly prefer top-rightness, then QR area.
+            score = (pos_score * 3.0) + (rel * 12.0)
+
+            if score > best_score:
+                best_score = float(score)
+                best = q
+                best_detail = {
+                    "qr_center": [cx, cy],
+                    "qr_rel_area": rel,
+                    "qr_pos_score": pos_score,
+                }
+        except Exception:
+            continue
+
+    if best is None:
+        return 0.0, {"qrs": []}
+
+    # Put best QR first for downstream drawing.
+    reordered = [best] + [q for q in (qrs or []) if q is not best]
+    detail = {
+        "qrs": reordered,
+        **best_detail,
+        "qr_engine": str(best.get("engine", "wechat")),
+        "qr_prep": str(best.get("prep", "")),
+        "qr_scale": best.get("scale", None),
+    }
+    return float(best_score), detail
+
+
 def detect_qr_codes_fast(image_bgr: np.ndarray) -> list[dict[str, Any]]:
     """フォーム判定のスキャン用: 速さ優先のQR検出。
 
@@ -1115,56 +1310,42 @@ def score_formA(
 
 
 def score_formB(image_bgr: np.ndarray) -> tuple[bool, float, dict[str, Any]]:
-    qrs = detect_qr_codes_wechat(image_bgr, getattr(score_formB, "_wechat", None))
+    wechat = getattr(score_formB, "_wechat", None)
+    qrs: list[dict[str, Any]] = []
+
+    # User request: do everything with WeChatQR from the start, including adjustment.
+    # If WeChat is not available, fallback to the existing OpenCV robust detector.
+    if wechat is not None:
+        qrs = detect_qr_codes_wechat_multiscale(image_bgr, wechat, mode="robust")
     if not qrs:
         qrs = detect_qr_codes_robust(image_bgr)
     if not qrs:
         return False, 0.0, {"qrs": []}
 
-    # Prefer "QR at top-right" (in the current rotated image),
-    # but do NOT hard-fail if it's slightly off. We instead score by proximity.
-    h, w = image_bgr.shape[:2]
-    pts = np.asarray(qrs[0]["points"], dtype=np.float32).reshape(-1, 2)
-    cx = float(pts[:, 0].mean())
-    cy = float(pts[:, 1].mean())
-
-    # Score: base 1.0 + relative QR size (encourage clearer detections)
-    area = float(cv2.contourArea(pts.astype(np.float32)))
-    rel = area / float(max(1, w * h))
-
-    # Proximity to top-right (0..1): higher is better
-    # - x: closer to right => larger
-    # - y: closer to top   => larger
-    x_score = cx / float(max(1, w))
-    y_score = 1.0 - (cy / float(max(1, h)))
-    pos_score = 0.6 * x_score + 0.4 * y_score
-
-    return True, 1.0 + rel * 10.0 + pos_score, {
-        "qrs": qrs,
-        "qr_center": [cx, cy],
-        "qr_rel_area": rel,
-        "qr_pos_score": pos_score,
-        "qr_engine": str(qrs[0].get("engine", "opencv")) if qrs else "",
-    }
+    best_score, detail = score_best_qr_candidate(image_bgr, qrs)
+    # Keep old score scale roughly compatible with the threshold (>=1.2 default)
+    score = 1.0 + float(best_score)
+    return True, float(score), detail
 
 
 def score_formB_fast(image_bgr: np.ndarray) -> tuple[bool, float, dict[str, Any]]:
     """回転スキャン時の高速判定用（QRがある角度候補を絞る）。"""
 
-    qrs = detect_qr_codes_fast(image_bgr)
+    wechat = getattr(score_formB, "_wechat", None)
+    qrs: list[dict[str, Any]] = []
+    if wechat is not None:
+        qrs = detect_qr_codes_wechat_multiscale(image_bgr, wechat, mode="fast")
+    else:
+        # fallback (kept for environments without opencv-contrib)
+        qrs = detect_qr_codes_fast(image_bgr)
+
     if not qrs:
         return False, 0.0, {"qrs": []}
 
-    h, w = image_bgr.shape[:2]
-    pts = np.asarray(qrs[0]["points"], dtype=np.float32).reshape(-1, 2)
-    cx = float(pts[:, 0].mean())
-    cy = float(pts[:, 1].mean())
-
-    # fast score: bias towards top-right but keep it mild
-    x_score = cx / float(max(1, w))
-    y_score = 1.0 - (cy / float(max(1, h)))
-    pos_score = 0.6 * x_score + 0.4 * y_score
-    return True, 1.0 + pos_score, {"qrs": qrs, "qr_center": [cx, cy], "qr_pos_score": pos_score}
+    best_score, detail = score_best_qr_candidate(image_bgr, qrs)
+    score = 1.0 + float(best_score)
+    detail["phase"] = "fast"
+    return True, float(score), detail
 
 
 def decide_form_by_rotations(
@@ -1178,7 +1359,7 @@ def decide_form_by_rotations(
     """Coarse-to-fine rotation scan; return best valid decision.
 
     NOTE:
-    - まず 0/90/180/270 の 4 回で大まかな向き（縦横/上下逆）を推定し、
+    - まず 0/45/90/.../315 の 8 回で大まかな向き（縦横/上下逆）を推定し、
       その近傍だけ細かく探索する（計算量削減）。
     - QR の robust 検出は重いため、候補角度のみ robust で再検証する。
     - A/B どちらもスコアが低い（閾値未満） or 近すぎる場合は Unknown 扱い。
@@ -1210,10 +1391,10 @@ def decide_form_by_rotations(
         return float(min(d, 360.0 - d))
 
     # ----------------------------------
-    # Coarse pass: 0/90/180/270 only
+    # Coarse pass: 8 directions (0/45/..../315)
     # ----------------------------------
 
-    coarse = [0.0, 90.0, 180.0, 270.0]
+    coarse = [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0]
     coarse_results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=min(max_workers, len(coarse))) as ex:
         futures = [ex.submit(_eval, a) for a in coarse]
@@ -1399,43 +1580,19 @@ def decide_form_by_rotations(
     return FormDecision(False, None, None, 0.0, {})
 
 
-# ------------------------------------------------------------
-# Template caching + global prefilter
-# ------------------------------------------------------------
+"""(template-topn / global prefilter)
 
-
-def compute_global_descriptor(image_bgr: np.ndarray, size: int = 256) -> np.ndarray:
-    """Compute a cheap global descriptor for template pre-filtering.
-
-    Current design:
-      - resize to fixed max side
-      - grayscale histogram (64 bins)
-      - HSV histogram (H:24, S:16)
-
-    Returns: 1D float32 vector normalized to unit length.
-    """
-
-    img, _ = resize_keep_aspect(image_bgr, max_side=int(size))
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-    h_hist = cv2.calcHist([hsv], [0], None, [24], [0, 180]).reshape(-1)
-    s_hist = cv2.calcHist([hsv], [1], None, [16], [0, 256]).reshape(-1)
-    g_hist = cv2.calcHist([gray], [0], None, [64], [0, 256]).reshape(-1)
-    v = np.concatenate([h_hist, s_hist, g_hist]).astype(np.float32)
-    n = float(np.linalg.norm(v))
-    if n > 1e-6:
-        v /= n
-    return v
+v4 ではユーザー要望により「フォーム確定後は全テンプレを XFeat で照合」します。
+そのため、旧版にあったグローバル特徴によるテンプレ候補絞り込み機能は削除しました。
+（CSVにも template-topn は出さず空欄にしています）
+"""
 
 
 @dataclass
 class CachedRef:
     template_path: str
-    ref_small: np.ndarray
     s_ref: float
     out0: dict[str, Any]
-    global_desc: np.ndarray
 
 
 class CachedXFeatMatcher:
@@ -1452,8 +1609,7 @@ class CachedXFeatMatcher:
         ref_small, s_ref = resize_keep_aspect(template_bgr, self.match_max_side)
         out0 = self.xfeat.detectAndCompute(ref_small, top_k=self.top_k)[0]
         out0.update({"image_size": (ref_small.shape[1], ref_small.shape[0])})
-        g = compute_global_descriptor(template_bgr)
-        return CachedRef(template_path=str(template_path), ref_small=ref_small, s_ref=float(s_ref), out0=out0, global_desc=g)
+        return CachedRef(template_path=str(template_path), s_ref=float(s_ref), out0=out0)
 
     def match_with_cached_ref(
         self,
@@ -1512,6 +1668,17 @@ class CachedXFeatMatcher:
         matches_n = int(len(mask))
         inlier_ratio = float(inliers) / float(matches_n) if matches_n else 0.0
 
+        # Refine H by least-squares on inliers for better warp quality.
+        reproj = None
+        if inliers >= 4:
+            try:
+                H_refined, rms = refine_homography_least_squares(H_small, mkpts0, mkpts1, mask)
+                if H_refined is not None:
+                    H_small = H_refined
+                reproj = rms
+            except Exception:
+                reproj = None
+
         # scale H back to full resolution: H_full = inv(S_tgt) * H_small * S_ref
         S_ref = scale_matrix(float(ref.s_ref))
         S_tgt = scale_matrix(float(s_tgt))
@@ -1526,6 +1693,7 @@ class CachedXFeatMatcher:
                     "inliers": inliers,
                     "matches": matches_n,
                     "inlier_ratio": float(inlier_ratio),
+                    "reproj_rms": reproj,
                     "H_ref_to_tgt": H_full.astype(float).tolist(),
                 },
             )(),
@@ -1540,14 +1708,10 @@ def select_top_templates(
     templates: list[CachedRef],
     top_n: int,
 ) -> list[CachedRef]:
-    if top_n <= 0 or top_n >= len(templates):
-        return templates
-    dists = []
-    for t in templates:
-        d = float(np.linalg.norm(target_desc - t.global_desc))
-        dists.append((d, t))
-    dists.sort(key=lambda x: x[0])
-    return [t for _, t in dists[:top_n]]
+    # v4 では prefilter を使わないため、互換用に「そのまま返す」だけにする。
+    # （この関数自体は本ファイル内では呼ばれない）
+    _ = (target_desc, top_n)
+    return templates
 
 
 # ------------------------------------------------------------
@@ -1616,12 +1780,6 @@ def _to_json_cell(v: Any) -> str:
         return str(v)
 
 
-def _path_or_empty(p: Any) -> str:
-    if not p:
-        return ""
-    return str(p)
-
-
 def _filename_only(p: Any) -> str:
     """Return only the filename part (no directory)."""
 
@@ -1664,19 +1822,6 @@ def _sanitize_template_candidate_results(v: Any) -> Any:
         return out
     except Exception:
         return v
-
-
-def compute_reproj_rms(H: np.ndarray, src_pts: np.ndarray, dst_pts: np.ndarray) -> float:
-    """Compute RMS reprojection error (px)."""
-
-    try:
-        src = np.asarray(src_pts, dtype=np.float32).reshape(-1, 1, 2)
-        dst = np.asarray(dst_pts, dtype=np.float32).reshape(-1, 1, 2)
-        proj = cv2.perspectiveTransform(src, np.asarray(H, dtype=np.float64))
-        err = np.linalg.norm(proj - dst, axis=2).reshape(-1)
-        return float(np.sqrt(np.mean(err**2))) if len(err) else float("nan")
-    except Exception:
-        return float("nan")
 
 
 def _template_number_from_path(p: str) -> str:
@@ -1881,7 +2026,8 @@ def build_csv_row(
 
         # ---- run configuration (selected, for quick filtering) ----
         "run_config_rotation_step_deg": str(getattr(args, "rotation_step", "")),
-        "run_config_template_topn": str(getattr(args, "template_topn", "")),
+        # v4 では template-topn は廃止（常に全テンプレ照合）
+        "run_config_template_topn": "",
         "run_config_xfeat_top_k": str(getattr(args, "top_k", "")),
         "run_config_xfeat_match_max_side_px": str(getattr(args, "match_max_side", "")),
         "run_config_marker_preproc": str(getattr(args, "marker_preproc", "")),
@@ -2014,14 +2160,6 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="フォームAマーカー検出の前処理（照明ムラ対策）",
     )
 
-    # (4) template caching / prefilter
-    p.add_argument(
-        "--template-topn",
-        type=int,
-        default=3,
-        help="グローバル特徴で候補テンプレを絞り込む上位N（0で全探索）",
-    )
-
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="cpu")
     p.add_argument("--top-k", type=int, default=1024, help="XFeatの特徴点数（大きいほど高精度だが遅い）")
     p.add_argument("--match-max-side", type=int, default=1200, help="XFeat用にリサイズする最大辺(px)（大きいほど高精度だが遅い）")
@@ -2092,7 +2230,7 @@ def print_explain() -> None:
         f"  --device              XFeatの実行デバイス (auto/cpu/cuda) [default: {defaults.device}]",
         f"  --top-k               特徴点数（大きいほど高精度だが遅い） [default: {defaults.top_k}]",
         f"  --match-max-side      マッチング前にリサイズする最大辺(px)（大きいほど高精度だが遅い） [default: {defaults.match_max_side}]",
-        f"  --template-topn       グローバル特徴でテンプレ候補を絞る上位N（0で全探索） [default: {defaults.template_topn}]",
+        "  (注) v4 ではテンプレ候補絞り込み（template-topn）は廃止し、常に全テンプレ照合します。",
         "",
         "【ログ】",
         f"  --log-level           ログレベル (DEBUG/INFO/WARNING/ERROR) [default: {defaults.log_level}]",
@@ -2283,7 +2421,7 @@ def print_config(args: argparse.Namespace) -> None:
             f"  polygon-margin      : ratio={args.polygon_margin_ratio} (min={args.polygon_margin_min_px}px, max={args.polygon_margin_max_px}px)"
         )
     print(f"  marker-preproc      : {args.marker_preproc}")
-    print(f"  template-topn       : {args.template_topn}")
+    print("  template-topn       : (removed) always match all templates")
     print(f"  unknown-threshold   : {args.unknown_score_threshold} / margin={args.unknown_margin}")
     print(f"  device              : {args.device}")
     print(f"  top-k               : {args.top_k}")
@@ -2504,37 +2642,46 @@ def process_one_case(
     else:
         qrs = ((decision.detail or {}).get("B") or {}).get("qrs")
         if not qrs:
-            qrs = detect_qr_codes_robust(chosen)
+            # Prefer WeChat-based detection for visualization too.
+            wechat = getattr(score_formB, "_wechat", None)
+            if wechat is not None:
+                qrs = detect_qr_codes_wechat_multiscale(chosen, wechat, mode="robust")
+            if not qrs:
+                qrs = detect_qr_codes_robust(chosen)
         rot_vis = draw_formB_qr_overlay(chosen, qrs)
     out_rot = out_dirs["rot"] / f"{case_id}_rot.jpg"
     cv2.imwrite(str(out_rot), rot_vis)
     item["output_rotated_decision_visualization_image_path"] = str(out_rot)
 
-    # 5) XFeat matching (template caching + prefilter)
+    # 5) XFeat matching
+    #   ユーザー要望: "絞り込みをやめる"。
+    #   フォームAなら APA/image/A の全テンプレ、フォームBなら APA/image/B の全テンプレへ
+    #   局所特徴（XFeat）で照合して最良を選ぶ。
     t0 = time.perf_counter()
     templates = templates_A if decision.form == "A" else templates_B
     best: Optional[dict[str, Any]] = None
 
-    # prefilter templates by global descriptor
-    target_desc = compute_global_descriptor(chosen)
-    candidates = select_top_templates(target_desc, templates, top_n=int(args.template_topn))
+    # NOTE: 絞り込みを廃止（常に全探索）
+    candidates = list(templates)
     item["template_prefilter"] = {
-        "topn": int(args.template_topn),
+        "mode": "disabled",
+        "topn": 0,
         "candidates": [c.template_path for c in candidates],
         "total": len(templates),
+        "note": "global prefilter disabled; matched against all templates in decided form",
     }
 
     template_candidate_results: list[dict[str, Any]] = []
 
     for ref in candidates:
         tp = Path(ref.template_path)
-        tpl_bgr = cv2.imread(str(tp))
-        if tpl_bgr is None:
-            continue
-
         if cached_matcher is not None:
+            # cached path: テンプレ画像の再読込は不要（特徴は事前計算済み）
             res, H_tpl_to_img, mk0, mk1 = cached_matcher.match_with_cached_ref(ref, chosen)
         else:
+            tpl_bgr = cv2.imread(str(tp))
+            if tpl_bgr is None:
+                continue
             res, H_tpl_to_img, mk0, mk1 = matcher.match_and_estimate_h(tpl_bgr, chosen)
 
         ok = bool(getattr(res, "ok", False)) and H_tpl_to_img is not None
@@ -2544,6 +2691,7 @@ def process_one_case(
             "inliers": int(getattr(res, "inliers", 0)),
             "matches": int(getattr(res, "matches", 0)),
             "inlier_ratio": float(getattr(res, "inlier_ratio", 0.0)),
+            "reproj_rms": getattr(res, "reproj_rms", None),
         }
         if ok and getattr(res, "H_ref_to_tgt", None) is not None:
             cand["H_ref_to_tgt"] = getattr(res, "H_ref_to_tgt")
@@ -2557,6 +2705,17 @@ def process_one_case(
             elif int(cand.get("inliers", 0)) == int(best.get("inliers", 0)):
                 if float(cand.get("inlier_ratio", 0.0)) > float(best.get("inlier_ratio", 0.0)):
                     best = cand
+                elif float(cand.get("inlier_ratio", 0.0)) == float(best.get("inlier_ratio", 0.0)):
+                    # Prefer smaller reprojection error if available.
+                    try:
+                        r0 = best.get("reproj_rms", None)
+                        r1 = cand.get("reproj_rms", None)
+                        if r0 is None and r1 is not None:
+                            best = cand
+                        elif (r0 is not None) and (r1 is not None) and float(r1) < float(r0):
+                            best = cand
+                    except Exception:
+                        pass
 
     times.match_s = time.perf_counter() - t0
     item["best_match"] = best
@@ -2753,18 +2912,10 @@ def main(argv=None) -> int:
             templates_B.append(cached_matcher.prepare_ref(img, str(pth)))
         logger.info("[OK] template cache built: A=%d B=%d", len(templates_A), len(templates_B))
     else:
-        # still need global desc for prefilter: build minimal cache
-        for pth in template_paths_A:
-            img = cv2.imread(str(pth))
-            if img is None:
-                continue
-            templates_A.append(CachedRef(str(pth), img, 1.0, {}, compute_global_descriptor(img)))
-        for pth in template_paths_B:
-            img = cv2.imread(str(pth))
-            if img is None:
-                continue
-            templates_B.append(CachedRef(str(pth), img, 1.0, {}, compute_global_descriptor(img)))
-        logger.info("[OK] template global-desc cache built: A=%d B=%d", len(templates_A), len(templates_B))
+        # CachedXFeatMatcher が無い場合でも、テンプレのパス一覧だけは必要。
+        templates_A = [CachedRef(template_path=str(p), s_ref=1.0, out0={}) for p in template_paths_A]
+        templates_B = [CachedRef(template_path=str(p), s_ref=1.0, out0={}) for p in template_paths_B]
+        logger.info("[OK] template list prepared (no feature cache): A=%d B=%d", len(templates_A), len(templates_B))
 
     summary: list[dict[str, Any]] = []
     csv_rows: list[dict[str, Any]] = []

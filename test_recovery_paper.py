@@ -517,6 +517,48 @@ def compute_reproj_rms(H: np.ndarray, src_pts: np.ndarray, dst_pts: np.ndarray) 
     return float(np.sqrt(np.mean(err**2))) if len(err) else float("nan")
 
 
+def refine_homography_least_squares(
+    H_init: np.ndarray,
+    mkpts0: np.ndarray,
+    mkpts1: np.ndarray,
+    inlier_mask: np.ndarray,
+) -> tuple[np.ndarray, Optional[float]]:
+    """Refine homography using inliers only.
+
+    Why:
+      cv2.findHomography(..., USAC_MAGSAC, ...) is robust, but the returned H can
+      be slightly suboptimal for warp quality. A common approach is:
+        1) robust estimation -> inlier mask
+        2) least-squares re-fit on inliers
+
+    Returns:
+      (H_refined, reproj_rms_on_inliers)
+    """
+
+    H0 = np.asarray(H_init, dtype=np.float64)
+    mask = np.asarray(inlier_mask, dtype=bool).reshape(-1)
+    if mask.size != len(mkpts0) or mask.size != len(mkpts1):
+        return H0, None
+
+    if int(mask.sum()) < 4:
+        return H0, None
+
+    p0 = np.asarray(mkpts0, dtype=np.float32)[mask]
+    p1 = np.asarray(mkpts1, dtype=np.float32)[mask]
+
+    # method=0 => a simple (non-robust) least squares fit.
+    H_ls, _ = cv2.findHomography(p0, p1, 0)
+    if H_ls is None:
+        return H0, None
+
+    try:
+        rms = compute_reproj_rms(np.asarray(H_ls, dtype=np.float64), p0, p1)
+    except Exception:
+        rms = None
+
+    return np.asarray(H_ls, dtype=np.float64), rms
+
+
 class XFeatMatcher:
     def __init__(self, top_k: int = 4096, device: str = "cpu", match_max_side: int = 1200):
         ensure_portable_git_on_path()
@@ -596,9 +638,16 @@ class XFeatMatcher:
         matches_n = int(len(mask))
         inlier_ratio = float(inliers) / float(matches_n) if matches_n else 0.0
 
+        # Refine H by least-squares on inliers for better warp quality.
         reproj = None
         if inliers >= 4:
-            reproj = compute_reproj_rms(H, mkpts0[mask], mkpts1[mask])
+            try:
+                H_refined, rms = refine_homography_least_squares(H, mkpts0, mkpts1, mask)
+                if H_refined is not None:
+                    H = H_refined
+                reproj = rms if rms is not None else compute_reproj_rms(H, mkpts0[mask], mkpts1[mask])
+            except Exception:
+                reproj = compute_reproj_rms(H, mkpts0[mask], mkpts1[mask])
 
         _ = time.time() - t0
 
