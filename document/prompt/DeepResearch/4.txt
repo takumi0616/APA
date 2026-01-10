@@ -1,15 +1,15 @@
-\paper_pipeline_v4.py
+\paper_pipeline_v5.py
 ```
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""paper_pipeline_v4.py
+"""paper_pipeline_v5.py
 
 [windows]
-C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v4.py --degrade-n 3
+C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v5.py --degrade-n 3
 
 [mac]
 # リポジトリルートから実行する想定（`APA/` 配下のスクリプトを直接指定）
-.venv/bin/python APA/paper_pipeline_v4.py --degrade-n 3
+.venv/bin/python paper_pipeline_v5.py --degrade-n 3
 
 目的
 ----
@@ -44,7 +44,8 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v4.py --degrade
    - 実処理は高速化のため Coarse-to-Fine
      - coarse: 0/45/90/.../315 の 8 方向で粗探索し、上位2角度を選ぶ
      - fine  : 上位角度の近傍（±50度）だけ、上記の角度リスト内で細かく探索
-     - フォールバック: fine で何も見つからなければ全角度探索
+     - （高速化）fine で何も見つからない場合は原則 Unknown（no_detection）とする
+       - ただし QR だけは「0/90/180/270 のみ robust 検出」で最小限の救済を行う
    - フォームA: 3点マーク（TL/TR/BL）が検出できる（`--marker-preproc` で前処理オプション）
    - フォームB: QRコードが検出できる
      - まず高速（軽量）検出で角度候補を絞り、最後に robust 検出で確定
@@ -130,7 +131,7 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
 
     # 改悪生成（degrade）
     "degrade": {
-        "n": 1,  # 1枚の入力から何枚の改悪画像を作るか
+        "n": 10,  # 1枚の入力から何枚の改悪画像を作るか
         "out_size_wh": [2400, 1800],  # 改悪画像の出力サイズ（幅, 高さ）
         "max_rot_deg": 180.0,  # 改悪生成の回転強度（>=180で0..360の一様回転モード）
         "min_abs_rot_deg": 0.0,  # 最小回転量（0なら小さな回転も許可）
@@ -387,7 +388,7 @@ def init_wechat_qr_detector(model_dir: str, logger: Optional[logging.Logger] = N
 
 
 # --- 既存実装の流用 ---
-# 注意: このスクリプトは `python APA/paper_pipeline_v4.py ...` の形で実行される想定。
+# 注意: このスクリプトは `python APA/paper_pipeline_v5.py ...` の形で実行される想定。
 # その場合 sys.path[0] は `.../APA` になるため、同ディレクトリのモジュールは
 # `from test_recovery_paper import ...` の形で import する（`import APA.xxx` は失敗しやすい）。
 from test_recovery_paper import (
@@ -1796,6 +1797,38 @@ def decide_form_by_rotations(
         d = abs((_wrap_angle(a) - _wrap_angle(b)) % 360.0)
         return float(min(d, 360.0 - d))
 
+    def _pick_nearest_angles(base_angles: list[float], all_angles: list[float], k_per_base: int = 2) -> list[float]:
+        """fine候補が空になった場合の最小限の救済。
+
+        目的:
+          ユーザー要望により「全角度探索フォールバック」は廃止する。
+          ただし `angles` の刻みが粗すぎる等で fine_set が空になる可能性はあるため、
+          base_angles それぞれに対して近い角度だけを拾う。
+
+        - 各 base_angle について circular distance が近い順に最大 k_per_base 個
+        - 全体では base_angles の個数 * k_per_base 程度に抑える
+        """
+
+        if not base_angles or not all_angles:
+            return []
+
+        picked: list[float] = []
+        for ba in base_angles:
+            ranked = sorted(all_angles, key=lambda a: _circular_dist_deg(float(a), float(ba)))
+            for a in ranked[: max(1, int(k_per_base))]:
+                picked.append(float(a))
+
+        # 重複排除しつつ順序をある程度安定させる
+        out: list[float] = []
+        seen: set[float] = set()
+        for a in picked:
+            aa = float(a)
+            if aa in seen:
+                continue
+            seen.add(aa)
+            out.append(aa)
+        return out
+
     # ----------------------------------
     # coarse: 8方向で粗探索（0/45/..../315）
     # ----------------------------------
@@ -1837,8 +1870,12 @@ def decide_form_by_rotations(
                 fine_set.add(float(a))
     fine = sorted(fine_set)
     if not fine:
-        # フォールバック: 全角度探索
-        fine = list(angles)
+        # NOTE:
+        # 以前はここで「全角度探索」にフォールバックしていたが、処理時間が大きく伸びるため廃止。
+        # 代わりに base_angles の近傍だけを最小限試す。
+        fine = _pick_nearest_angles(base_angles=base_angles, all_angles=angles, k_per_base=2)
+        if not fine:
+            return FormDecision(False, None, None, 0.0, {"reason": "no_detection", "coarse": coarse_results, "fine_angles": []})
 
     bestA: Optional[FormDecision] = None
     bestB_fast: Optional[FormDecision] = None
@@ -1861,55 +1898,39 @@ def decide_form_by_rotations(
                 if bestB_fast is None or candB.score > bestB_fast.score:
                     bestB_fast = candB
 
-    # fine で見つからなければ全角度探索（元の挙動へのフォールバック）
+    # fine で見つからない場合:
+    # - 以前は「全角度探索（fallback_full）」で回帰を避けていたが、処理時間が長すぎるため廃止。
+    # - 代わりに、QR（フォームB）は robust 検出で最小限救済（0/90/180/270）し、
+    #   それでもダメなら Unknown（no_detection）とする。
     if bestA is None and bestB_fast is None:
-        # デフォルトでも 36 角度程度なので、これで回帰を避ける
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = [ex.submit(_eval, a) for a in angles]
-            for fut in as_completed(futures):
-                r = fut.result()
-                if not r or r.get("skip"):
-                    continue
-                angle = float(r["angle"])
-                if r["A"]["ok"]:
-                    candA = FormDecision(True, "A", angle, float(r["A"]["score"]), {"A": r["A"]["detail"], "phase": "fallback_full"})
-                    if bestA is None or candA.score > bestA.score:
-                        bestA = candA
-                if r["B_fast"]["ok"]:
-                    candB = FormDecision(True, "B", angle, float(r["B_fast"]["score"]), {"B_fast": r["B_fast"]["detail"], "phase": "fallback_full"})
-                    if bestB_fast is None or candB.score > bestB_fast.score:
-                        bestB_fast = candB
+        rescue_angles = [float(a) for a in PIPELINE_DEFAULTS["rotation_scan"]["rescue_angles_deg"]]
+        bestB_rescue: Optional[FormDecision] = None
+        for aa in rescue_angles:
+            rotated = rotate_image_bound(rectified_bgr, aa)
+            rotated, _ = enforce_landscape(rotated)
+            if rotated.shape[0] > rotated.shape[1]:
+                continue
+            okB, scoreB, detB = score_formB(rotated)
+            if not okB:
+                continue
+            cand = FormDecision(True, "B", float(aa), float(scoreB), {"B": detB, "rescue": True, "phase": "no_detection_rescue"})
+            if bestB_rescue is None or cand.score > bestB_rescue.score:
+                bestB_rescue = cand
+        if bestB_rescue is not None:
+            return bestB_rescue
 
-        if bestA is None and bestB_fast is None:
-            # FAST で全く検出できない場合でも、robust 側だと拾えるケースがある。
-            # まずは 0/90/180/270 のみ rescue を実施して、見つかれば B として確定する。
-            rescue_angles = [float(a) for a in PIPELINE_DEFAULTS["rotation_scan"]["rescue_angles_deg"]]
-            bestB_rescue: Optional[FormDecision] = None
-            for aa in rescue_angles:
-                rotated = rotate_image_bound(rectified_bgr, aa)
-                rotated, _ = enforce_landscape(rotated)
-                if rotated.shape[0] > rotated.shape[1]:
-                    continue
-                okB, scoreB, detB = score_formB(rotated)
-                if not okB:
-                    continue
-                cand = FormDecision(True, "B", float(aa), float(scoreB), {"B": detB, "rescue": True, "phase": "no_detection_rescue"})
-                if bestB_rescue is None or cand.score > bestB_rescue.score:
-                    bestB_rescue = cand
-            if bestB_rescue is not None:
-                return bestB_rescue
-
-            return FormDecision(
-                False,
-                None,
-                None,
-                0.0,
-                {
-                    "reason": "no_detection",
-                    "coarse": coarse_results,
-                    "fine_angles": fine,
-                },
-            )
+        return FormDecision(
+            False,
+            None,
+            None,
+            0.0,
+            {
+                "reason": "no_detection",
+                "coarse": coarse_results,
+                "fine_angles": fine,
+                "note": "full_angle_fallback_disabled",
+            },
+        )
 
     # Unknown 判定: スコアが低すぎる / A-Bが近すぎる
     # （どちらかが None の場合は -inf として扱う）
@@ -1996,7 +2017,7 @@ def decide_form_by_rotations(
 
 """（template-topn / グローバル特徴による事前絞り込み）
 
-v4 ではユーザー要望により「フォーム確定後は全テンプレを XFeat で照合」します。
+v5 ではユーザー要望により「フォーム確定後は全テンプレを XFeat で照合」します。
 そのため、旧版にあったグローバル特徴によるテンプレ候補絞り込み機能は削除しました。
 （CSVにも template-topn は出さず空欄にしています）
 """
@@ -2122,7 +2143,7 @@ def select_top_templates(
     templates: list[CachedRef],
     top_n: int,
 ) -> list[CachedRef]:
-    # v4 では prefilter を使わないため、互換用に「そのまま返す」だけにする。
+    # v5 では prefilter を使わないため、互換用に「そのまま返す」だけにする。
     # （この関数自体は本ファイル内では呼ばれない）
     _ = (target_desc, top_n)
     return templates
@@ -2447,7 +2468,7 @@ def build_csv_row(
 
         # ---- 実行設定（主要なものだけ抜粋） ----
         "run_config_rotation_step_deg": str(getattr(args, "rotation_step", "")),
-        # v4 では template-topn は廃止（常に全テンプレ照合）
+        # v5 では template-topn は廃止（常に全テンプレ照合）
         "run_config_template_topn": "",
         "run_config_xfeat_top_k": str(getattr(args, "top_k", "")),
         "run_config_xfeat_match_max_side_px": str(getattr(args, "match_max_side", "")),
@@ -2732,7 +2753,7 @@ def print_explain() -> None:
         f"  --device              XFeatの実行デバイス (auto/cpu/cuda) [default: {defaults.device}]",
         f"  --top-k               特徴点数（大きいほど高精度だが遅い） [default: {defaults.top_k}]",
         f"  --match-max-side      マッチング前にリサイズする最大辺(px)（大きいほど高精度だが遅い） [default: {defaults.match_max_side}]",
-        "  (注) v4 ではテンプレ候補絞り込み（template-topn）は廃止し、常に全テンプレ照合します。",
+        "  (注) v5 ではテンプレ候補絞り込み（template-topn）は廃止し、常に全テンプレ照合します。",
         "",
         "【ログ】",
         f"  --log-level           ログレベル (DEBUG/INFO/WARNING/ERROR) [default: {defaults.log_level}]",
@@ -2742,7 +2763,7 @@ def print_explain() -> None:
         f"  --out                 出力ディレクトリ（run_... が作成される） [default: {defaults.out}]",
         "",
         "最小コマンド例（おすすめデフォルト使用）:",
-        r"  C:\Users\takumi\develop\miniconda3\python.exe APA\paper_pipeline_v4.py --limit 1",
+        r"  C:\Users\takumi\develop\miniconda3\python.exe APA\paper_pipeline_v5.py --limit 1",
         "",
     ]
     print("\n".join(lines))
@@ -3337,7 +3358,7 @@ def main(argv=None) -> int:
     logger = setup_logging(out_root, level=str(args.log_level), console_level=str(args.console_log_level))
 
     logger.info("=" * 70)
-    logger.info("paper_pipeline_v4")
+    logger.info("paper_pipeline_v5")
     logger.info("=" * 70)
     logger.info("OpenCV: %s", cv2.__version__)
     logger.info("torch : %s", torch.__version__)
@@ -3593,133 +3614,261 @@ def main(argv=None) -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 
+
 ```
 
-@/APA\paper_pipeline_v4.py を動かした場合、1枚当たりかなり時間がかかります
+@/APA\paper_pipeline_v5.py を動かした場合、1枚当たりかなり時間がかかります
 以下のログを見てください
 ```
-2026-01-09 16:04:44 [INFO] ======================================================================
-2026-01-09 16:04:44 [INFO] paper_pipeline_v4
-2026-01-09 16:04:44 [INFO] ======================================================================
-2026-01-09 16:04:44 [INFO] OpenCV: 4.12.0
-2026-01-09 16:04:44 [INFO] torch : 2.9.1+cpu
-2026-01-09 16:04:44 [INFO] src-forms: A,B,C
-2026-01-09 16:04:44 [INFO] [INFO] Loading DocAligner...
-2026-01-09 16:04:46 [INFO] [OK] DocAligner loaded
-2026-01-09 16:04:46 [INFO] [INFO] Loading XFeat...
-2026-01-09 16:04:47 [INFO] [OK] XFeat loaded
-2026-01-09 16:04:47 [INFO] [OK] WeChat QR detector initialized: C:\Users\takumi\develop\APA\models\wechat_qrcode
-2026-01-09 16:04:47 [INFO] [OK] CachedXFeatMatcher enabled
-2026-01-09 16:04:51 [INFO] [OK] template cache built: A=6 B=6
-2026-01-09 16:04:51 [INFO] Processing sources from form A: 6 images
-2026-01-09 16:05:00 [INFO] [CASE] id=A_1_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=415 inlier_ratio=0.8504098360655737 time_total_s=9.447724 (1_degrade=1.177079,2_doc=0.207588,3_rectify=0.008258,4_decide=3.867640,5_match=3.126050,6_warp=0.085092) src=1.jpg
-2026-01-09 16:05:12 [INFO] [CASE] id=A_1_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=345 inlier_ratio=0.7912844036697247 time_total_s=11.250470 (1_degrade=1.042152,2_doc=0.213727,3_rectify=0.009576,4_decide=5.930498,5_match=3.024414,6_warp=0.063875) src=1.jpg
-2026-01-09 16:05:22 [INFO] [CASE] id=A_1_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=379 inlier_ratio=0.8275109170305677 time_total_s=10.110761 (1_degrade=0.734584,2_doc=0.205568,3_rectify=0.008460,4_decide=4.239758,5_match=3.703949,6_warp=0.072846) src=1.jpg
-2026-01-09 16:05:33 [INFO] [CASE] id=A_2_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=380 inlier_ratio=0.8296943231441049 time_total_s=11.569473 (1_degrade=1.302315,2_doc=0.340851,3_rectify=0.021255,4_decide=5.809434,5_match=3.097090,6_warp=0.080450) src=2.jpg
-2026-01-09 16:05:44 [INFO] [CASE] id=A_2_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=400 inlier_ratio=0.8368200836820083 time_total_s=10.901417 (1_degrade=0.853420,2_doc=0.210397,3_rectify=0.006522,4_decide=6.036341,5_match=2.846513,6_warp=0.067707) src=2.jpg
-2026-01-09 16:05:52 [INFO] [CASE] id=A_2_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=430 inlier_ratio=0.86 time_total_s=8.125408 (1_degrade=0.716399,2_doc=0.192011,3_rectify=0.007965,4_decide=3.483870,5_match=2.728169,6_warp=0.067272) src=2.jpg
-2026-01-09 16:06:00 [INFO] [CASE] id=A_3_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=407 inlier_ratio=0.8323108384458078 time_total_s=7.959122 (1_degrade=1.167363,2_doc=0.219050,3_rectify=0.007368,4_decide=3.214988,5_match=2.352140,6_warp=0.082384) src=3.jpg
-2026-01-09 16:06:09 [INFO] [CASE] id=A_3_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=371 inlier_ratio=0.8207964601769911 time_total_s=8.958997 (1_degrade=1.209790,2_doc=0.198870,3_rectify=0.006470,4_decide=3.372874,5_match=3.178208,6_warp=0.080710) src=3.jpg
-2026-01-09 16:06:18 [INFO] [CASE] id=A_3_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=418 inlier_ratio=0.8326693227091634 time_total_s=8.417768 (1_degrade=1.141050,2_doc=0.200300,3_rectify=0.009792,4_decide=3.335133,5_match=2.725177,6_warp=0.081644) src=3.jpg
-2026-01-09 16:06:36 [WARNING] [CASE] id=A_4_deg00 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=17.952307 (1_degrade=1.362710,2_doc=0.196685,3_rectify=0.009439,4_decide=16.304947,5_match=0.000000,6_warp=0.000000) src=4.jpg
-2026-01-09 16:06:59 [WARNING] [CASE] id=A_4_deg01 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=23.321693 (1_degrade=1.165741,2_doc=0.217689,3_rectify=0.009413,4_decide=21.864632,5_match=0.000000,6_warp=0.000000) src=4.jpg
-2026-01-09 16:07:21 [WARNING] [CASE] id=A_4_deg02 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=22.027873 (1_degrade=0.654873,2_doc=0.229686,3_rectify=0.008085,4_decide=21.064572,5_match=0.000000,6_warp=0.000000) src=4.jpg
-2026-01-09 16:07:30 [INFO] [CASE] id=A_5_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=397 inlier_ratio=0.8219461697722568 time_total_s=8.942222 (1_degrade=0.841933,2_doc=0.225397,3_rectify=0.008386,4_decide=4.204914,5_match=2.731652,6_warp=0.082008) src=5.jpg
-2026-01-09 16:07:40 [INFO] [CASE] id=A_5_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=426 inlier_ratio=0.8114285714285714 time_total_s=9.367179 (1_degrade=0.750833,2_doc=0.190579,3_rectify=0.009614,4_decide=4.310027,5_match=3.070171,6_warp=0.077514) src=5.jpg
-2026-01-09 16:07:48 [INFO] [CASE] id=A_5_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=363 inlier_ratio=0.7773019271948608 time_total_s=8.788340 (1_degrade=0.770609,2_doc=0.224147,3_rectify=0.008755,4_decide=3.925977,5_match=3.046899,6_warp=0.065772) src=5.jpg
-2026-01-09 16:07:57 [INFO] [CASE] id=A_6_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=430 inlier_ratio=0.8365758754863813 time_total_s=8.313863 (1_degrade=0.673050,2_doc=0.198685,3_rectify=0.010694,4_decide=3.542272,5_match=2.882726,6_warp=0.077817) src=6.jpg
-2026-01-09 16:08:06 [INFO] [CASE] id=A_6_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=401 inlier_ratio=0.8302277432712215 time_total_s=9.100089 (1_degrade=1.515964,2_doc=0.195576,3_rectify=0.007297,4_decide=3.413526,5_match=2.955313,6_warp=0.075731) src=6.jpg
-2026-01-09 16:08:14 [INFO] [CASE] id=A_6_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=387 inlier_ratio=0.8130252100840336 time_total_s=7.829838 (1_degrade=0.709141,2_doc=0.198172,3_rectify=0.005236,4_decide=3.365908,5_match=2.642703,6_warp=0.062715) src=6.jpg
-2026-01-09 16:08:14 [INFO] Processing sources from form B: 6 images
-2026-01-09 16:08:25 [INFO] [CASE] id=B_1_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=400 inlier_ratio=0.8213552361396304 time_total_s=10.862114 (1_degrade=0.861561,2_doc=0.201565,3_rectify=0.008207,4_decide=5.206346,5_match=3.612207,6_warp=0.084023) src=1.jpg
-2026-01-09 16:08:34 [INFO] [CASE] id=B_1_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=434 inlier_ratio=0.8460038986354775 time_total_s=9.617051 (1_degrade=1.241770,2_doc=0.225724,3_rectify=0.007067,4_decide=4.356303,5_match=2.900620,6_warp=0.073188) src=1.jpg
-2026-01-09 16:08:43 [INFO] [CASE] id=B_1_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=424 inlier_ratio=0.8548387096774194 time_total_s=8.520076 (1_degrade=0.874236,2_doc=0.256351,3_rectify=0.006776,4_decide=3.682270,5_match=2.759341,6_warp=0.072369) src=1.jpg
-2026-01-09 16:08:53 [INFO] [CASE] id=B_2_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=385 inlier_ratio=0.8037578288100209 time_total_s=9.641250 (1_degrade=1.206476,2_doc=0.181607,3_rectify=0.006974,4_decide=5.051229,5_match=2.308792,6_warp=0.077772) src=2.jpg
-2026-01-09 16:09:01 [INFO] [CASE] id=B_2_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=346 inlier_ratio=0.7671840354767184 time_total_s=8.150928 (1_degrade=0.632550,2_doc=0.197654,3_rectify=0.005412,4_decide=4.096790,5_match=2.297070,6_warp=0.067033) src=2.jpg
-2026-01-09 16:09:10 [INFO] [CASE] id=B_2_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=421 inlier_ratio=0.8143133462282398 time_total_s=9.624545 (1_degrade=0.661720,2_doc=0.217184,3_rectify=0.011392,4_decide=5.601595,5_match=2.259060,6_warp=0.064560) src=2.jpg
-2026-01-09 16:09:21 [INFO] [CASE] id=B_3_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=442 inlier_ratio=0.884 time_total_s=10.728227 (1_degrade=0.795103,2_doc=0.216816,3_rectify=0.008784,4_decide=4.945372,5_match=3.522903,6_warp=0.065641) src=3.jpg
-2026-01-09 16:09:36 [INFO] [CASE] id=B_3_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=378 inlier_ratio=0.8181818181818182 time_total_s=15.292944 (1_degrade=1.441955,2_doc=0.239001,3_rectify=0.018074,4_decide=8.370245,5_match=3.948101,6_warp=0.079901) src=3.jpg
-2026-01-09 16:09:48 [INFO] [CASE] id=B_3_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=432 inlier_ratio=0.8520710059171598 time_total_s=11.730382 (1_degrade=0.961445,2_doc=0.230294,3_rectify=0.015680,4_decide=5.139115,5_match=3.911394,6_warp=0.079981) src=3.jpg
-2026-01-09 16:09:59 [INFO] [CASE] id=B_4_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=409 inlier_ratio=0.8035363457760314 time_total_s=10.521500 (1_degrade=1.015220,2_doc=0.235693,3_rectify=0.012487,4_decide=5.518411,5_match=2.806883,6_warp=0.068274) src=4.jpg
-2026-01-09 16:10:09 [INFO] [CASE] id=B_4_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=449 inlier_ratio=0.8193430656934306 time_total_s=10.248287 (1_degrade=1.096500,2_doc=0.225162,3_rectify=0.006489,4_decide=4.067342,5_match=3.658879,6_warp=0.077998) src=4.jpg
-2026-01-09 16:10:21 [INFO] [CASE] id=B_4_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=441 inlier_ratio=0.8497109826589595 time_total_s=12.192304 (1_degrade=1.005787,2_doc=0.422555,3_rectify=0.012216,4_decide=5.669661,5_match=3.891904,6_warp=0.072089) src=4.jpg
-2026-01-09 16:10:35 [INFO] [CASE] id=B_5_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=399 inlier_ratio=0.8159509202453987 time_total_s=13.506214 (1_degrade=1.074713,2_doc=0.198829,3_rectify=0.007238,4_decide=8.253437,5_match=2.872316,6_warp=0.085494) src=5.jpg
-2026-01-09 16:10:45 [INFO] [CASE] id=B_5_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=414 inlier_ratio=0.8414634146341463 time_total_s=9.669562 (1_degrade=0.668151,2_doc=0.202609,3_rectify=0.011130,4_decide=4.752412,5_match=3.069528,6_warp=0.071763) src=5.jpg
-2026-01-09 16:10:54 [INFO] [CASE] id=B_5_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=441 inlier_ratio=0.8352272727272727 time_total_s=9.152086 (1_degrade=1.155995,2_doc=0.190793,3_rectify=0.007436,4_decide=4.470785,5_match=2.467446,6_warp=0.067295) src=5.jpg
-2026-01-09 16:11:02 [INFO] [CASE] id=B_6_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=433 inlier_ratio=0.8506876227897839 time_total_s=7.711663 (1_degrade=1.150286,2_doc=0.189248,3_rectify=0.005122,4_decide=3.300185,5_match=2.222658,6_warp=0.077843) src=6.jpg
-2026-01-09 16:11:11 [INFO] [CASE] id=B_6_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=424 inlier_ratio=0.8653061224489796 time_total_s=9.215888 (1_degrade=1.289683,2_doc=0.185753,3_rectify=0.009467,4_decide=4.423019,5_match=2.426658,6_warp=0.064929) src=6.jpg
-2026-01-09 16:11:19 [INFO] [CASE] id=B_6_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=440 inlier_ratio=0.8380952380952381 time_total_s=8.091832 (1_degrade=0.868428,2_doc=0.191084,3_rectify=0.008374,4_decide=3.900027,5_match=2.261668,6_warp=0.060194) src=6.jpg
-2026-01-09 16:11:19 [INFO] Processing sources from form C: 6 images
-2026-01-09 16:11:41 [INFO] [CASE] id=C_1_deg00 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=22.517248 (1_degrade=0.640800,2_doc=0.194700,3_rectify=0.007018,4_decide=21.605501,5_match=0.000000,6_warp=0.000000) src=1.jpg
-2026-01-09 16:12:04 [INFO] [CASE] id=C_1_deg01 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=22.228014 (1_degrade=1.180370,2_doc=0.185648,3_rectify=0.006267,4_decide=20.795317,5_match=0.000000,6_warp=0.000000) src=1.jpg
-2026-01-09 16:12:31 [INFO] [CASE] id=C_1_deg02 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=27.412431 (1_degrade=0.649160,2_doc=0.181850,3_rectify=0.008156,4_decide=26.517158,5_match=0.000000,6_warp=0.000000) src=1.jpg
-2026-01-09 16:12:52 [INFO] [CASE] id=C_2_deg00 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=20.498819 (1_degrade=0.772880,2_doc=0.311234,3_rectify=0.008878,4_decide=19.337475,5_match=0.000000,6_warp=0.000000) src=2.jpg
-2026-01-09 16:13:20 [INFO] [CASE] id=C_2_deg01 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=27.958443 (1_degrade=0.844837,2_doc=0.214822,3_rectify=0.008355,4_decide=26.823204,5_match=0.000000,6_warp=0.000000) src=2.jpg
-2026-01-09 16:13:49 [INFO] [CASE] id=C_2_deg02 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=29.447931 (1_degrade=0.924007,2_doc=0.259442,3_rectify=0.007543,4_decide=28.178948,5_match=0.000000,6_warp=0.000000) src=2.jpg
-2026-01-09 16:14:13 [INFO] [CASE] id=C_3_deg00 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=23.690559 (1_degrade=0.798023,2_doc=0.212169,3_rectify=0.005778,4_decide=22.603485,5_match=0.000000,6_warp=0.000000) src=3.jpg
-2026-01-09 16:14:34 [INFO] [CASE] id=C_3_deg01 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=21.475524 (1_degrade=0.848803,2_doc=0.216737,3_rectify=0.008866,4_decide=20.325670,5_match=0.000000,6_warp=0.000000) src=3.jpg
-2026-01-09 16:14:57 [INFO] [CASE] id=C_3_deg02 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=22.915213 (1_degrade=1.026038,2_doc=0.178535,3_rectify=0.006388,4_decide=21.627499,5_match=0.000000,6_warp=0.000000) src=3.jpg
-2026-01-09 16:15:23 [INFO] [CASE] id=C_4_deg00 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=25.754620 (1_degrade=1.253441,2_doc=0.178383,3_rectify=0.007748,4_decide=24.239457,5_match=0.000000,6_warp=0.000000) src=4.jpg
-2026-01-09 16:15:42 [INFO] [CASE] id=C_4_deg01 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=18.893456 (1_degrade=1.374123,2_doc=0.182325,3_rectify=0.007957,4_decide=17.270174,5_match=0.000000,6_warp=0.000000) src=4.jpg
-2026-01-09 16:16:04 [INFO] [CASE] id=C_4_deg02 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=21.603347 (1_degrade=1.231521,2_doc=0.179676,3_rectify=0.011497,4_decide=20.109088,5_match=0.000000,6_warp=0.000000) src=4.jpg
-2026-01-09 16:16:35 [INFO] [CASE] id=C_5_deg00 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=30.959326 (1_degrade=1.134842,2_doc=0.182646,3_rectify=0.008339,4_decide=29.562545,5_match=0.000000,6_warp=0.000000) src=5.jpg
-2026-01-09 16:16:58 [INFO] [CASE] id=C_5_deg01 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=23.737897 (1_degrade=1.192998,2_doc=0.192397,3_rectify=0.007813,4_decide=22.271215,5_match=0.000000,6_warp=0.000000) src=5.jpg
-2026-01-09 16:17:20 [INFO] [CASE] id=C_5_deg02 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=21.816833 (1_degrade=1.065435,2_doc=0.181825,3_rectify=0.011356,4_decide=20.483950,5_match=0.000000,6_warp=0.000000) src=5.jpg
-2026-01-09 16:17:41 [INFO] [CASE] id=C_6_deg00 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=21.244059 (1_degrade=0.761170,2_doc=0.183751,3_rectify=0.007306,4_decide=20.229725,5_match=0.000000,6_warp=0.000000) src=6.jpg
-2026-01-09 16:18:02 [INFO] [CASE] id=C_6_deg01 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=20.235875 (1_degrade=1.112827,2_doc=0.186000,3_rectify=0.005788,4_decide=18.862045,5_match=0.000000,6_warp=0.000000) src=6.jpg
-2026-01-09 16:18:26 [INFO] [CASE] id=C_6_deg02 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=24.738176 (1_degrade=0.672516,2_doc=0.179357,3_rectify=0.009500,4_decide=23.803982,5_match=0.000000,6_warp=0.000000) src=6.jpg
-2026-01-09 16:18:26 [INFO] ======================================================================
-2026-01-09 16:18:26 [INFO] [SUMMARY] total=54 ok_expected=51 (94.4%) ok_warp=33 (61.1%)
-2026-01-09 16:18:26 [INFO] [SUMMARY] elapsed avg per case: 15.103s
-2026-01-09 16:18:26 [INFO] [SUMMARY] stage counts:
-2026-01-09 16:18:26 [INFO]   done                 : 33
-2026-01-09 16:18:26 [INFO]   form_unknown         : 21
-2026-01-09 16:18:26 [INFO] [SUMMARY] stage time totals (s):
-2026-01-09 16:18:26 [INFO]   degrade_s    : 53.27
-2026-01-09 16:18:26 [INFO]   docaligner_s : 11.47
-2026-01-09 16:18:26 [INFO]   rectify_s    : 0.48
-2026-01-09 16:18:26 [INFO]   decide_s     : 616.74
-2026-01-09 16:18:26 [INFO]   match_s      : 97.31
-2026-01-09 16:18:26 [INFO]   warp_s       : 2.43
-2026-01-09 16:18:26 [INFO] ======================================================================
-2026-01-09 16:18:26 [INFO] [STATS] overall
-2026-01-09 16:18:26 [INFO]   total_cases                       : 54
-2026-01-09 16:18:26 [INFO]   ok_warp(done_aligned_generated)    : 33 (61.1%)
-2026-01-09 16:18:26 [INFO]   ok_expected_behavior(user_KPI)     : 51 (94.4%)
-2026-01-09 16:18:26 [INFO]   run_elapsed_total_seconds          : 815.583
-2026-01-09 16:18:26 [INFO]   avg_elapsed_per_case_seconds       : 15.103
-2026-01-09 16:18:26 [INFO] [STATS] A form
-2026-01-09 16:18:26 [INFO]   cases                             : 18
-2026-01-09 16:18:26 [INFO]   form_accuracy                      : 15 (83.3%)
-2026-01-09 16:18:26 [INFO]   template_accuracy                  : 15 (83.3%)
-2026-01-09 16:18:26 [INFO] [STATS] B form
-2026-01-09 16:18:26 [INFO]   cases                             : 18
-2026-01-09 16:18:26 [INFO]   form_accuracy                      : 18 (100.0%)
-2026-01-09 16:18:26 [INFO]   template_accuracy                  : 18 (100.0%)
-2026-01-09 16:18:26 [INFO] [STATS] C form (should be rejected)
-2026-01-09 16:18:26 [INFO]   cases                             : 18
-2026-01-09 16:18:26 [INFO]   reject_success(stage=form_unknown) : 18 (100.0%)
-2026-01-09 16:18:26 [INFO]   false_positive_as_A                : 0 (0.0%)
-2026-01-09 16:18:26 [INFO]   false_positive_as_B                : 0 (0.0%)
-2026-01-09 16:18:26 [INFO] [STATS] stage time totals (s) (same as SUMMARY)
-2026-01-09 16:18:26 [INFO]   degrade_s    : 53.27
-2026-01-09 16:18:26 [INFO]   docaligner_s : 11.47
-2026-01-09 16:18:26 [INFO]   rectify_s    : 0.48
-2026-01-09 16:18:26 [INFO]   decide_s     : 616.74
-2026-01-09 16:18:26 [INFO]   match_s      : 97.31
-2026-01-09 16:18:26 [INFO]   warp_s       : 2.43
-2026-01-09 16:18:26 [INFO] [STATS] stage time mean per case (s)
-2026-01-09 16:18:26 [INFO]   degrade_s    : 0.987
-2026-01-09 16:18:26 [INFO]   docaligner_s : 0.212
-2026-01-09 16:18:26 [INFO]   rectify_s    : 0.009
-2026-01-09 16:18:26 [INFO]   decide_s     : 11.421
-2026-01-09 16:18:26 [INFO]   match_s      : 1.802
-2026-01-09 16:18:26 [INFO]   warp_s       : 0.045
-2026-01-09 16:18:26 [INFO] [STATS] per-case total time (s)
-2026-01-09 16:18:26 [INFO]   mean  : 15.074
-2026-01-09 16:18:26 [INFO]   median: 11.076
-2026-01-09 16:18:26 [INFO] [DONE] outputs: C:\Users\takumi\develop\APA\output_pipeline\run_20260109_160444
-2026-01-09 16:18:26 [INFO] [DONE] elapsed: 815.6s
+2026-01-09 23:48:23 [INFO] ======================================================================
+2026-01-09 23:48:23 [INFO] paper_pipeline_v5
+2026-01-09 23:48:23 [INFO] ======================================================================
+2026-01-09 23:48:23 [INFO] OpenCV: 4.12.0
+2026-01-09 23:48:23 [INFO] torch : 2.9.1
+2026-01-09 23:48:23 [INFO] src-forms: A,B,C
+2026-01-09 23:48:23 [INFO] [INFO] Loading DocAligner...
+2026-01-09 23:48:24 [INFO] [OK] DocAligner loaded
+2026-01-09 23:48:24 [INFO] [INFO] Loading XFeat...
+2026-01-09 23:48:25 [INFO] [OK] XFeat loaded
+2026-01-09 23:48:25 [INFO] [OK] WeChat QR detector initialized: /Users/takumi0616/Develop/docker_miniconda/src/APA/models/wechat_qrcode
+2026-01-09 23:48:25 [INFO] [OK] CachedXFeatMatcher enabled
+2026-01-09 23:48:28 [INFO] [OK] template cache built: A=6 B=6
+2026-01-09 23:48:28 [INFO] Processing sources from form A: 6 images
+2026-01-09 23:48:34 [INFO] [CASE] id=A_1_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=406 inlier_ratio=0.8565400843881856 time_total_s=6.284276 (1_degrade=0.889399,2_doc=0.227452,3_rectify=0.003898,4_decide=2.645834,5_match=1.779136,6_warp=0.056866) src=1.jpg
+2026-01-09 23:48:41 [INFO] [CASE] id=A_1_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=342 inlier_ratio=0.8028169014084507 time_total_s=7.544152 (1_degrade=0.534313,2_doc=0.204387,3_rectify=0.004353,4_decide=4.449697,5_match=1.645474,6_warp=0.044285) src=1.jpg
+2026-01-09 23:48:47 [INFO] [CASE] id=A_1_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=366 inlier_ratio=0.782051282051282 time_total_s=5.770230 (1_degrade=0.448313,2_doc=0.232418,3_rectify=0.004554,4_decide=2.701782,5_match=1.685302,6_warp=0.039374) src=1.jpg
+2026-01-09 23:48:55 [INFO] [CASE] id=A_1_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=376 inlier_ratio=0.8209606986899564 time_total_s=8.151120 (1_degrade=0.468967,2_doc=0.214929,3_rectify=0.006308,4_decide=4.995091,5_match=1.754503,6_warp=0.041217) src=1.jpg
+2026-01-09 23:49:00 [INFO] [CASE] id=A_1_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=350 inlier_ratio=0.8413461538461539 time_total_s=5.038710 (1_degrade=0.433093,2_doc=0.220028,3_rectify=0.002633,4_decide=2.293864,5_match=1.420940,6_warp=0.040586) src=1.jpg
+2026-01-09 23:49:06 [INFO] [CASE] id=A_1_deg05 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=385 inlier_ratio=0.8406113537117904 time_total_s=5.308457 (1_degrade=0.427109,2_doc=0.209183,3_rectify=0.003031,4_decide=2.159183,5_match=1.794599,6_warp=0.041516) src=1.jpg
+2026-01-09 23:49:21 [WARNING] [CASE] id=A_1_deg06 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=15.382156 (1_degrade=0.728305,2_doc=0.208963,3_rectify=0.002741,4_decide=14.384997,5_match=0.000000,6_warp=0.000000) src=1.jpg
+2026-01-09 23:49:27 [INFO] [CASE] id=A_1_deg07 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=396 inlier_ratio=0.825 time_total_s=6.167934 (1_degrade=0.790181,2_doc=0.214400,3_rectify=0.005367,4_decide=2.819274,5_match=1.667879,6_warp=0.043457) src=1.jpg
+2026-01-09 23:49:35 [INFO] [CASE] id=A_1_deg08 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=408 inlier_ratio=0.8553459119496856 time_total_s=8.037797 (1_degrade=0.477987,2_doc=0.217368,3_rectify=0.003510,4_decide=5.160668,5_match=1.501648,6_warp=0.039310) src=1.jpg
+2026-01-09 23:49:42 [INFO] [CASE] id=A_1_deg09 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=418 inlier_ratio=0.8495934959349594 time_total_s=6.980571 (1_degrade=0.513346,2_doc=0.213332,3_rectify=0.004058,4_decide=3.959564,5_match=1.606056,6_warp=0.040977) src=1.jpg
+2026-01-09 23:49:50 [INFO] [CASE] id=A_2_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=392 inlier_ratio=0.8200836820083682 time_total_s=8.238274 (1_degrade=0.753995,2_doc=0.201619,3_rectify=0.006344,4_decide=4.999681,5_match=1.515664,6_warp=0.047026) src=2.jpg
+2026-01-09 23:49:59 [INFO] [CASE] id=A_2_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=392 inlier_ratio=0.8235294117647058 time_total_s=8.746948 (1_degrade=0.496571,2_doc=0.222409,3_rectify=0.002946,4_decide=5.883397,5_match=1.465306,6_warp=0.040455) src=2.jpg
+2026-01-09 23:50:05 [INFO] [CASE] id=A_2_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=428 inlier_ratio=0.852589641434263 time_total_s=5.275836 (1_degrade=0.446954,2_doc=0.211343,3_rectify=0.003566,4_decide=2.409651,5_match=1.530058,6_warp=0.038308) src=2.jpg
+2026-01-09 23:50:26 [WARNING] [CASE] id=A_2_deg03 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=21.663970 (1_degrade=0.793870,2_doc=0.193427,3_rectify=0.008430,4_decide=20.615947,5_match=0.000000,6_warp=0.000000) src=2.jpg
+2026-01-09 23:50:36 [INFO] [CASE] id=A_2_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=374 inlier_ratio=0.8292682926829268 time_total_s=9.842950 (1_degrade=0.398778,2_doc=0.193383,3_rectify=0.003111,4_decide=7.118614,5_match=1.465448,6_warp=0.039034) src=2.jpg
+2026-01-09 23:50:43 [INFO] [CASE] id=A_2_deg05 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=402 inlier_ratio=0.8481012658227848 time_total_s=6.587606 (1_degrade=0.405273,2_doc=0.190591,3_rectify=0.003171,4_decide=3.826288,5_match=1.485296,6_warp=0.039920) src=2.jpg
+2026-01-09 23:50:48 [INFO] [CASE] id=A_2_deg06 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=449 inlier_ratio=0.8701550387596899 time_total_s=5.404569 (1_degrade=0.437039,2_doc=0.224641,3_rectify=0.005409,4_decide=2.069201,5_match=1.946508,6_warp=0.041627) src=2.jpg
+2026-01-09 23:51:08 [WARNING] [CASE] id=A_2_deg07 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=19.517903 (1_degrade=0.440581,2_doc=0.213580,3_rectify=0.003103,4_decide=18.803095,5_match=0.000000,6_warp=0.000000) src=2.jpg
+2026-01-09 23:51:25 [WARNING] [CASE] id=A_2_deg08 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=17.561364 (1_degrade=0.570431,2_doc=0.216425,3_rectify=0.004445,4_decide=16.724193,5_match=0.000000,6_warp=0.000000) src=2.jpg
+2026-01-09 23:51:35 [INFO] [CASE] id=A_2_deg09 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=370 inlier_ratio=0.8240534521158129 time_total_s=9.905485 (1_degrade=0.556310,2_doc=0.476107,3_rectify=0.006700,4_decide=5.495908,5_match=2.109644,6_warp=0.183758) src=2.jpg
+2026-01-09 23:51:41 [INFO] [CASE] id=A_3_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=411 inlier_ratio=0.8353658536585366 time_total_s=6.205740 (1_degrade=1.171055,2_doc=0.246036,3_rectify=0.003587,4_decide=2.461280,5_match=1.580975,6_warp=0.050866) src=3.jpg
+2026-01-09 23:51:48 [INFO] [CASE] id=A_3_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=376 inlier_ratio=0.8191721132897604 time_total_s=6.268386 (1_degrade=0.758391,2_doc=0.206999,3_rectify=0.003574,4_decide=2.689977,5_match=1.766773,6_warp=0.052739) src=3.jpg
+2026-01-09 23:51:54 [INFO] [CASE] id=A_3_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=414 inlier_ratio=0.8329979879275654 time_total_s=6.154179 (1_degrade=0.817487,2_doc=0.245346,3_rectify=0.005080,4_decide=2.446983,5_match=1.881255,6_warp=0.048764) src=3.jpg
+2026-01-09 23:52:00 [INFO] [CASE] id=A_3_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=373 inlier_ratio=0.8091106290672451 time_total_s=6.114297 (1_degrade=0.775859,2_doc=0.213082,3_rectify=0.005081,4_decide=2.692944,5_match=1.665087,6_warp=0.056703) src=3.jpg
+2026-01-09 23:52:06 [INFO] [CASE] id=A_3_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=367 inlier_ratio=0.8155555555555556 time_total_s=6.413102 (1_degrade=0.778529,2_doc=0.224762,3_rectify=0.003726,4_decide=2.869786,5_match=1.699271,6_warp=0.054968) src=3.jpg
+2026-01-09 23:52:13 [INFO] [CASE] id=A_3_deg05 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=412 inlier_ratio=0.8391038696537678 time_total_s=6.706457 (1_degrade=0.901171,2_doc=0.267074,3_rectify=0.007214,4_decide=2.942201,5_match=1.762470,6_warp=0.053876) src=3.jpg
+2026-01-09 23:52:19 [INFO] [CASE] id=A_3_deg06 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=467 inlier_ratio=0.892925430210325 time_total_s=6.464806 (1_degrade=0.697187,2_doc=0.270254,3_rectify=0.007329,4_decide=3.338136,5_match=1.437677,6_warp=0.035574) src=3.jpg
+2026-01-09 23:52:25 [INFO] [CASE] id=A_3_deg07 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=393 inlier_ratio=0.8524945770065075 time_total_s=5.429760 (1_degrade=0.744715,2_doc=0.146937,3_rectify=0.002486,4_decide=2.434494,5_match=1.428818,6_warp=0.042231) src=3.jpg
+2026-01-09 23:52:30 [INFO] [CASE] id=A_3_deg08 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=449 inlier_ratio=0.8330241187384044 time_total_s=4.885239 (1_degrade=0.407242,2_doc=0.159937,3_rectify=0.002309,4_decide=1.835856,5_match=1.754796,6_warp=0.042971) src=3.jpg
+2026-01-09 23:52:35 [INFO] [CASE] id=A_3_deg09 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=362 inlier_ratio=0.8341013824884793 time_total_s=5.729570 (1_degrade=0.728739,2_doc=0.146259,3_rectify=0.005746,4_decide=2.671290,5_match=1.530647,6_warp=0.045469) src=3.jpg
+2026-01-09 23:52:41 [INFO] [CASE] id=A_4_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=383 inlier_ratio=0.8148936170212766 time_total_s=6.002816 (1_degrade=0.781232,2_doc=0.154978,3_rectify=0.003580,4_decide=3.017246,5_match=1.401452,6_warp=0.042336) src=4.jpg
+2026-01-09 23:52:47 [INFO] [CASE] id=A_4_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=464 inlier_ratio=0.8315412186379928 time_total_s=5.169062 (1_degrade=0.482380,2_doc=0.203495,3_rectify=0.002915,4_decide=2.299712,5_match=1.526638,6_warp=0.038614) src=4.jpg
+2026-01-09 23:52:51 [INFO] [CASE] id=A_4_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=433 inlier_ratio=0.854043392504931 time_total_s=4.714182 (1_degrade=0.379940,2_doc=0.146868,3_rectify=0.002450,4_decide=1.831905,5_match=1.692942,6_warp=0.040745) src=4.jpg
+2026-01-09 23:52:57 [INFO] [CASE] id=A_4_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=448 inlier_ratio=0.835820895522388 time_total_s=5.227467 (1_degrade=0.678973,2_doc=0.168681,3_rectify=0.003881,4_decide=1.958247,5_match=1.613453,6_warp=0.056480) src=4.jpg
+2026-01-09 23:53:02 [INFO] [CASE] id=A_4_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=414 inlier_ratio=0.8313253012048193 time_total_s=5.270014 (1_degrade=0.853500,2_doc=0.211805,3_rectify=0.004538,4_decide=1.886348,5_match=1.660875,6_warp=0.044122) src=4.jpg
+2026-01-09 23:53:07 [INFO] [CASE] id=A_4_deg05 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=391 inlier_ratio=0.8248945147679325 time_total_s=5.404465 (1_degrade=0.478104,2_doc=0.202775,3_rectify=0.005426,4_decide=2.519890,5_match=1.523006,6_warp=0.039817) src=4.jpg
+2026-01-09 23:53:14 [INFO] [CASE] id=A_4_deg06 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=405 inlier_ratio=0.8455114822546973 time_total_s=6.568875 (1_degrade=0.407902,2_doc=0.157291,3_rectify=0.004131,4_decide=3.506543,5_match=1.626812,6_warp=0.045895) src=4.jpg
+2026-01-09 23:53:20 [INFO] [CASE] id=A_4_deg07 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=369 inlier_ratio=0.76875 time_total_s=5.874200 (1_degrade=0.538451,2_doc=0.181217,3_rectify=0.002958,4_decide=2.584021,5_match=1.724638,6_warp=0.045859) src=4.jpg
+2026-01-09 23:53:27 [INFO] [CASE] id=A_4_deg08 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=420 inlier_ratio=0.825147347740668 time_total_s=6.942428 (1_degrade=1.029864,2_doc=0.210165,3_rectify=0.005683,4_decide=3.271656,5_match=1.604250,6_warp=0.057855) src=4.jpg
+2026-01-09 23:53:36 [INFO] [CASE] id=A_4_deg09 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=391 inlier_ratio=0.8231578947368421 time_total_s=9.339191 (1_degrade=0.570822,2_doc=0.207863,3_rectify=0.007469,4_decide=5.129347,5_match=2.364143,6_warp=0.047178) src=4.jpg
+2026-01-09 23:53:45 [INFO] [CASE] id=A_5_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=385 inlier_ratio=0.8020833333333334 time_total_s=9.034546 (1_degrade=0.594293,2_doc=0.211659,3_rectify=0.004949,4_decide=5.805766,5_match=1.644181,6_warp=0.053930) src=5.jpg
+2026-01-09 23:53:52 [INFO] [CASE] id=A_5_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=435 inlier_ratio=0.8301526717557252 time_total_s=6.940459 (1_degrade=0.570705,2_doc=0.208923,3_rectify=0.003492,4_decide=3.748022,5_match=1.594125,6_warp=0.047837) src=5.jpg
+2026-01-09 23:53:59 [INFO] [CASE] id=A_5_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=366 inlier_ratio=0.7904967602591793 time_total_s=6.751414 (1_degrade=0.547861,2_doc=0.201002,3_rectify=0.004354,4_decide=3.518651,5_match=1.680478,6_warp=0.047057) src=5.jpg
+2026-01-09 23:54:10 [WARNING] [CASE] id=A_5_deg03 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=10.972229 (1_degrade=0.854664,2_doc=0.165891,3_rectify=0.003614,4_decide=9.889496,5_match=0.000000,6_warp=0.000000) src=5.jpg
+2026-01-09 23:54:16 [INFO] [CASE] id=A_5_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=391 inlier_ratio=0.8128898128898129 time_total_s=6.216258 (1_degrade=0.379340,2_doc=0.155179,3_rectify=0.004159,4_decide=3.349955,5_match=1.662189,6_warp=0.037774) src=5.jpg
+2026-01-09 23:54:33 [WARNING] [CASE] id=A_5_deg05 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=16.992127 (1_degrade=0.759670,2_doc=0.168529,3_rectify=0.005542,4_decide=16.001120,5_match=0.000000,6_warp=0.000000) src=5.jpg
+2026-01-09 23:54:38 [INFO] [CASE] id=A_5_deg06 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=419 inlier_ratio=0.8135922330097087 time_total_s=4.811307 (1_degrade=0.351249,2_doc=0.143991,3_rectify=0.002638,4_decide=2.272805,5_match=1.421318,6_warp=0.040045) src=5.jpg
+2026-01-09 23:54:43 [INFO] [CASE] id=A_5_deg07 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=414 inlier_ratio=0.828 time_total_s=5.680579 (1_degrade=0.708681,2_doc=0.209712,3_rectify=0.002297,4_decide=2.838757,5_match=1.320948,6_warp=0.042314) src=5.jpg
+2026-01-09 23:54:49 [INFO] [CASE] id=A_5_deg08 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=425 inlier_ratio=0.8333333333333334 time_total_s=5.225524 (1_degrade=0.370999,2_doc=0.145821,3_rectify=0.002275,4_decide=2.517339,5_match=1.543653,6_warp=0.041603) src=5.jpg
+2026-01-09 23:54:54 [INFO] [CASE] id=A_5_deg09 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=371 inlier_ratio=0.7910447761194029 time_total_s=5.309772 (1_degrade=0.386440,2_doc=0.146894,3_rectify=0.003727,4_decide=2.891794,5_match=1.305239,6_warp=0.035260) src=5.jpg
+2026-01-09 23:54:59 [INFO] [CASE] id=A_6_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=437 inlier_ratio=0.8501945525291829 time_total_s=4.876392 (1_degrade=0.356258,2_doc=0.144633,3_rectify=0.004369,4_decide=2.235283,5_match=1.494447,6_warp=0.038642) src=6.jpg
+2026-01-09 23:55:04 [INFO] [CASE] id=A_6_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=394 inlier_ratio=0.7864271457085829 time_total_s=5.181651 (1_degrade=0.763248,2_doc=0.144394,3_rectify=0.003313,4_decide=2.082114,5_match=1.554003,6_warp=0.040707) src=6.jpg
+2026-01-09 23:55:09 [INFO] [CASE] id=A_6_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=392 inlier_ratio=0.835820895522388 time_total_s=5.156316 (1_degrade=0.393334,2_doc=0.181032,3_rectify=0.002945,4_decide=2.272053,5_match=1.588103,6_warp=0.044503) src=6.jpg
+2026-01-09 23:55:15 [INFO] [CASE] id=A_6_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=408 inlier_ratio=0.8192771084337349 time_total_s=5.785887 (1_degrade=0.424540,2_doc=0.156343,3_rectify=0.003513,4_decide=2.855718,5_match=1.612040,6_warp=0.042639) src=6.jpg
+2026-01-09 23:55:21 [INFO] [CASE] id=A_6_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=432 inlier_ratio=0.8197343453510436 time_total_s=6.271364 (1_degrade=0.732196,2_doc=0.147700,3_rectify=0.002584,4_decide=2.832491,5_match=1.824597,6_warp=0.052721) src=6.jpg
+2026-01-09 23:55:28 [INFO] [CASE] id=A_6_deg05 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=454 inlier_ratio=0.8664122137404581 time_total_s=6.564278 (1_degrade=0.619654,2_doc=0.165320,3_rectify=0.003402,4_decide=3.015462,5_match=1.891247,6_warp=0.049277) src=6.jpg
+2026-01-09 23:55:33 [INFO] [CASE] id=A_6_deg06 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=414 inlier_ratio=0.8296593186372746 time_total_s=5.501878 (1_degrade=0.564955,2_doc=0.252196,3_rectify=0.003536,4_decide=2.605904,5_match=1.420607,6_warp=0.036903) src=6.jpg
+2026-01-09 23:55:38 [INFO] [CASE] id=A_6_deg07 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=395 inlier_ratio=0.8681318681318682 time_total_s=5.009806 (1_degrade=0.410356,2_doc=0.150929,3_rectify=0.003250,4_decide=2.419639,5_match=1.370902,6_warp=0.038130) src=6.jpg
+2026-01-09 23:55:44 [INFO] [CASE] id=A_6_deg08 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=424 inlier_ratio=0.8379446640316206 time_total_s=5.628016 (1_degrade=0.391335,2_doc=0.157642,3_rectify=0.002473,4_decide=2.500507,5_match=1.762390,6_warp=0.050317) src=6.jpg
+2026-01-09 23:55:49 [INFO] [CASE] id=A_6_deg09 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=433 inlier_ratio=0.8407766990291262 time_total_s=5.337686 (1_degrade=0.561715,2_doc=0.265976,3_rectify=0.002704,4_decide=2.209839,5_match=1.568602,6_warp=0.043430) src=6.jpg
+2026-01-09 23:55:49 [INFO] Processing sources from form B: 6 images
+2026-01-09 23:55:56 [INFO] [CASE] id=B_1_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=402 inlier_ratio=0.8410041841004184 time_total_s=6.864106 (1_degrade=0.521080,2_doc=0.254776,3_rectify=0.009644,4_decide=4.019689,5_match=1.448830,6_warp=0.038016) src=1.jpg
+2026-01-09 23:56:02 [INFO] [CASE] id=B_1_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=421 inlier_ratio=0.8271119842829077 time_total_s=6.065617 (1_degrade=0.708457,2_doc=0.150485,3_rectify=0.002995,4_decide=2.906990,5_match=1.638482,6_warp=0.050343) src=1.jpg
+2026-01-09 23:56:09 [INFO] [CASE] id=B_1_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=430 inlier_ratio=0.86 time_total_s=6.966139 (1_degrade=0.484516,2_doc=0.412606,3_rectify=0.003345,4_decide=3.877480,5_match=1.605097,6_warp=0.039778) src=1.jpg
+2026-01-09 23:56:17 [INFO] [CASE] id=B_1_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=428 inlier_ratio=0.8492063492063492 time_total_s=8.002840 (1_degrade=0.832091,2_doc=0.158487,3_rectify=0.003299,4_decide=4.941113,5_match=1.495704,6_warp=0.045445) src=1.jpg
+2026-01-09 23:56:27 [INFO] [CASE] id=B_1_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=403 inlier_ratio=0.8174442190669371 time_total_s=9.264908 (1_degrade=0.850716,2_doc=0.235381,3_rectify=0.003296,4_decide=5.955513,5_match=1.649607,6_warp=0.045159) src=1.jpg
+2026-01-09 23:56:33 [INFO] [CASE] id=B_1_deg05 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=416 inlier_ratio=0.8125 time_total_s=6.153691 (1_degrade=0.798658,2_doc=0.226079,3_rectify=0.004432,4_decide=3.158903,5_match=1.414935,6_warp=0.044578) src=1.jpg
+2026-01-09 23:56:40 [INFO] [CASE] id=B_1_deg06 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=389 inlier_ratio=0.7987679671457906 time_total_s=7.189594 (1_degrade=0.440153,2_doc=0.170427,3_rectify=0.006496,4_decide=4.491362,5_match=1.537074,6_warp=0.035260) src=1.jpg
+2026-01-09 23:56:46 [INFO] [CASE] id=B_1_deg07 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=418 inlier_ratio=0.8277227722772277 time_total_s=6.167674 (1_degrade=0.378589,2_doc=0.163397,3_rectify=0.002380,4_decide=3.756326,5_match=1.321955,6_warp=0.033056) src=1.jpg
+2026-01-09 23:56:52 [INFO] [CASE] id=B_1_deg08 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=380 inlier_ratio=0.8033826638477801 time_total_s=6.309805 (1_degrade=0.449202,2_doc=0.163024,3_rectify=0.005053,4_decide=3.874436,5_match=1.302196,6_warp=0.034794) src=1.jpg
+2026-01-09 23:56:59 [INFO] [CASE] id=B_1_deg09 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=390 inlier_ratio=0.8057851239669421 time_total_s=6.249625 (1_degrade=0.672208,2_doc=0.139743,3_rectify=0.003682,4_decide=3.609552,5_match=1.294950,6_warp=0.037599) src=1.jpg
+2026-01-09 23:57:04 [INFO] [CASE] id=B_2_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=375 inlier_ratio=0.7606490872210954 time_total_s=5.752221 (1_degrade=0.714301,2_doc=0.142611,3_rectify=0.002599,4_decide=3.253163,5_match=1.134292,6_warp=0.040150) src=2.jpg
+2026-01-09 23:57:09 [INFO] [CASE] id=B_2_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=357 inlier_ratio=0.7744034707158352 time_total_s=5.061516 (1_degrade=0.359547,2_doc=0.143383,3_rectify=0.002437,4_decide=2.940469,5_match=1.132351,6_warp=0.034588) src=2.jpg
+2026-01-09 23:57:15 [INFO] [CASE] id=B_2_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=412 inlier_ratio=0.8031189083820662 time_total_s=5.836388 (1_degrade=0.367029,2_doc=0.147261,3_rectify=0.003540,4_decide=3.553063,5_match=1.194221,6_warp=0.036328) src=2.jpg
+2026-01-09 23:57:23 [INFO] [CASE] id=B_2_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=426 inlier_ratio=0.8052930056710775 time_total_s=7.902137 (1_degrade=0.721400,2_doc=0.148142,3_rectify=0.003145,4_decide=5.043401,5_match=1.422343,6_warp=0.040237) src=2.jpg
+2026-01-09 23:57:30 [INFO] [CASE] id=B_2_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=372 inlier_ratio=0.7766179540709812 time_total_s=6.990614 (1_degrade=0.459678,2_doc=0.160767,3_rectify=0.002119,4_decide=4.613414,5_match=1.245353,6_warp=0.034645) src=2.jpg
+2026-01-09 23:57:36 [INFO] [CASE] id=B_2_deg05 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=429 inlier_ratio=0.8297872340425532 time_total_s=6.128935 (1_degrade=0.436435,2_doc=0.163613,3_rectify=0.004083,4_decide=3.713357,5_match=1.268409,6_warp=0.037548) src=2.jpg
+2026-01-09 23:57:43 [INFO] [CASE] id=B_2_deg06 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=456 inlier_ratio=0.8366972477064221 time_total_s=6.636105 (1_degrade=0.702711,2_doc=0.147018,3_rectify=0.002986,4_decide=3.887654,5_match=1.353142,6_warp=0.042298) src=2.jpg
+2026-01-09 23:57:49 [INFO] [CASE] id=B_2_deg07 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=414 inlier_ratio=0.7976878612716763 time_total_s=5.676467 (1_degrade=0.422980,2_doc=0.153224,3_rectify=0.004246,4_decide=3.138522,5_match=1.426105,6_warp=0.034317) src=2.jpg
+2026-01-09 23:57:57 [INFO] [CASE] id=B_2_deg08 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=413 inlier_ratio=0.812992125984252 time_total_s=8.820729 (1_degrade=0.401561,2_doc=0.158925,3_rectify=0.002422,4_decide=6.611693,5_match=1.136089,6_warp=0.035527) src=2.jpg
+2026-01-09 23:58:08 [INFO] [CASE] id=B_2_deg09 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=372 inlier_ratio=0.7607361963190185 time_total_s=10.104099 (1_degrade=0.675238,2_doc=0.144414,3_rectify=0.004382,4_decide=6.992155,5_match=1.697643,6_warp=0.045499) src=2.jpg
+2026-01-09 23:58:13 [INFO] [CASE] id=B_3_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=438 inlier_ratio=0.8690476190476191 time_total_s=5.648416 (1_degrade=0.383503,2_doc=0.148691,3_rectify=0.002962,4_decide=3.231626,5_match=1.364014,6_warp=0.036407) src=3.jpg
+2026-01-09 23:58:23 [INFO] [CASE] id=B_3_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=373 inlier_ratio=0.8233995584988962 time_total_s=9.622711 (1_degrade=0.732627,2_doc=0.146668,3_rectify=0.005858,4_decide=6.454154,5_match=1.678589,6_warp=0.045544) src=3.jpg
+2026-01-09 23:58:29 [INFO] [CASE] id=B_3_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=431 inlier_ratio=0.841796875 time_total_s=6.244521 (1_degrade=0.424835,2_doc=0.158886,3_rectify=0.004555,4_decide=3.595860,5_match=1.494712,6_warp=0.037496) src=3.jpg
+2026-01-09 23:58:36 [INFO] [CASE] id=B_3_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=428 inlier_ratio=0.8408644400785854 time_total_s=6.682489 (1_degrade=0.767377,2_doc=0.157859,3_rectify=0.004899,4_decide=3.606652,5_match=1.539725,6_warp=0.049695) src=3.jpg
+2026-01-09 23:58:42 [INFO] [CASE] id=B_3_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=383 inlier_ratio=0.8080168776371308 time_total_s=6.569542 (1_degrade=0.430557,2_doc=0.169003,3_rectify=0.004696,4_decide=3.521191,5_match=1.797893,6_warp=0.042306) src=3.jpg
+2026-01-09 23:58:51 [INFO] [CASE] id=B_3_deg05 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=442 inlier_ratio=0.8532818532818532 time_total_s=8.276079 (1_degrade=0.886793,2_doc=0.187475,3_rectify=0.003671,4_decide=5.076435,5_match=1.506885,6_warp=0.048128) src=3.jpg
+2026-01-09 23:58:59 [WARNING] [CASE] id=B_3_deg06 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form=B pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=8.790695 (1_degrade=0.513463,2_doc=0.168308,3_rectify=0.003033,4_decide=8.056172,5_match=0.000000,6_warp=0.000000) src=3.jpg
+2026-01-09 23:59:09 [INFO] [CASE] id=B_3_deg07 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=447 inlier_ratio=0.8514285714285714 time_total_s=9.012847 (1_degrade=0.893825,2_doc=0.255258,3_rectify=0.003034,4_decide=5.882220,5_match=1.424519,6_warp=0.045276) src=3.jpg
+2026-01-09 23:59:15 [INFO] [CASE] id=B_3_deg08 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=446 inlier_ratio=0.8336448598130841 time_total_s=6.716923 (1_degrade=0.481119,2_doc=0.160931,3_rectify=0.002789,4_decide=3.868315,5_match=1.571784,6_warp=0.037649) src=3.jpg
+2026-01-09 23:59:23 [INFO] [CASE] id=B_3_deg09 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=408 inlier_ratio=0.8111332007952287 time_total_s=7.940584 (1_degrade=0.444283,2_doc=0.163878,3_rectify=0.002440,4_decide=5.559461,5_match=1.245721,6_warp=0.035707) src=3.jpg
+2026-01-09 23:59:30 [INFO] [CASE] id=B_4_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=414 inlier_ratio=0.8101761252446184 time_total_s=6.971991 (1_degrade=0.436652,2_doc=0.156902,3_rectify=0.004090,4_decide=4.246357,5_match=1.558536,6_warp=0.037405) src=4.jpg
+2026-01-09 23:59:37 [INFO] [CASE] id=B_4_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=438 inlier_ratio=0.8021978021978022 time_total_s=6.612538 (1_degrade=0.525978,2_doc=0.179887,3_rectify=0.002551,4_decide=3.776679,5_match=1.549188,6_warp=0.037259) src=4.jpg
+2026-01-09 23:59:44 [INFO] [CASE] id=B_4_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=456 inlier_ratio=0.8507462686567164 time_total_s=6.806101 (1_degrade=0.482607,2_doc=0.215131,3_rectify=0.003682,4_decide=4.041787,5_match=1.486298,6_warp=0.037742) src=4.jpg
+2026-01-09 23:59:50 [INFO] [CASE] id=B_4_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=481 inlier_ratio=0.8394415357766143 time_total_s=6.612361 (1_degrade=0.710434,2_doc=0.166219,3_rectify=0.002151,4_decide=3.119442,5_match=1.902900,6_warp=0.055842) src=4.jpg
+2026-01-09 23:59:56 [INFO] [CASE] id=B_4_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=422 inlier_ratio=0.7977315689981096 time_total_s=5.457446 (1_degrade=0.547526,2_doc=0.199217,3_rectify=0.002253,4_decide=2.677835,5_match=1.484032,6_warp=0.036250) src=4.jpg
+2026-01-10 00:00:04 [INFO] [CASE] id=B_4_deg05 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=372 inlier_ratio=0.779874213836478 time_total_s=8.623410 (1_degrade=0.402282,2_doc=0.157225,3_rectify=0.002622,4_decide=6.104302,5_match=1.424422,6_warp=0.037523) src=4.jpg
+2026-01-10 00:00:11 [INFO] [CASE] id=B_4_deg06 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=353 inlier_ratio=0.7724288840262582 time_total_s=6.538700 (1_degrade=0.746111,2_doc=0.151540,3_rectify=0.004259,4_decide=3.398090,5_match=1.664226,6_warp=0.043930) src=4.jpg
+2026-01-10 00:00:19 [INFO] [CASE] id=B_4_deg07 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=420 inlier_ratio=0.8300395256916996 time_total_s=8.339660 (1_degrade=0.408704,2_doc=0.155974,3_rectify=0.005553,4_decide=5.974543,5_match=1.259597,6_warp=0.033965) src=4.jpg
+2026-01-10 00:00:25 [INFO] [CASE] id=B_4_deg08 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=430 inlier_ratio=0.819047619047619 time_total_s=5.419253 (1_degrade=0.409270,2_doc=0.182062,3_rectify=0.002526,4_decide=3.011882,5_match=1.305433,6_warp=0.035245) src=4.jpg
+2026-01-10 00:00:32 [INFO] [CASE] id=B_4_deg09 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=437 inlier_ratio=0.8122676579925651 time_total_s=7.453450 (1_degrade=0.680320,2_doc=0.142722,3_rectify=0.002886,4_decide=4.550140,5_match=1.497180,6_warp=0.043386) src=4.jpg
+2026-01-10 00:00:41 [INFO] [CASE] id=B_5_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=378 inlier_ratio=0.8129032258064516 time_total_s=9.078058 (1_degrade=0.633767,2_doc=0.138892,3_rectify=0.003283,4_decide=6.644022,5_match=1.133023,6_warp=0.044843) src=5.jpg
+2026-01-10 00:00:48 [INFO] [CASE] id=B_5_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=434 inlier_ratio=0.8628230616302187 time_total_s=6.358733 (1_degrade=0.376928,2_doc=0.158794,3_rectify=0.004920,4_decide=4.144449,5_match=1.126429,6_warp=0.033664) src=5.jpg
+2026-01-10 00:00:55 [INFO] [CASE] id=B_5_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=445 inlier_ratio=0.8460076045627376 time_total_s=7.010664 (1_degrade=0.487817,2_doc=0.155404,3_rectify=0.002931,4_decide=3.585372,5_match=2.102904,6_warp=0.043084) src=5.jpg
+2026-01-10 00:01:05 [INFO] [CASE] id=B_5_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=447 inlier_ratio=0.8324022346368715 time_total_s=10.724242 (1_degrade=0.469959,2_doc=0.185799,3_rectify=0.004731,4_decide=7.819156,5_match=1.667771,6_warp=0.038902) src=5.jpg
+2026-01-10 00:01:16 [INFO] [CASE] id=B_5_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=421 inlier_ratio=0.8522267206477733 time_total_s=10.794747 (1_degrade=0.766252,2_doc=0.145693,3_rectify=0.002966,4_decide=7.877048,5_match=1.418779,6_warp=0.046290) src=5.jpg
+2026-01-10 00:01:24 [INFO] [CASE] id=B_5_deg05 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=411 inlier_ratio=0.8269617706237424 time_total_s=7.720400 (1_degrade=0.454664,2_doc=0.175249,3_rectify=0.002770,4_decide=3.592636,5_match=2.659435,6_warp=0.057778) src=5.jpg
+2026-01-10 00:01:35 [INFO] [CASE] id=B_5_deg06 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=411 inlier_ratio=0.8286290322580645 time_total_s=11.228914 (1_degrade=0.595264,2_doc=0.241379,3_rectify=0.005601,4_decide=7.691913,5_match=1.398083,6_warp=0.119323) src=5.jpg
+2026-01-10 00:01:46 [INFO] [CASE] id=B_5_deg07 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=415 inlier_ratio=0.8201581027667985 time_total_s=10.674621 (1_degrade=1.958654,2_doc=0.325598,3_rectify=0.004657,4_decide=5.077638,5_match=2.477912,6_warp=0.059699) src=5.jpg
+2026-01-10 00:01:56 [INFO] [CASE] id=B_5_deg08 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=408 inlier_ratio=0.8143712574850299 time_total_s=9.973697 (1_degrade=1.223260,2_doc=0.323108,3_rectify=0.009399,4_decide=5.747285,5_match=1.922898,6_warp=0.055943) src=5.jpg
+2026-01-10 00:02:06 [INFO] [CASE] id=B_5_deg09 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=423 inlier_ratio=0.8426294820717132 time_total_s=10.203744 (1_degrade=0.772921,2_doc=0.159866,3_rectify=0.002592,4_decide=7.219320,5_match=1.446997,6_warp=0.047193) src=5.jpg
+2026-01-10 00:02:13 [INFO] [CASE] id=B_6_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=435 inlier_ratio=0.8546168958742633 time_total_s=6.730177 (1_degrade=0.783443,2_doc=0.466405,3_rectify=0.002860,4_decide=3.109021,5_match=1.675803,6_warp=0.056124) src=6.jpg
+2026-01-10 00:02:22 [INFO] [CASE] id=B_6_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=431 inlier_ratio=0.8551587301587301 time_total_s=9.664055 (1_degrade=0.845986,2_doc=0.178026,3_rectify=0.003945,4_decide=5.313487,5_match=2.494284,6_warp=0.060776) src=6.jpg
+2026-01-10 00:02:30 [INFO] [CASE] id=B_6_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=473 inlier_ratio=0.8631386861313869 time_total_s=7.755583 (1_degrade=0.658969,2_doc=0.257258,3_rectify=0.005668,4_decide=4.231924,5_match=1.823373,6_warp=0.058323) src=6.jpg
+2026-01-10 00:02:37 [INFO] [CASE] id=B_6_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=444 inlier_ratio=0.8457142857142858 time_total_s=7.194935 (1_degrade=0.645186,2_doc=0.268864,3_rectify=0.003098,4_decide=3.890064,5_match=1.652807,6_warp=0.048978) src=6.jpg
+2026-01-10 00:02:47 [INFO] [CASE] id=B_6_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=427 inlier_ratio=0.8323586744639376 time_total_s=9.308771 (1_degrade=0.534942,2_doc=0.235404,3_rectify=0.005678,4_decide=6.208677,5_match=1.665147,6_warp=0.049990) src=6.jpg
+2026-01-10 00:02:54 [INFO] [CASE] id=B_6_deg05 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=435 inlier_ratio=0.8365384615384616 time_total_s=7.136190 (1_degrade=0.853374,2_doc=0.222234,3_rectify=0.003170,4_decide=3.552100,5_match=1.811155,6_warp=0.056422) src=6.jpg
+2026-01-10 00:02:59 [INFO] [CASE] id=B_6_deg06 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=439 inlier_ratio=0.8442307692307692 time_total_s=5.575163 (1_degrade=0.444857,2_doc=0.211020,3_rectify=0.005085,4_decide=3.066306,5_match=1.316476,6_warp=0.033468) src=6.jpg
+2026-01-10 00:03:08 [INFO] [CASE] id=B_6_deg07 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=438 inlier_ratio=0.85546875 time_total_s=8.401653 (1_degrade=0.377895,2_doc=0.139751,3_rectify=0.002534,4_decide=6.170390,5_match=1.174187,6_warp=0.038563) src=6.jpg
+2026-01-10 00:03:13 [INFO] [CASE] id=B_6_deg08 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=423 inlier_ratio=0.8426294820717132 time_total_s=5.726006 (1_degrade=0.384176,2_doc=0.147147,3_rectify=0.003748,4_decide=2.951178,5_match=1.627946,6_warp=0.039548) src=6.jpg
+2026-01-10 00:03:24 [INFO] [CASE] id=B_6_deg09 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=397 inlier_ratio=0.8357894736842105 time_total_s=10.712344 (1_degrade=0.479027,2_doc=0.213723,3_rectify=0.005248,4_decide=7.746392,5_match=1.608796,6_warp=0.042020) src=6.jpg
+2026-01-10 00:03:24 [INFO] Processing sources from form C: 6 images
+2026-01-10 00:03:40 [INFO] [CASE] id=C_1_deg00 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=15.922685 (1_degrade=0.469837,2_doc=0.167325,3_rectify=0.003606,4_decide=15.223553,5_match=0.000000,6_warp=0.000000) src=1.jpg
+2026-01-10 00:03:57 [INFO] [CASE] id=C_1_deg01 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=16.768373 (1_degrade=0.552518,2_doc=0.206299,3_rectify=0.002628,4_decide=15.934269,5_match=0.000000,6_warp=0.000000) src=1.jpg
+2026-01-10 00:04:16 [INFO] [CASE] id=C_1_deg02 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=18.983716 (1_degrade=0.377000,2_doc=0.156554,3_rectify=0.002919,4_decide=18.403012,5_match=0.000000,6_warp=0.000000) src=1.jpg
+2026-01-10 00:04:31 [INFO] [CASE] id=C_1_deg03 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=14.725516 (1_degrade=0.388030,2_doc=0.184789,3_rectify=0.004110,4_decide=14.092074,5_match=0.000000,6_warp=0.000000) src=1.jpg
+2026-01-10 00:04:44 [INFO] [CASE] id=C_1_deg04 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=13.903867 (1_degrade=0.633322,2_doc=0.142460,3_rectify=0.004042,4_decide=13.070870,5_match=0.000000,6_warp=0.000000) src=1.jpg
+2026-01-10 00:05:03 [INFO] [CASE] id=C_1_deg05 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=18.863116 (1_degrade=0.414782,2_doc=0.170779,3_rectify=0.002221,4_decide=18.225102,5_match=0.000000,6_warp=0.000000) src=1.jpg
+2026-01-10 00:05:19 [INFO] [CASE] id=C_1_deg06 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=15.996685 (1_degrade=0.546687,2_doc=0.198304,3_rectify=0.004558,4_decide=15.179869,5_match=0.000000,6_warp=0.000000) src=1.jpg
+2026-01-10 00:05:30 [INFO] [CASE] id=C_1_deg07 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=10.585430 (1_degrade=0.785699,2_doc=0.162604,3_rectify=0.004523,4_decide=9.570026,5_match=0.000000,6_warp=0.000000) src=1.jpg
+2026-01-10 00:05:44 [INFO] [CASE] id=C_1_deg08 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=14.539557 (1_degrade=0.426679,2_doc=0.202153,3_rectify=0.002372,4_decide=13.863708,5_match=0.000000,6_warp=0.000000) src=1.jpg
+2026-01-10 00:06:01 [INFO] [CASE] id=C_1_deg09 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=16.599034 (1_degrade=0.409501,2_doc=0.151295,3_rectify=0.002200,4_decide=15.986278,5_match=0.000000,6_warp=0.000000) src=1.jpg
+2026-01-10 00:06:15 [INFO] [CASE] id=C_2_deg00 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=14.187931 (1_degrade=0.363530,2_doc=0.143883,3_rectify=0.004000,4_decide=13.632606,5_match=0.000000,6_warp=0.000000) src=2.jpg
+2026-01-10 00:06:33 [INFO] [CASE] id=C_2_deg01 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=17.504057 (1_degrade=0.417982,2_doc=0.154020,3_rectify=0.004124,4_decide=16.875877,5_match=0.000000,6_warp=0.000000) src=2.jpg
+2026-01-10 00:06:50 [INFO] [CASE] id=C_2_deg02 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=16.911687 (1_degrade=0.407285,2_doc=0.155374,3_rectify=0.002490,4_decide=16.295573,5_match=0.000000,6_warp=0.000000) src=2.jpg
+2026-01-10 00:07:03 [INFO] [CASE] id=C_2_deg03 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=13.349479 (1_degrade=0.477103,2_doc=0.200697,3_rectify=0.003685,4_decide=12.615233,5_match=0.000000,6_warp=0.000000) src=2.jpg
+2026-01-10 00:07:14 [INFO] [CASE] id=C_2_deg04 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=10.901260 (1_degrade=0.368561,2_doc=0.148881,3_rectify=0.003957,4_decide=10.331466,5_match=0.000000,6_warp=0.000000) src=2.jpg
+2026-01-10 00:07:28 [INFO] [CASE] id=C_2_deg05 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=14.337721 (1_degrade=0.661872,2_doc=0.145204,3_rectify=0.002107,4_decide=13.476313,5_match=0.000000,6_warp=0.000000) src=2.jpg
+2026-01-10 00:07:40 [INFO] [CASE] id=C_2_deg06 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=11.462611 (1_degrade=0.398448,2_doc=0.158354,3_rectify=0.003082,4_decide=10.855133,5_match=0.000000,6_warp=0.000000) src=2.jpg
+2026-01-10 00:07:53 [INFO] [CASE] id=C_2_deg07 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=13.651077 (1_degrade=0.354912,2_doc=0.142565,3_rectify=0.001912,4_decide=13.104762,5_match=0.000000,6_warp=0.000000) src=2.jpg
+2026-01-10 00:08:12 [INFO] [CASE] id=C_2_deg08 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=18.366098 (1_degrade=0.449066,2_doc=0.160415,3_rectify=0.002319,4_decide=17.702054,5_match=0.000000,6_warp=0.000000) src=2.jpg
+2026-01-10 00:08:27 [INFO] [CASE] id=C_2_deg09 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=15.138253 (1_degrade=0.404005,2_doc=0.152758,3_rectify=0.004225,4_decide=14.531644,5_match=0.000000,6_warp=0.000000) src=2.jpg
+2026-01-10 00:08:44 [INFO] [CASE] id=C_3_deg00 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=16.973519 (1_degrade=0.400304,2_doc=0.154926,3_rectify=0.002618,4_decide=16.362092,5_match=0.000000,6_warp=0.000000) src=3.jpg
+2026-01-10 00:09:00 [INFO] [CASE] id=C_3_deg01 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=15.667963 (1_degrade=0.431903,2_doc=0.157857,3_rectify=0.003629,4_decide=14.999832,5_match=0.000000,6_warp=0.000000) src=3.jpg
+2026-01-10 00:09:17 [INFO] [CASE] id=C_3_deg02 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=17.276407 (1_degrade=0.700354,2_doc=0.149992,3_rectify=0.002495,4_decide=16.365554,5_match=0.000000,6_warp=0.000000) src=3.jpg
+2026-01-10 00:09:27 [INFO] [CASE] id=C_3_deg03 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=9.665927 (1_degrade=0.445682,2_doc=0.206682,3_rectify=0.003504,4_decide=8.964658,5_match=0.000000,6_warp=0.000000) src=3.jpg
+2026-01-10 00:09:43 [INFO] [CASE] id=C_3_deg04 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=16.537930 (1_degrade=0.716753,2_doc=0.147848,3_rectify=0.004304,4_decide=15.622206,5_match=0.000000,6_warp=0.000000) src=3.jpg
+2026-01-10 00:10:03 [INFO] [CASE] id=C_3_deg05 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=20.122909 (1_degrade=0.621242,2_doc=0.148614,3_rectify=0.003243,4_decide=19.292262,5_match=0.000000,6_warp=0.000000) src=3.jpg
+2026-01-10 00:10:18 [INFO] [CASE] id=C_3_deg06 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=14.752915 (1_degrade=0.661874,2_doc=0.139069,3_rectify=0.003479,4_decide=13.897162,5_match=0.000000,6_warp=0.000000) src=3.jpg
+2026-01-10 00:10:31 [INFO] [CASE] id=C_3_deg07 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=13.215007 (1_degrade=0.383532,2_doc=0.148875,3_rectify=0.003822,4_decide=12.633187,5_match=0.000000,6_warp=0.000000) src=3.jpg
+2026-01-10 00:10:45 [INFO] [CASE] id=C_3_deg08 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=13.475675 (1_degrade=0.369534,2_doc=0.142073,3_rectify=0.003737,4_decide=12.917476,5_match=0.000000,6_warp=0.000000) src=3.jpg
+2026-01-10 00:11:05 [INFO] [CASE] id=C_3_deg09 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=20.637484 (1_degrade=0.625046,2_doc=0.143334,3_rectify=0.003327,4_decide=19.810540,5_match=0.000000,6_warp=0.000000) src=3.jpg
+2026-01-10 00:11:25 [INFO] [CASE] id=C_4_deg00 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=20.133417 (1_degrade=0.700196,2_doc=0.137835,3_rectify=0.002750,4_decide=19.239261,5_match=0.000000,6_warp=0.000000) src=4.jpg
+2026-01-10 00:11:42 [INFO] [CASE] id=C_4_deg01 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=16.074313 (1_degrade=0.725355,2_doc=0.187518,3_rectify=0.004005,4_decide=15.106115,5_match=0.000000,6_warp=0.000000) src=4.jpg
+2026-01-10 00:11:58 [INFO] [CASE] id=C_4_deg02 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=16.955830 (1_degrade=0.836879,2_doc=0.163017,3_rectify=0.005455,4_decide=15.894195,5_match=0.000000,6_warp=0.000000) src=4.jpg
+2026-01-10 00:12:18 [INFO] [CASE] id=C_4_deg03 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=19.366107 (1_degrade=0.394641,2_doc=0.153159,3_rectify=0.003058,4_decide=18.763356,5_match=0.000000,6_warp=0.000000) src=4.jpg
+2026-01-10 00:12:35 [INFO] [CASE] id=C_4_deg04 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=17.531587 (1_degrade=0.699472,2_doc=0.174459,3_rectify=0.002853,4_decide=16.600732,5_match=0.000000,6_warp=0.000000) src=4.jpg
+2026-01-10 00:12:49 [INFO] [CASE] id=C_4_deg05 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=13.697023 (1_degrade=0.353754,2_doc=0.144236,3_rectify=0.002541,4_decide=13.144203,5_match=0.000000,6_warp=0.000000) src=4.jpg
+2026-01-10 00:13:04 [INFO] [CASE] id=C_4_deg06 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=14.756477 (1_degrade=0.691976,2_doc=0.155766,3_rectify=0.003867,4_decide=13.856642,5_match=0.000000,6_warp=0.000000) src=4.jpg
+2026-01-10 00:13:20 [INFO] [CASE] id=C_4_deg07 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=15.707556 (1_degrade=0.884473,2_doc=0.176724,3_rectify=0.005049,4_decide=14.584151,5_match=0.000000,6_warp=0.000000) src=4.jpg
+2026-01-10 00:13:32 [INFO] [CASE] id=C_4_deg08 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=12.298414 (1_degrade=0.658157,2_doc=0.148450,3_rectify=0.004254,4_decide=11.436595,5_match=0.000000,6_warp=0.000000) src=4.jpg
+2026-01-10 00:13:46 [INFO] [CASE] id=C_4_deg09 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=14.519360 (1_degrade=0.399089,2_doc=0.148651,3_rectify=0.002130,4_decide=13.921107,5_match=0.000000,6_warp=0.000000) src=4.jpg
+2026-01-10 00:14:07 [INFO] [CASE] id=C_5_deg00 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=20.143097 (1_degrade=0.660829,2_doc=0.174104,3_rectify=0.003634,4_decide=19.244971,5_match=0.000000,6_warp=0.000000) src=5.jpg
+2026-01-10 00:14:21 [INFO] [CASE] id=C_5_deg01 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=14.351861 (1_degrade=0.651027,2_doc=0.136649,3_rectify=0.003914,4_decide=13.509688,5_match=0.000000,6_warp=0.000000) src=5.jpg
+2026-01-10 00:14:32 [INFO] [CASE] id=C_5_deg02 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=10.771747 (1_degrade=0.622453,2_doc=0.143400,3_rectify=0.004297,4_decide=9.949668,5_match=0.000000,6_warp=0.000000) src=5.jpg
+2026-01-10 00:14:47 [INFO] [CASE] id=C_5_deg03 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=15.657731 (1_degrade=0.352917,2_doc=0.136660,3_rectify=0.002563,4_decide=15.118243,5_match=0.000000,6_warp=0.000000) src=5.jpg
+2026-01-10 00:15:03 [INFO] [CASE] id=C_5_deg04 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=15.473072 (1_degrade=0.635567,2_doc=0.140122,3_rectify=0.004253,4_decide=14.648155,5_match=0.000000,6_warp=0.000000) src=5.jpg
+2026-01-10 00:15:20 [INFO] [CASE] id=C_5_deg05 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=17.000557 (1_degrade=0.388263,2_doc=0.142745,3_rectify=0.004437,4_decide=16.418831,5_match=0.000000,6_warp=0.000000) src=5.jpg
+2026-01-10 00:15:33 [INFO] [CASE] id=C_5_deg06 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=13.550074 (1_degrade=0.367380,2_doc=0.137602,3_rectify=0.002245,4_decide=13.003651,5_match=0.000000,6_warp=0.000000) src=5.jpg
+2026-01-10 00:15:51 [INFO] [CASE] id=C_5_deg07 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=17.793814 (1_degrade=0.359797,2_doc=0.144237,3_rectify=0.002869,4_decide=17.239377,5_match=0.000000,6_warp=0.000000) src=5.jpg
+2026-01-10 00:16:07 [INFO] [CASE] id=C_5_deg08 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=16.067337 (1_degrade=0.881169,2_doc=0.147099,3_rectify=0.004963,4_decide=14.976263,5_match=0.000000,6_warp=0.000000) src=5.jpg
+2026-01-10 00:16:22 [INFO] [CASE] id=C_5_deg09 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=14.314796 (1_degrade=0.347246,2_doc=0.136406,3_rectify=0.002003,4_decide=13.779810,5_match=0.000000,6_warp=0.000000) src=5.jpg
+2026-01-10 00:16:36 [INFO] [CASE] id=C_6_deg00 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=14.799197 (1_degrade=0.401492,2_doc=0.146308,3_rectify=0.002639,4_decide=14.208282,5_match=0.000000,6_warp=0.000000) src=6.jpg
+2026-01-10 00:16:50 [INFO] [CASE] id=C_6_deg01 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=13.666154 (1_degrade=0.520386,2_doc=0.155267,3_rectify=0.002065,4_decide=12.938668,5_match=0.000000,6_warp=0.000000) src=6.jpg
+2026-01-10 00:17:05 [INFO] [CASE] id=C_6_deg02 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=14.933679 (1_degrade=0.357198,2_doc=0.139634,3_rectify=0.006971,4_decide=14.383002,5_match=0.000000,6_warp=0.000000) src=6.jpg
+2026-01-10 00:17:19 [INFO] [CASE] id=C_6_deg03 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=14.408459 (1_degrade=0.340415,2_doc=0.141701,3_rectify=0.003679,4_decide=13.869501,5_match=0.000000,6_warp=0.000000) src=6.jpg
+2026-01-10 00:17:38 [INFO] [CASE] id=C_6_deg04 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=19.049179 (1_degrade=0.404711,2_doc=0.157458,3_rectify=0.006839,4_decide=18.430383,5_match=0.000000,6_warp=0.000000) src=6.jpg
+2026-01-10 00:17:52 [INFO] [CASE] id=C_6_deg05 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=13.223949 (1_degrade=0.423874,2_doc=0.160297,3_rectify=0.004314,4_decide=12.590637,5_match=0.000000,6_warp=0.000000) src=6.jpg
+2026-01-10 00:18:09 [INFO] [CASE] id=C_6_deg06 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=17.508153 (1_degrade=0.400617,2_doc=0.218853,3_rectify=0.003790,4_decide=16.832575,5_match=0.000000,6_warp=0.000000) src=6.jpg
+2026-01-10 00:18:23 [INFO] [CASE] id=C_6_deg07 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=13.415097 (1_degrade=0.449699,2_doc=0.149461,3_rectify=0.002300,4_decide=12.765637,5_match=0.000000,6_warp=0.000000) src=6.jpg
+2026-01-10 00:18:36 [INFO] [CASE] id=C_6_deg08 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=13.590698 (1_degrade=0.664913,2_doc=0.140815,3_rectify=0.002036,4_decide=12.734781,5_match=0.000000,6_warp=0.000000) src=6.jpg
+2026-01-10 00:18:52 [INFO] [CASE] id=C_6_deg09 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=15.941147 (1_degrade=0.419828,2_doc=0.141255,3_rectify=0.002306,4_decide=15.329343,5_match=0.000000,6_warp=0.000000) src=6.jpg
+2026-01-10 00:18:52 [INFO] ======================================================================
+2026-01-10 00:18:52 [INFO] [SUMMARY] total=180 ok_expected=173 (96.1%) ok_warp=113 (62.8%)
+2026-01-10 00:18:52 [INFO] [SUMMARY] elapsed avg per case: 10.137s
+2026-01-10 00:18:52 [INFO] [SUMMARY] stage counts:
+2026-01-10 00:18:52 [INFO]   done                 : 113
+2026-01-10 00:18:52 [INFO]   form_unknown         : 67
+2026-01-10 00:18:52 [INFO] [SUMMARY] stage time totals (s):
+2026-01-10 00:18:52 [INFO]   degrade_s    : 102.84
+2026-01-10 00:18:52 [INFO]   docaligner_s : 32.78
+2026-01-10 00:18:52 [INFO]   rectify_s    : 0.69
+2026-01-10 00:18:52 [INFO]   decide_s     : 1429.85
+2026-01-10 00:18:52 [INFO]   match_s      : 178.56
+2026-01-10 00:18:52 [INFO]   warp_s       : 5.14
+2026-01-10 00:18:52 [INFO] ======================================================================
+2026-01-10 00:18:52 [INFO] [STATS] overall
+2026-01-10 00:18:52 [INFO]   total_cases                       : 180
+2026-01-10 00:18:52 [INFO]   ok_warp(done_aligned_generated)    : 113 (62.8%)
+2026-01-10 00:18:52 [INFO]   ok_expected_behavior(user_KPI)     : 173 (96.1%)
+2026-01-10 00:18:52 [INFO]   run_elapsed_total_seconds          : 1824.657
+2026-01-10 00:18:52 [INFO]   avg_elapsed_per_case_seconds       : 10.137
+2026-01-10 00:18:52 [INFO] [STATS] A form
+2026-01-10 00:18:52 [INFO]   cases                             : 60
+2026-01-10 00:18:52 [INFO]   form_accuracy                      : 54 (90.0%)
+2026-01-10 00:18:52 [INFO]   template_accuracy                  : 54 (90.0%)
+2026-01-10 00:18:52 [INFO] [STATS] B form
+2026-01-10 00:18:52 [INFO]   cases                             : 60
+2026-01-10 00:18:52 [INFO]   form_accuracy                      : 59 (98.3%)
+2026-01-10 00:18:52 [INFO]   template_accuracy                  : 59 (98.3%)
+2026-01-10 00:18:52 [INFO] [STATS] C form (should be rejected)
+2026-01-10 00:18:52 [INFO]   cases                             : 60
+2026-01-10 00:18:52 [INFO]   reject_success(stage=form_unknown) : 60 (100.0%)
+2026-01-10 00:18:52 [INFO]   false_positive_as_A                : 0 (0.0%)
+2026-01-10 00:18:52 [INFO]   false_positive_as_B                : 0 (0.0%)
+2026-01-10 00:18:52 [INFO] [STATS] stage time totals (s) (same as SUMMARY)
+2026-01-10 00:18:52 [INFO]   degrade_s    : 102.84
+2026-01-10 00:18:52 [INFO]   docaligner_s : 32.78
+2026-01-10 00:18:52 [INFO]   rectify_s    : 0.69
+2026-01-10 00:18:52 [INFO]   decide_s     : 1429.85
+2026-01-10 00:18:52 [INFO]   match_s      : 178.56
+2026-01-10 00:18:52 [INFO]   warp_s       : 5.14
+2026-01-10 00:18:52 [INFO] [STATS] stage time mean per case (s)
+2026-01-10 00:18:52 [INFO]   degrade_s    : 0.571
+2026-01-10 00:18:52 [INFO]   docaligner_s : 0.182
+2026-01-10 00:18:52 [INFO]   rectify_s    : 0.004
+2026-01-10 00:18:52 [INFO]   decide_s     : 7.944
+2026-01-10 00:18:52 [INFO]   match_s      : 0.992
+2026-01-10 00:18:52 [INFO]   warp_s       : 0.029
+2026-01-10 00:18:52 [INFO] [STATS] per-case total time (s)
+2026-01-10 00:18:52 [INFO]   mean  : 10.132
+2026-01-10 00:18:52 [INFO]   median: 8.308
+2026-01-10 00:18:52 [INFO] [DONE] outputs: /Users/takumi0616/Develop/docker_miniconda/src/APA/output_pipeline/run_20260109_234823
+2026-01-10 00:18:52 [INFO] [DONE] elapsed: 1824.7s
+
 
 ```
 一番時間がかかっているところ、改善できそうなところ、逆にここはもう改善できない（必要時間）などいろいろな視点から考察してください
