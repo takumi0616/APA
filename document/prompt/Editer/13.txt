@@ -1,0 +1,68 @@
+# タスク（プロンプト）を行う前に必ず以下の資料を読んでください
+
+この資料は環境がどう構築されたかを記しておりコマンド実行などの際は必ず参考にしてください
+@/git_installation_guide.md
+@/miniconda_installation_guide.md
+
+タスクを行った際は、タスク成功後に、行ったことをマークダウン記法でまとめたものを@/APA\document\report の中にファイルを作成してください
+ファイル名のルール：番号_年月日_行ったことを日本語.md（例：1_20260106_環境構築）
+番号は@/APA\document\report の中を精査して確認してください
+これまでのreportも読み込んでからタスクを行ってください
+---
+# プロンプト
+
+@/APA\paper_pipeline_v6.py 
+上記のプログラムに以下の改善を行ってほしいです
+
+改善1
+```
+2-2. 精度を落とさずに効く改善（優先度高）
+改善A：WeChatQRDetector の “Lock による並列潰し” を解消（Bで激効き）
+あなたの実装は WeChatQRDetector.detect() で Lock を取っています。
+
+with self._lock:
+    res, points = self.detector.detectAndDecode(image_bgr)
+これ、回転スキャンが ThreadPoolExecutor で並列でも、WeChat検出部分は結局1本に直列化されます。
+ログ上、Bの decide が 5〜10秒台に伸びている主因の1つになっている可能性が高いです。
+
+精度は変えずに速度だけ上げる方針なら：
+
+**「detectorを1個 + lock」→「detectorをスレッド数ぶん用意してlock不要」**にする
+threading.local() で「各スレッドに1個」遅延生成
+あるいは queue.Queue で detector pool を作る
+WeChat はモデル読み込みが重いですが、初期化は起動時1回で済むので、回転スキャン中の直列化解消のメリットが大きいです。
+```
+
+改善2
+```
+3-1. 現状の無駄：ターゲット特徴をテンプレごとに再計算している
+CachedXFeatMatcher.match_with_cached_ref() の中で毎回これをやっています：
+
+tgt_small, s_tgt = resize_keep_aspect(tgt_bgr, self.match_max_side)
+out1 = self.xfeat.detectAndCompute(tgt_small, top_k=self.top_k)[0]
+つまり テンプレ6枚なら out1 を6回作る（しかも out1 はテンプレによらず同じ）。
+
+=> ここは 1 case あたりの match_s（平均1.49s）をかなり削れます。
+（体感：CPUなら 1.5s → 0.6〜0.9s くらいには落ちることが多いタイプの無駄です）
+
+具体的に何をするか（実装案）
+CachedXFeatMatcher に「ターゲット特徴を前計算するAPI」を追加
+ループ内は match_lighterglue(ref.out0, out1) と findHomography だけにする
+擬似コード：
+
+# 1回だけ
+tgt_small, s_tgt = resize_keep_aspect(chosen, match_max_side)
+out1 = xfeat.detectAndCompute(tgt_small, top_k=top_k)[0]
+out1["image_size"] = (tgt_small.shape[1], tgt_small.shape[0])
+invS_tgt = np.linalg.inv(scale_matrix(s_tgt))
+
+for ref in templates:   # 6枚
+    matches = xfeat.match_lighterglue(ref.out0, out1)
+    H_small = cv2.findHomography(...)
+    H_full  = invS_tgt @ H_small @ scale_matrix(ref.s_ref)
+これは**結果が変わらない（同じ out1 を使うだけ）**ので、精度は落ちません。
+```
+
+上記の改善を順番に確実に行ってください
+プログラムをすべて改善できたのちに実行して結果確認、エラーが出る場合は試行錯誤して適宜改善してください
+全ての改善が無事に終了したときに、レポートの作成を行ってください
