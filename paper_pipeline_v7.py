@@ -3,11 +3,11 @@
 """paper_pipeline_v7.py
 
 [windows]
-C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v7.py --degrade-n 3
+C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v7.py
 
 [mac]
 # リポジトリルートから実行する想定（`APA/` 配下のスクリプトを直接指定）
-.venv/bin/python paper_pipeline_v7.py --degrade-n 3
+.venv/bin/python paper_pipeline_v7.py
 
 目的
 ----
@@ -39,11 +39,9 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v7.py --degrade
    - `--polygon-margin-px > 0` の場合は固定pxマージンで上書き可能
 4) フォーム判定（回転探索）
    - 角度リストは仕様として `0..350` を `--rotation-step` 刻みで作成
-   - 実処理は高速化のため Coarse-to-Fine
-     - coarse: 0/45/90/.../315 の 8 方向で粗探索し、上位2角度を選ぶ
-       - この coarse 段階で QR が 1 度も見つからなければ「フォームBではない」と判断し、以降フォームBの探索は行わない
-     - fine  : 上位角度の近傍（±50度）だけ、上記の角度リスト内で細かく探索
-     - fine で何も見つからない場合は Unknown（no_detection）とする（救済処置は行わない）
+   - v7.2 改善: 3) で横長に統一されているため、回転探索は **2方向（0度/180度）** のみにする
+     - scan2: 0 と 180 のみを比較し、最上位角度を確定に使う
+     - scan2 で何も見つからない場合は Unknown（no_detection）とする（救済処置は行わない）
    - フォームA: 3点マーク（TL/TR/BL）が検出できる（`--marker-preproc` で前処理オプション）
    - フォームB: QRコードが検出できる
      - まず高速（軽量）検出で角度候補を絞り、最後に robust 検出で確定
@@ -130,7 +128,7 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
 
     # 改悪生成（degrade）
     "degrade": {
-        "n": 10,  # 1枚の入力から何枚の改悪画像を作るか
+        "n": 100,  # 1枚の入力から何枚の改悪画像を作るか
         "out_size_wh": [2400, 1800],  # 改悪画像の出力サイズ（幅, 高さ）
         "max_rot_deg": 180.0,  # 改悪生成の回転強度（>=180で0..360の一様回転モード）
         "min_abs_rot_deg": 0.0,  # 最小回転量（0なら小さな回転も許可）
@@ -158,8 +156,9 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
     "rotation_scan": {
         "step_deg": 10.0,  # 回転スキャンの角度刻み（0..350 をこの刻みで生成）
         "max_workers": 8,  # 回転スキャンの並列数（スレッド）
-        "coarse_angles_deg": [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0],  # 粗探索の角度（向きの当たりを付ける）
-        "fine_window_deg": 50.0,  # 粗探索の上位角度から±何度を細探索するか
+        # v7.2 改善: rectify 後は enforce_landscape で横長に統一されているため、
+        # 追加で見るべきは「上下反転（180度）」のみ。
+        "scan_angles_2_deg": [0.0, 180.0],
     },
 
     # DocAligner（紙領域検出）
@@ -234,8 +233,12 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
         },
         "wechat": {
             "fast": {
-                "scales": [1.0, 0.75, 0.5, 1.25, 1.5],  # WeChat fast のスケール
-                "up_scale_enable_max_side_px": 1600,  # 最大辺がこの値以上なら拡大は無効化
+                # v7.1 改善:
+                # - fast では縮小スケール（<1.0）をやめて 1.0 の1発にする
+                # - 小さい画像のときだけ up-scale を試す
+                "scales": [1.0],
+                "up_scales_small_image": [1.25, 1.5],
+                "up_scale_enable_max_side_px": 1600,  # 最大辺がこの値未満なら拡大も試す
             },
             "robust": {
                 "scales": [1.0, 0.75, 0.5, 0.25, 1.25, 1.5, 2.0],  # WeChat robust のスケール
@@ -1230,9 +1233,24 @@ def detect_qr_codes_wechat_multiscale(
     if mode == "fast":
         variants = [("bgr", image_bgr)]
         cfg = PIPELINE_DEFAULTS["qr"]["wechat"]["fast"]
-        scales = [float(s) for s in cfg["scales"]]
-        if max(h0, w0) >= int(cfg["up_scale_enable_max_side_px"]):
-            scales = [s for s in scales if s <= 1.0]
+
+        # v7.1 改善:
+        # WeChat は内部で入力を縮小してNNに入れるため、画像が大きいケースに対して
+        # 0.75 / 0.5 の試行は効果が薄い可能性が高い。
+        # そのため fast では 1.0 のみを基本とし、小さい画像のときだけ up-scale を追加する。
+        scales: list[float] = [float(s) for s in (cfg.get("scales") or [1.0])]
+        if max(h0, w0) < int(cfg.get("up_scale_enable_max_side_px", 0) or 0):
+            scales += [float(s) for s in (cfg.get("up_scales_small_image") or [])]
+
+        # 重複排除（順序維持）
+        seen: set[float] = set()
+        scales2: list[float] = []
+        for s in scales:
+            if s in seen:
+                continue
+            seen.add(s)
+            scales2.append(s)
+        scales = scales2
     else:
         variants = _preprocess_variants_for_qr(image_bgr)
         cfg = PIPELINE_DEFAULTS["qr"]["wechat"]["robust"]
@@ -1460,22 +1478,22 @@ def extract_form_unknown_reason(decision: Any) -> tuple[str, dict[str, Any]]:
         if k in detail:
             diag[k] = detail.get(k)
 
-    # no_detection のときは、coarse の最大スコアだけ抜粋する（全 detail は巨大になり得るため）
+    # no_detection のときは、探索段階の最大スコアだけ抜粋する（全 detail は巨大になり得るため）
     if reason == "no_detection":
         try:
-            coarse = detail.get("coarse") or []
+            scan = detail.get("scan") or detail.get("coarse") or []
             max_a = float("-inf")
             max_b = float("-inf")
-            for r in coarse:
+            for r in scan:
                 try:
                     max_a = max(max_a, float(((r.get("A") or {}).get("score") or 0.0)))
                     max_b = max(max_b, float(((r.get("B_fast") or {}).get("score") or 0.0)))
                 except Exception:
                     continue
             if max_a != float("-inf"):
-                diag["coarse_max_A_score"] = max_a
+                diag["scan_max_A_score"] = max_a
             if max_b != float("-inf"):
-                diag["coarse_max_B_fast_score"] = max_b
+                diag["scan_max_B_fast_score"] = max_b
         except Exception:
             pass
 
@@ -1808,14 +1826,17 @@ def decide_form_by_rotations(
     unknown_score_threshold: float = 0.0,
     unknown_margin: float = 0.0,
 ) -> FormDecision:
-    """Coarse-to-fine の回転スキャンで、最良の判定（A/B/Unknown）を返す。
+    """回転スキャンで、最良の判定（A/B/Unknown）を返す。
 
-    注意:
-    - まず 0/45/90/.../315 の 8 回で大まかな向き（縦横/上下逆）を推定し、
-      その近傍だけ細かく探索する（計算量削減）。
-    - フォームB（QR探索）は coarse 段階で一度も QR が見つからなければ「フォームBではない」と判断し、
-      以降はフォームB探索（B_fast / robust）を行わない（救済処置もしない）。
-    - A/B どちらもスコアが低い（閾値未満） or 近すぎる場合は Unknown 扱い。
+    v7.2 改善（ユーザー要望）:
+      - 3) で rectify 後に enforce_landscape しているため、縦横（90度回転）探索は不要
+      - 上下反転だけ確認すればよいので、2方向（0度/180度）のみを試す
+      - その中の **最上位角度** を用いてフォーム判定と角度確定を行う
+
+    方針:
+      - スキャン中はフォームBは fast 検出（WeChat fast or OpenCV fast）で軽量に評価
+      - フォームBが勝った場合のみ、同一角度で robust 検出を1回だけ試して確度を上げる（近傍探索はしない）
+      - A/B どちらもスコアが低い（閾値未満） or 近すぎる場合は Unknown 扱い
     """
 
     def _eval(angle: float, *, enable_formB: bool) -> dict[str, Any]:
@@ -1839,125 +1860,40 @@ def decide_form_by_rotations(
             "B_fast": {"ok": bool(okBf), "score": float(scoreBf), "detail": detBf},
         }
 
-    def _wrap_angle(a: float) -> float:
-        return float(a) % 360.0
-
-    def _circular_dist_deg(a: float, b: float) -> float:
-        d = abs((_wrap_angle(a) - _wrap_angle(b)) % 360.0)
-        return float(min(d, 360.0 - d))
-
-    def _pick_nearest_angles(base_angles: list[float], all_angles: list[float], k_per_base: int = 2) -> list[float]:
-        """fine候補が空になった場合の最小限の救済。
-
-        目的:
-          ユーザー要望により「全角度探索フォールバック」は廃止する。
-          ただし `angles` の刻みが粗すぎる等で fine_set が空になる可能性はあるため、
-          base_angles それぞれに対して近い角度だけを拾う。
-
-        - 各 base_angle について circular distance が近い順に最大 k_per_base 個
-        - 全体では base_angles の個数 * k_per_base 程度に抑える
-        """
-
-        if not base_angles or not all_angles:
-            return []
-
-        picked: list[float] = []
-        for ba in base_angles:
-            ranked = sorted(all_angles, key=lambda a: _circular_dist_deg(float(a), float(ba)))
-            for a in ranked[: max(1, int(k_per_base))]:
-                picked.append(float(a))
-
-        # 重複排除しつつ順序をある程度安定させる
-        out: list[float] = []
-        seen: set[float] = set()
-        for a in picked:
-            aa = float(a)
-            if aa in seen:
-                continue
-            seen.add(aa)
-            out.append(aa)
-        return out
-
     # ----------------------------------
-    # coarse: 8方向で粗探索（0/45/..../315）
+    # scan: 2方向のみ（0/180）
     # ----------------------------------
 
-    coarse = [float(a) for a in PIPELINE_DEFAULTS["rotation_scan"]["coarse_angles_deg"]]
-    coarse_results: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=min(max_workers, len(coarse))) as ex:
-        futures = [ex.submit(_eval, a, enable_formB=True) for a in coarse]
-        for fut in as_completed(futures):
-            r = fut.result()
-            if not r or r.get("skip"):
-                continue
-            coarse_results.append(r)
+    scan_angles = [float(a) for a in (PIPELINE_DEFAULTS.get("rotation_scan") or {}).get("scan_angles_2_deg", [])]
+    if not scan_angles:
+        scan_angles = [0.0, 180.0]
 
-    if not coarse_results:
-        return FormDecision(False, None, None, 0.0, {"reason": "coarse_all_skipped"})
-
-    # coarse 段階で QR が一度も見つからなければ「フォームBではない」
-    has_qr_in_coarse = any(bool((r.get("B_fast") or {}).get("ok")) for r in coarse_results)
-
-    # coarse 結果から上位2角度を選ぶ
-    # - フォームB候補が存在する場合: max(A_score, B_fast_score)
-    # - フォームB候補が存在しない場合: A_score のみ（B探索を打ち切るため）
-    coarse_sorted = sorted(
-        coarse_results,
-        key=lambda rr: (
-            max(float(rr["A"]["score"]), float(rr["B_fast"]["score"]))
-            if has_qr_in_coarse
-            else float(rr["A"]["score"])
-        ),
-        reverse=True,
-    )
-    coarse_top = coarse_sorted[:2]
-    base_angles = [float(r["angle"]) for r in coarse_top]
-
-    # ----------------------------------
-    # fine: coarse上位の近傍だけ探索
-    # ----------------------------------
-
-    window = float(PIPELINE_DEFAULTS["rotation_scan"]["fine_window_deg"])  # 取り逃し防止のため少し広め
-
-    # fine の角度候補は、ユーザー指定の角度リスト（0..350, step=N）に揃える。
-    # （355 のように新規生成はしない）
-    fine_set: set[float] = set()
-    for ba in base_angles:
-        for a in angles:
-            if _circular_dist_deg(a, ba) <= window:
-                fine_set.add(float(a))
-    fine = sorted(fine_set)
-    if not fine:
-        # NOTE:
-        # 以前はここで「全角度探索」にフォールバックしていたが、処理時間が大きく伸びるため廃止。
-        # 代わりに base_angles の近傍だけを最小限試す。
-        fine = _pick_nearest_angles(base_angles=base_angles, all_angles=angles, k_per_base=2)
-        if not fine:
-            return FormDecision(False, None, None, 0.0, {"reason": "no_detection", "coarse": coarse_results, "fine_angles": []})
-
+    scan_results: list[dict[str, Any]] = []
     bestA: Optional[FormDecision] = None
     bestB_fast: Optional[FormDecision] = None
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(_eval, a, enable_formB=has_qr_in_coarse) for a in fine]
+
+    with ThreadPoolExecutor(max_workers=min(int(max_workers), len(scan_angles))) as ex:
+        futures = [ex.submit(_eval, a, enable_formB=True) for a in scan_angles]
         for fut in as_completed(futures):
             r = fut.result()
             if not r or r.get("skip"):
                 continue
+            scan_results.append(r)
 
             angle = float(r["angle"])
-
-            if r["A"]["ok"]:
-                candA = FormDecision(True, "A", angle, float(r["A"]["score"]), {"A": r["A"]["detail"], "phase": "fine"})
+            if (r.get("A") or {}).get("ok"):
+                candA = FormDecision(True, "A", angle, float(r["A"]["score"]), {"A": r["A"]["detail"], "phase": "scan2"})
                 if bestA is None or candA.score > bestA.score:
                     bestA = candA
-
-            if r["B_fast"]["ok"]:
-                candB = FormDecision(True, "B", angle, float(r["B_fast"]["score"]), {"B_fast": r["B_fast"]["detail"], "phase": "fine"})
+            if (r.get("B_fast") or {}).get("ok"):
+                candB = FormDecision(True, "B", angle, float(r["B_fast"]["score"]), {"B_fast": r["B_fast"]["detail"], "phase": "scan2"})
                 if bestB_fast is None or candB.score > bestB_fast.score:
                     bestB_fast = candB
 
-    # fine で見つからない場合:
-    # - 救済処置は行わない（ユーザー要望）
+    if not scan_results:
+        return FormDecision(False, None, None, 0.0, {"reason": "scan_all_skipped", "scan_angles": scan_angles})
+
+    # 2方向で見つからない場合は Unknown（救済処置は行わない）
     if bestA is None and bestB_fast is None:
         return FormDecision(
             False,
@@ -1966,9 +1902,9 @@ def decide_form_by_rotations(
             0.0,
             {
                 "reason": "no_detection",
-                "coarse": coarse_results,
-                "fine_angles": fine,
-                "note": "formB_disabled_by_coarse" if not has_qr_in_coarse else "formB_enabled_but_no_detection",
+                "scan": scan_results,
+                "scan_angles": scan_angles,
+                "note": "scan2_only",
             },
         )
 
@@ -1995,36 +1931,41 @@ def decide_form_by_rotations(
     if bestB_fast is None:
         return FormDecision(False, None, None, float(top_score), {"reason": "no_detection", "note": "unexpected_b_fast_none"})
 
-    # B を robust 検出で絞り込み（bestB_fast とその近傍だけ）
-    step = float(angles[1] - angles[0]) if len(angles) >= 2 else 10.0
-    candidates = [bestB_fast.angle_deg]
-    if bestB_fast.angle_deg is not None:
-        candidates += [bestB_fast.angle_deg - step, bestB_fast.angle_deg + step]
+    # フォームB: 同一角度で robust を1回だけ試して確度を上げる（近傍探索はしない）
+    try:
+        aa = float(bestB_fast.angle_deg) % 360.0 if bestB_fast.angle_deg is not None else None
+    except Exception:
+        aa = None
 
-    bestB: Optional[FormDecision] = None
-    for a in candidates:
-        if a is None:
-            continue
-        # 0..360 に正規化
-        aa = float(a) % 360.0
-        rotated = rotate_image_bound(rectified_bgr, aa)
+    if aa is not None:
+        rotated = rotate_image_bound(rectified_bgr, float(aa))
         rotated, _ = enforce_landscape(rotated)
-        if rotated.shape[0] > rotated.shape[1]:
-            continue
-        okB, scoreB, detB = score_formB(rotated)
-        if not okB:
-            continue
-        cand = FormDecision(True, "B", float(aa), float(scoreB), {"B": detB, "B_fast": bestB_fast.detail.get("B_fast") if bestB_fast.detail else {}})
-        if bestB is None or cand.score > bestB.score:
-            bestB = cand
+        if rotated.shape[0] <= rotated.shape[1]:
+            okB, scoreB, detB = score_formB(rotated)
+            if okB:
+                return FormDecision(
+                    True,
+                    "B",
+                    float(aa),
+                    float(scoreB),
+                    {
+                        "B": detB,
+                        "B_fast": bestB_fast.detail.get("B_fast") if bestB_fast.detail else {},
+                        "phase": "scan2_robust_confirm",
+                    },
+                )
 
-    if bestB is not None:
-        return bestB
+    # robust で失敗した場合は fast 判定を採用（角度確定の優先）
+    if bestB_fast is not None:
+        if bestB_fast.detail is None:
+            bestB_fast.detail = {}
+        bestB_fast.detail.setdefault("note", "robust_failed_use_fast")
+        return bestB_fast
 
-    # 最後のフォールバック: A があるなら A、なければ失敗
+    # ここに来ることは基本ないが、安全のため
     if bestA is not None:
         return bestA
-    return FormDecision(False, None, None, 0.0, {"reason": "no_decision_final_fallback"})
+    return FormDecision(False, None, None, float(top_score), {"reason": "no_decision_final_fallback"})
 
 
 """（template-topn / グローバル特徴による事前絞り込み）

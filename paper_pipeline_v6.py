@@ -3,11 +3,11 @@
 """paper_pipeline_v6.py
 
 [windows]
-C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v6.py --degrade-n 3
+C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v6.py
 
 [mac]
 # リポジトリルートから実行する想定（`APA/` 配下のスクリプトを直接指定）
-.venv/bin/python paper_pipeline_v6.py --degrade-n 3
+.venv/bin/python paper_pipeline_v6.py
 
 目的
 ----
