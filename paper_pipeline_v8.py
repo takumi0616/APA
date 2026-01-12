@@ -42,9 +42,14 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v8.py
      - 0 と 180 を比較し、最上位角度を確定に使う
      - 0/180 で何も見つからない場合は Unknown（no_detection）とする（救済処置は行わない）
    - フォームA: 3点マーク（TL/TR/BL）が検出できる（`--marker-preproc` で前処理オプション）
+     - v8 では **フォームAスコアが十分高い場合**、速度のため **フォームB判定をスキップ**する
+       - 既定の閾値は `PIPELINE_DEFAULTS["formA_strong"]["score_threshold"]`（現状 4.0）
    - フォームB: QRコードが検出できる
-     - **WeChat QR エンジンのみ** を使用（OpenCV 標準 QRCodeDetector は使わない）
+     - **WeChat QR エンジンのみ** を使用（OpenCV 標準 `QRCodeDetector` は使わない）
      - `--wechat-model-dir` にモデルが必要（opencv-contrib 必須）
+     - v8 では WeChat-only でも v7 と同様に **fast → robust の2段階**で評価する
+       - scan中は fast（軽量）で角度候補を評価
+       - B が勝った場合のみ、同一角度で robust を **最大1回** 実行して確定
    - 判定不能/曖昧なら `stage=form_unknown`（Unknown）で終了
 5) XFeat matching によるテンプレ照合
    - テンプレは `APA/image/A` または `APA/image/B`（`1.jpg`〜`6.jpg`）
@@ -65,6 +70,14 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v8.py
 - `summary.json` / `summary.csv`
 - `run.log`           : 実行ログ（logging）
 
+※v8 ではデバッグ画像の保存量を `--save-images {all,fail,none}` で制御できる。
+
+- `all` : 従来通り、常に保存
+- `fail`: `stage!=done` のケースだけ保存（成功ケースは保存しない）
+- `none`: 一切保存しない（速度計測向け）
+
+ディレクトリ自体は作られるが、`fail/none` の場合は中身が空になることがある。
+
 注意
 ----
 - torch.hub 経由の XFeat 読み込みで git が必要になることがあるため、
@@ -72,6 +85,8 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v8.py
 - QR 検出は WeChat QR エンジン（`cv2.wechat_qrcode_WeChatQRCode`）のみ利用する。
   - WeChat を使うには opencv-contrib のビルドと、4つのモデルファイル
     （detect/sr の prototxt/caffemodel）が必要
+  - **src-forms に B を含む場合、WeChat が利用できないと起動時にエラー終了**する
+- JPEG 保存は可能なら python-turbojpeg（libjpeg-turbo）を優先する（失敗時は `cv2.imwrite` にフォールバック）
 - 日本語ラベル描画は Pillow を使用（OpenCV putText は日本語非対応のため）。
   - `APA_FONT_PATH` を設定すると任意フォントを優先可能
 
