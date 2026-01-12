@@ -168,6 +168,14 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
         "scan_angles_2_deg": [0.0, 180.0],
     },
 
+    # フォームAが「十分強い」場合の枝刈り（B判定をスキップ）
+    # NOTE:
+    # score_formA は概ね 0..(base_score~3 + pos_score*2~2) 程度なので、
+    # 4.0 前後を "ほぼ間違いなくA" の目安として使う。
+    "formA_strong": {
+        "score_threshold": 4.0,
+    },
+
     # DocAligner（紙領域検出）
     "docaligner": {
         "model": "fastvit_sa24",  # DocAlignerのモデル名
@@ -227,9 +235,19 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
     "qr": {
         "min_test_side_px": 120,  # QR検出で試す画像サイズの最小辺(px)
         "wechat": {
-            # 0/180 のみの回転探索なので「fastで絞る」戦略は不要。
-            # WeChat のみで 1 回の検出で判定する。
-            "scales": [1.0, 0.75, 0.5, 0.25, 1.25, 1.5, 2.0],  # WeChat で試すスケール
+            # v8 改善:
+            # フォーム判定は 0/180 のみだが、WeChat QR の探索（前処理×スケール）自体が重い。
+            # そのため v7 と同様に "fast→robust" の2段階を導入する。
+            "fast": {
+                # fast: 角度候補の絞り込み用（極力軽量）
+                "variants": ["bgr"],
+                "scales": [1.0],
+            },
+            "robust": {
+                # robust: 最終確定用（多少重くてもよいが、呼ぶのは最大1回）
+                "variants": ["bgr", "gray"],
+                "scales": [1.0, 0.5, 1.5],
+            },
             "up_scale_enable_max_side_px": 1800,  # 最大辺がこの値以上なら拡大は無効化
             "max_test_side_px": 6500,  # WeChat で試す画像の最大辺(px)
             "adaptive_morph_kernel": [5, 5],
@@ -1121,84 +1139,87 @@ def detect_qr_codes_wechat(
         return []
 
 
-def _preprocess_variants_for_qr(image_bgr: np.ndarray) -> list[tuple[str, np.ndarray]]:
+def _preprocess_variants_for_qr(image_bgr: np.ndarray, variant_names: list[str]) -> list[tuple[str, np.ndarray]]:
     """QR検出のための前処理バリエーションを作る。
 
-    WeChat QR detector は BGR 入力を受け付けるため、前処理を施した結果も BGR に戻して渡す。
-    低コントラストや照明変動のケースで検出率が上がることがある。
+    NOTE:
+      v8 の速度改善のため「必要なものだけ」生成する。
+      現状は bgr / gray をサポートし、将来拡張しやすい形にしている。
     """
 
     if image_bgr is None:
         return []
 
-    variants: list[tuple[str, np.ndarray]] = [("bgr", image_bgr)]
-    try:
-        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-        variants.append(("gray", cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)))
+    names = [str(x) for x in (variant_names or [])]
+    if not names:
+        names = ["bgr"]
 
-        # CLAHE
-        try:
-            clahe_cfg = PIPELINE_DEFAULTS["marker"]["clahe"]
-            clahe = cv2.createCLAHE(
-                clipLimit=float(clahe_cfg["clipLimit"]),
-                tileGridSize=tuple(int(x) for x in clahe_cfg["tileGridSize"]),
-            )
-            g2 = clahe.apply(gray)
-            variants.append(("clahe", cv2.cvtColor(g2, cv2.COLOR_GRAY2BGR)))
-        except Exception:
-            pass
+    out: list[tuple[str, np.ndarray]] = []
+    for name in names:
+        if name == "bgr":
+            out.append(("bgr", image_bgr))
+        elif name == "gray":
+            try:
+                gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+                out.append(("gray", cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)))
+            except Exception:
+                continue
+        else:
+            # 未対応は無視（設定ミスで落ちないようにする）
+            continue
 
-        # 自適応二値化 + モルフォロジー
-        try:
-            at = PIPELINE_DEFAULTS["marker"]["adaptive_threshold"]
-            kernel_xy = PIPELINE_DEFAULTS["qr"]["wechat"]["adaptive_morph_kernel"]
-            bw = cv2.adaptiveThreshold(
-                gray,
-                255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY,
-                int(at["block_size"]),
-                int(at["C"]),
-            )
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, tuple(int(x) for x in kernel_xy))
-            bw2 = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel)
-            bw2 = cv2.morphologyEx(bw2, cv2.MORPH_OPEN, kernel)
-            variants.append(("adaptive_morph", cv2.cvtColor(bw2, cv2.COLOR_GRAY2BGR)))
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-    return variants
+    # 重複排除（順序維持）
+    seen: set[str] = set()
+    out2: list[tuple[str, np.ndarray]] = []
+    for n, img in out:
+        if n in seen:
+            continue
+        seen.add(n)
+        out2.append((n, img))
+    return out2
 
 
 def detect_qr_codes_wechat_multiscale(
     image_bgr: np.ndarray,
     wechat: Optional[Any],
+    *,
+    mode: str = "robust",
 ) -> list[dict[str, Any]]:
     """WeChatエンジンによるQR検出（前処理 + マルチスケール）。
 
-    NOTE:
-      本パイプラインのフォーム判定は 0/180 のみのため、
-      "fastで候補を絞ってrobustで確定" の2段階は行わない。
-      WeChat のみで 1 回の検出を行い、スコア最大の候補を採用する。
+    v8 改善（ユーザー要望）:
+      - B判定を fast→robust の2段階にする
+      - robust は必要時のみ 1 回
+
+    mode:
+      - fast  : 角度候補絞り込み用（軽量）
+      - robust: 最終確定用
     """
 
     if wechat is None or image_bgr is None:
         return []
 
-    h0, w0 = image_bgr.shape[:2]
+    mode = str(mode or "robust")
+    cfg_all = PIPELINE_DEFAULTS.get("qr", {}).get("wechat", {})
+    cfg = cfg_all.get(mode, {}) if isinstance(cfg_all, dict) else {}
 
-    variants = _preprocess_variants_for_qr(image_bgr)
-    cfg = PIPELINE_DEFAULTS["qr"]["wechat"]
-    scales = [float(s) for s in cfg["scales"]]
-    if max(h0, w0) >= int(cfg["up_scale_enable_max_side_px"]):
-        scales = [s for s in scales if s <= 1.0]
+    variant_names = list(cfg.get("variants") or ["bgr"])
+    scales = [float(s) for s in (cfg.get("scales") or [1.0])]
+
+    h0, w0 = image_bgr.shape[:2]
+    up_enable_max = int(cfg_all.get("up_scale_enable_max_side_px", 0) or 0)
+    if up_enable_max > 0 and max(h0, w0) >= up_enable_max:
+        # 大きい画像は up-scale を無効化
+        scales = [s for s in scales if s <= 1.0 + 1e-9]
+
+    min_side = int(PIPELINE_DEFAULTS.get("qr", {}).get("min_test_side_px", 120))
+    max_side = int(cfg_all.get("max_test_side_px", 6500))
+
+    variants = _preprocess_variants_for_qr(image_bgr, variant_names)
 
     best: list[dict[str, Any]] = []
     best_score = float("-inf")
 
-    # WeChat detector は複数QRを返すことがあるため、後段でスコアリングする
     for prep_name, src in variants:
         h, w = src.shape[:2]
         for s in scales:
@@ -1207,9 +1228,9 @@ def detect_qr_codes_wechat_multiscale(
             else:
                 new_w = int(round(w * s))
                 new_h = int(round(h * s))
-                if new_w < int(PIPELINE_DEFAULTS["qr"]["min_test_side_px"]) or new_h < int(PIPELINE_DEFAULTS["qr"]["min_test_side_px"]):
+                if new_w < min_side or new_h < min_side:
                     continue
-                if new_w > int(PIPELINE_DEFAULTS["qr"]["wechat"]["max_test_side_px"]) or new_h > int(PIPELINE_DEFAULTS["qr"]["wechat"]["max_test_side_px"]):
+                if new_w > max_side or new_h > max_side:
                     continue
                 interp = cv2.INTER_CUBIC if s > 1.0 else cv2.INTER_AREA
                 test = cv2.resize(src, (new_w, new_h), interpolation=interp)
@@ -1234,9 +1255,11 @@ def detect_qr_codes_wechat_multiscale(
                 q["prep"] = prep_name
                 q["scale"] = float(s)
 
-            # 簡単なヒューリスティックで best を選ぶ:
-            # - QRの面積が大きいほど安定
-            # - 右上に寄っているほど望ましい
+            # fast は "見つけたら即返す"（軽量化）
+            if mode == "fast":
+                return qrs
+
+            # robust: best を選ぶ
             score = float("-inf")
             try:
                 score, _ = score_best_qr_candidate(test if abs(s - 1.0) < 1e-9 else src, qrs)
@@ -1248,6 +1271,28 @@ def detect_qr_codes_wechat_multiscale(
                 best = qrs
 
     return best
+
+
+def score_formB_fast(image_bgr: np.ndarray) -> tuple[bool, float, dict[str, Any]]:
+    """回転スキャン中の高速B判定。
+
+    v7の設計（fast→必要ならrobust）を v8(WeChat-only) にも導入するためのもの。
+    - fast は見つけたら即返す
+    - scale/variant は PIPELINE_DEFAULTS["qr"]["wechat"]["fast"] に従う
+    """
+
+    wechat = getattr(score_formB, "_wechat", None)
+    if wechat is None:
+        return False, 0.0, {"qrs": [], "reason": "wechat_detector_disabled", "phase": "fast"}
+
+    qrs = detect_qr_codes_wechat_multiscale(image_bgr, wechat, mode="fast")
+    if not qrs:
+        return False, 0.0, {"qrs": [], "reason": "wechat_no_qr", "phase": "fast"}
+
+    best_score, detail = score_best_qr_candidate(image_bgr, qrs)
+    score = 1.0 + float(best_score)
+    detail["phase"] = "fast"
+    return True, float(score), detail
 
 
 def score_best_qr_candidate(
@@ -1382,7 +1427,8 @@ def extract_form_unknown_reason(decision: Any) -> tuple[str, dict[str, Any]]:
             for r in scan:
                 try:
                     max_a = max(max_a, float(((r.get("A") or {}).get("score") or 0.0)))
-                    max_b = max(max_b, float(((r.get("B") or {}).get("score") or 0.0)))
+                    # v8では scan に B_fast が入る
+                    max_b = max(max_b, float(((r.get("B_fast") or r.get("B") or {}).get("score") or 0.0)))
                 except Exception:
                     continue
             if max_a != float("-inf"):
@@ -1682,7 +1728,8 @@ def score_formB(image_bgr: np.ndarray) -> tuple[bool, float, dict[str, Any]]:
     if wechat is None:
         return False, 0.0, {"qrs": [], "reason": "wechat_detector_disabled"}
 
-    qrs = detect_qr_codes_wechat_multiscale(image_bgr, wechat)
+    # robustは最終確定用（必要時に1回だけ呼ぶ想定）
+    qrs = detect_qr_codes_wechat_multiscale(image_bgr, wechat, mode="robust")
     if not qrs:
         return False, 0.0, {"qrs": [], "reason": "wechat_no_qr"}
 
@@ -1722,16 +1769,25 @@ def decide_form_by_rotations(
             return {"angle": float(angle), "skip": True}
 
         okA, scoreA, detA = score_formA(rotated, marker_preproc=marker_preproc)
-        if enable_formB:
-            okB, scoreB, detB = score_formB(rotated)
+
+        # Aが十分強い場合はB判定を省略（WeChatは重い）
+        strong_th = float((PIPELINE_DEFAULTS.get("formA_strong") or {}).get("score_threshold") or 0.0)
+        a_is_strong = bool(okA) and (strong_th > 0) and (float(scoreA) >= strong_th)
+
+        if enable_formB and (not a_is_strong):
+            okBf, scoreBf, detBf = score_formB_fast(rotated)
         else:
-            okB, scoreB, detB = (False, 0.0, {"qrs": [], "disabled": True})
+            okBf, scoreBf, detBf = (
+                False,
+                0.0,
+                {"qrs": [], "disabled": True, "skipped_by_formA_strong": bool(a_is_strong)},
+            )
 
         return {
             "angle": float(angle),
             "skip": False,
             "A": {"ok": bool(okA), "score": float(scoreA), "detail": detA},
-            "B": {"ok": bool(okB), "score": float(scoreB), "detail": detB},
+            "B_fast": {"ok": bool(okBf), "score": float(scoreBf), "detail": detBf},
         }
 
     # ----------------------------------
@@ -1744,7 +1800,7 @@ def decide_form_by_rotations(
 
     scan_results: list[dict[str, Any]] = []
     bestA: Optional[FormDecision] = None
-    bestB: Optional[FormDecision] = None
+    bestB_fast: Optional[FormDecision] = None
 
     with ThreadPoolExecutor(max_workers=min(int(max_workers), len(scan_angles))) as ex:
         futures = [ex.submit(_eval, a, enable_formB=True) for a in scan_angles]
@@ -1759,16 +1815,22 @@ def decide_form_by_rotations(
                 candA = FormDecision(True, "A", angle, float(r["A"]["score"]), {"A": r["A"]["detail"], "phase": "scan2"})
                 if bestA is None or candA.score > bestA.score:
                     bestA = candA
-            if (r.get("B") or {}).get("ok"):
-                candB = FormDecision(True, "B", angle, float(r["B"]["score"]), {"B": r["B"]["detail"], "phase": "scan2"})
-                if bestB is None or candB.score > bestB.score:
-                    bestB = candB
+            if (r.get("B_fast") or {}).get("ok"):
+                candB = FormDecision(
+                    True,
+                    "B",
+                    angle,
+                    float(r["B_fast"]["score"]),
+                    {"B_fast": r["B_fast"]["detail"], "phase": "scan2"},
+                )
+                if bestB_fast is None or candB.score > bestB_fast.score:
+                    bestB_fast = candB
 
     if not scan_results:
         return FormDecision(False, None, None, 0.0, {"reason": "scan_all_skipped", "scan_angles": scan_angles})
 
     # 2方向で見つからない場合は Unknown（救済処置は行わない）
-    if bestA is None and bestB is None:
+    if bestA is None and bestB_fast is None:
         return FormDecision(
             False,
             None,
@@ -1785,7 +1847,7 @@ def decide_form_by_rotations(
     # Unknown 判定: スコアが低すぎる / A-Bが近すぎる
     # （どちらかが None の場合は -inf として扱う）
     a_score = float(bestA.score) if bestA is not None else float("-inf")
-    b_score = float(bestB.score) if bestB is not None else float("-inf")
+    b_score = float(bestB_fast.score) if bestB_fast is not None else float("-inf")
 
     # しきい値: 最大スコアが一定未満なら Unknown
     top_score = max(a_score, b_score)
@@ -1793,19 +1855,48 @@ def decide_form_by_rotations(
         return FormDecision(False, None, None, float(top_score), {"reason": "below_threshold", "a_score": a_score, "b_score": b_score})
 
     # マージン: A/B の差が小さすぎたら Unknown
-    if float(unknown_margin) > 0 and bestA is not None and bestB is not None:
+    if float(unknown_margin) > 0 and bestA is not None and bestB_fast is not None:
         if abs(a_score - b_score) < float(unknown_margin):
             return FormDecision(False, None, None, float(top_score), {"reason": "ambiguous", "a_score": a_score, "b_score": b_score})
 
     # A があり、B_fast より良ければ A を優先
-    if bestA is not None and (bestB is None or bestA.score >= bestB.score):
+    if bestA is not None and (bestB_fast is None or bestA.score >= bestB_fast.score):
         return bestA
 
     # ここに来る時点で bestB は存在する想定
-    if bestB is None:
-        return FormDecision(False, None, None, float(top_score), {"reason": "no_detection", "note": "unexpected_b_none"})
+    if bestB_fast is None:
+        return FormDecision(False, None, None, float(top_score), {"reason": "no_detection", "note": "unexpected_b_fast_none"})
 
-    return bestB
+    # Bが勝った場合のみ、同一角度でrobust確定を1回だけ試す
+    aa: Optional[float]
+    try:
+        aa = float(bestB_fast.angle_deg) % 360.0 if bestB_fast.angle_deg is not None else None
+    except Exception:
+        aa = None
+
+    if aa is not None:
+        rotated = rotate_image_bound(rectified_bgr, float(aa))
+        h, w = rotated.shape[:2]
+        if h <= w:
+            okB, scoreB, detB = score_formB(rotated)
+            if okB:
+                return FormDecision(
+                    True,
+                    "B",
+                    float(aa),
+                    float(scoreB),
+                    {
+                        "B": detB,
+                        "B_fast": bestB_fast.detail.get("B_fast") if bestB_fast.detail else {},
+                        "phase": "scan2_robust_confirm",
+                    },
+                )
+
+    # robust で失敗した場合は fast 判定を採用
+    if bestB_fast.detail is None:
+        bestB_fast.detail = {}
+    bestB_fast.detail.setdefault("note", "robust_failed_use_fast")
+    return bestB_fast
 
 
 
