@@ -310,3 +310,97 @@ C:\Users\takumi\develop\miniconda3\python.exe APA\paper_pipeline_v8.py --src-for
    - 例: robust の scales を増やす、gray 以外の前処理を追加する等
 3. 実運用を意識した速度測定
    - `--save-images none` と `--save-images fail` で IO 抑制の効果を別途測る
+
+---
+
+## 7) 追加の詳細分析（case 単位の内訳）
+
+上記の KPI/サマリに加えて、`run.log` の各 `[CASE]` 行を集計して、
+「どの入力フォームで」「どの stage/理由で」落ちているかをもう一段詳しく比較する。
+
+（解析スクリプト例: `APA/trash/analyze_runlogs_v7_v8.py`）
+
+### 7.1 入力フォーム別 × stage の件数
+
+#### v7
+
+| 入力フォーム | done | form_unknown | homography_unstable |
+| ------------ | ---: | -----------: | ------------------: |
+| A            |   57 |            3 |                   0 |
+| B            |   55 |            3 |                   2 |
+| C            |    0 |           60 |                   0 |
+
+#### v8
+
+| 入力フォーム | done | form_unknown | homography_unstable |
+| ------------ | ---: | -----------: | ------------------: |
+| A            |   56 |            4 |                   0 |
+| B            |   54 |            6 |                   0 |
+| C            |    0 |           60 |                   0 |
+
+**読み取り**
+
+- v7→v8 の差分は、主に **B の落ち方が変わった**こと。
+  - v7: B は「フォームは通るが warp が不安定」(`homography_unstable`) が 2 件
+  - v8: B は「フォーム確定の時点で止まる」(`form_unknown`) が 3 件増（3→6）
+- A も `form_unknown` が 1 件増（3→4）。
+- C は v7/v8 ともに **全件 form_unknown**（期待動作）で、誤検出は無し。
+
+### 7.2 form_unknown の reason 分布
+
+#### v7
+
+| 入力フォーム | no_detection | below_threshold |
+| ------------ | -----------: | --------------: |
+| A            |            3 |               0 |
+| B            |            3 |               0 |
+| C            |           60 |               0 |
+
+#### v8
+
+| 入力フォーム | no_detection | below_threshold |
+| ------------ | -----------: | --------------: |
+| A            |            4 |               0 |
+| B            |            3 |               3 |
+| C            |           60 |               0 |
+
+**ポイント**
+
+- v8 では v7 に無かった **`below_threshold` が新規に発生**している。
+  - 該当ケース（v8）: `B_3_deg01`, `B_4_deg00`, `B_5_deg04`
+    - ログ上は `unknown_reason=below_threshold` で、フォーム確定まで行かず停止
+- これは実装上、
+  - `score_best_qr_candidate()` のスコア設計を「位置支配」に変更したこと
+  - その一方で `--unknown-score-threshold`（既定 1.2）は **v7 のスコア感のまま**
+    という組み合わせにより、**スコアの絶対値が閾値を割りやすくなった**可能性が高い。
+
+### 7.3 v8 の「速くなったが、B が落ちやすくなった」構図の整理
+
+- v8 は **フォーム判定(decide)を高速化**できている（83.32s → 52.65s）。
+  - 0/180 回転の特例（0° はコピー、180° は `cv2.rotate`）
+  - `enforce_landscape()` 重複排除
+  - A が強いときの B 判定スキップ
+  - WeChat fast→robust の導入（robust を最大 1 回に抑制）
+- ただし、その代償として「B を拾えない」方向に倒れるケースが増えた。
+  - `below_threshold` は **v8 のスコア/閾値の不整合**が主因の疑い
+  - `no_detection` は **WeChat の探索範囲（variants/scales）が v7 より狭い**ことが影響している可能性
+
+### 7.4 次アクション（より具体）
+
+1. **`below_threshold` ケースのスコア確認**
+
+   v8 の `summary.csv` には `form_unknown_diagnostics_json` が出ているため、
+   まずは該当 3 件の `top_score`（閾値 1.2 と比較する値）を確認し、
+   どれくらい下げれば救えるかを定量化する。
+
+2. **`unknown_score_threshold` の再調整**
+
+   - 例: `1.2 → 1.0` または `0.8`
+   - ただし、閾値を下げすぎると C の誤検出が増える可能性があるため、
+     「C の false positive 0%」を維持できる範囲で調整する。
+
+3. **WeChat robust の探索範囲を段階的に広げる**
+
+   v8 は速度のために `variants/scales` を絞っているため、
+   `no_detection` の B ケース（3 件）が実運用で問題になるなら、
+   robust 側だけ段階的に増やして取りこぼしを減らす。
