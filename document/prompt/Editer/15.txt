@@ -1,0 +1,145 @@
+# タスク（プロンプト）を行う前に必ず以下の資料を読んでください
+
+この資料は環境がどう構築されたかを記しておりコマンド実行などの際は必ず参考にしてください
+@/git_installation_guide.md
+@/miniconda_installation_guide.md
+
+タスクを行った際は、タスク成功後に、行ったことをマークダウン記法でまとめたものを@/APA\document\report の中にファイルを作成してください
+ファイル名のルール：番号_年月日_行ったことを日本語.md（例：1_20260106_環境構築）
+番号は@/APA\document\report の中を精査して確認してください
+これまでのreportも読み込んでからタスクを行ってください
+---
+# プロンプト
+
+@/APA\paper_pipeline_v8.py 
+現在私は上記のプログラムの精度向上に努めています
+上記のプログラムに以下の改善を行ってほしいです
+
+改善1
+```
+B-5) JPEG書き出しをするなら TurboJPEG 系に寄せる（テストだけで効果大）
+「保存を残したい」場合、OpenCVのimencode/imwriteより libjpeg-turbo の方が速いケースが多いです。
+
+LearnOpenCV のベンチでは TurboJPEG が高速なデコーダ/ローダとして紹介されています。
+PyTurboJPEG のREADMEベンチでは TurboJPEG.encode() が cv2.imencode() より高速という結果が例示されています。
+**ただし本命は “保存しない”**です。FPSは保存をやめないと伸びません。
+```
+
+改善2
+```
+B-4) 0度/180度の回転に rotate_image_bound を使わない（精度に影響ゼロ）
+rotate_image_bound() は warpAffine を行うので、0/180でも無駄に重いです。
+
+0°: そのまま
+180°: cv2.rotate(img, cv2.ROTATE_180)
+に置き換え可能です。
+```
+
+改善3
+```
+B-1) デバッグ画像保存を “常時” から “必要時だけ” にする
+現状は done のケースでも毎回 5〜6枚保存します。FPS運用では基本やりません。
+
+実装案
+--save-images {none,fail,all} を追加して、
+
+none: 一切保存しない（FPS測定用）
+fail: stage != done の時だけ保存
+all: 現状通り
+にすると良いです。
+
+期待効果
+ログから逆算すると、未計測オーバーヘッドが平均 0.43s/case あるので、
+保存を止めるだけで だいたい 20%〜30% くらい短縮が期待できます（環境依存）。
+```
+
+改善4
+```
+1. 根本的な原因解析
+原因①：面積（Area）の重みが強すぎて位置を無視している
+score_best_qr_candidate 関数内の以下のコードが最大の原因です。
+
+Python
+
+# 現在のコード
+score = (pos_score * 3.0) + (rel * 12.0)
+問題点: rel（画像全体に対するQRの面積比）の重みが 12.0 と非常に高く設定されています。一方、向きを決定する pos_score（位置スコア）の重みはわずか 3.0 です。
+
+結果: QRが「右下」にあっても、たまたま検出された面積（rel）が「右上」にある時よりわずかに大きいだけで、右下の画像が「正しい向き」として選ばれてしまいます。向き判定において面積は重要ではなく、位置こそが絶対的な指標であるべきです。
+
+原因②：回転スキャン内での enforce_landscape の重複適用
+decide_form_by_rotations 関数の _eval 内部（スキャンループ内）で以下の処理が行われています。
+
+Python
+
+# 現在のコード
+def _eval(angle: float, *, enable_formB: bool) -> dict[str, Any]:
+    rotated = rotate_image_bound(rectified_bgr, angle)
+    rotated, _ = enforce_landscape(rotated) # ← これが問題
+問題点: ループの外（ステップ3）ですでに横長（Landscape）に統一されているのに、回転させた後で再度 enforce_landscape を実行しています。
+
+結果: 180度回転させて「本来はQRが左下に来るはずの画像」が、この関数のせいで再び回転させられたり、座標系が狂ったりして、スコアリングの前提条件が崩れています。
+
+原因③：位置スコア（pos_score）の計算式が「右上」を厳密に区別できていない
+Python
+
+x_score = cx / float(max(1, w))
+y_score = 1.0 - (cy / float(max(1, h)))
+pos_score = 0.6 * x_score + 0.4 * y_score
+問題点: この加算方式だと、「中央の右端」と「右上の少し内側」が同じようなスコアになってしまいます。また、座標が 0.0〜1.0 の線形なため、180度反対側（左下）との点数差が十分に開きません。
+
+2. 修正案（コードの改善）
+以下の3箇所を修正することで、フォームBの判定精度が劇的に向上します。
+
+修正1：score_best_qr_candidate の重み付けを変更
+位置スコアを最優先し、面積は「ノイズ（小さい誤検出）を除外する」程度に抑えます。
+
+Python
+
+def score_best_qr_candidate(image_bgr: np.ndarray, qrs: list[dict[str, Any]]) -> tuple[float, dict[str, Any]]:
+    # ... (前段の計算は維持)
+    
+    # 改善案：位置スコアを支配的にし、面積は補助的にする
+    # pos_score (0.0~1.0) を 2乗することで、端に寄っているものをより強く評価する
+    final_pos_score = pos_score ** 2 
+    
+    # 重み付けを変更: 位置(15.0) >> 面積(2.0)
+    score = (final_pos_score * 15.0) + (rel * 2.0)
+    
+    # ...
+修正2：decide_form_by_rotations のループ内処理を簡素化
+スキャン中は余計な回転（enforce_landscape）をさせず、純粋に指定角度の評価だけを行います。
+
+Python
+
+def decide_form_by_rotations(...):
+    def _eval(angle: float, *, enable_formB: bool) -> dict[str, Any]:
+        # 単純に回転させるだけでよい（外側ですでに横長化されているため）
+        rotated = rotate_image_bound(rectified_bgr, angle)
+        
+        # 以下の enforce_landscape は削除またはコメントアウト
+        # rotated, _ = enforce_landscape(rotated) 
+        
+        # ... (以下 A/B のスコアリング)
+修正3：位置スコアの計算を「右上」に特化させる
+単なる加算ではなく、右上の隅（x=1.0, y=0.0）からの距離に基づいたスコアリングにします。
+
+Python
+
+# 改善案：右上角(1.0, 0.0) からの距離で計算
+dist_from_top_right = math.sqrt((nx - 1.0)**2 + (ny - 0.0)**2)
+# 距離が近いほど高得点 (最大 1.0)
+pos_score = max(0.0, 1.0 - (dist_from_top_right / 1.414))
+3. まとめ：なぜこれで直るのか？
+「右上の確信度」を物理的に強化: 重みを 3.0 -> 15.0 に引き上げることで、QRが少しでも右上に寄っていれば、多少面積が小さくても正解として選ばれるようになります。
+
+回転の整合性: enforce_landscape をループ内から消すことで、「0度（そのまま）」と「180度（上下反転）」の比較が正しく機能し、座標が予期せず入れ替わるバグを防ぎます。
+
+180度判定の安定化: フォームBにおいて「QRが右上にいない＝逆さま」という判断が明確になり、no_detection や form_unknown に陥るケースを減らせます。
+```
+
+プログラムを改善してください
+
+上記の改善を順番に確実に行ってください
+プログラムをすべて改善できたのちに実行して結果確認、エラーが出る場合は試行錯誤して適宜改善してください
+全ての改善が無事に終了したときに、レポートの作成を行ってください
