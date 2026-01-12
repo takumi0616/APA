@@ -250,23 +250,29 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
     "qr": {
         "min_test_side_px": 120,  # QR検出で試す画像サイズの最小辺(px)
         "wechat": {
-            # v8 改善:
-            # フォーム判定は 0/180 のみだが、WeChat QR の探索（前処理×スケール）自体が重い。
-            # そのため v7 と同様に "fast→robust" の2段階を導入する。
+            # v8.2 改善:
+            # v7並みの精度を確保するため、前処理バリエーションを増やす。
+            # fast→robust の2段階で評価する。
             "fast": {
-                # fast: 角度候補の絞り込み用（極力軽量）
+                # fast: 角度候補の絞り込み用
+                # v8.2: 前処理を増やして精度向上
                 "variants": ["bgr"],
                 "scales": [1.0],
             },
             "robust": {
                 # robust: 最終確定用（多少重くてもよいが、呼ぶのは最大1回）
-                "variants": ["bgr", "gray"],
-                "scales": [1.0, 0.5, 1.5],
+                # v8.2: v7並みの前処理バリエーションに拡張
+                "variants": ["bgr", "gray", "clahe", "adaptive_threshold"],
+                "scales": [0.5, 1.0, 1.5],
             },
             "up_scale_enable_max_side_px": 1800,  # 最大辺がこの値以上なら拡大は無効化
             "max_test_side_px": 6500,  # WeChat で試す画像の最大辺(px)
             "adaptive_morph_kernel": [5, 5],
         },
+        # CLAHE設定（照明ムラ対策）
+        "clahe": {"clipLimit": 2.0, "tileGridSize": [8, 8]},
+        # 自適応二値化の設定
+        "adaptive_threshold": {"block_size": 51, "C": 5},
     },
 
     # Homography（特徴点マッチングの射影変換）
@@ -1157,9 +1163,15 @@ def detect_qr_codes_wechat(
 def _preprocess_variants_for_qr(image_bgr: np.ndarray, variant_names: list[str]) -> list[tuple[str, np.ndarray]]:
     """QR検出のための前処理バリエーションを作る。
 
-    NOTE:
-      v8 の速度改善のため「必要なものだけ」生成する。
-      現状は bgr / gray をサポートし、将来拡張しやすい形にしている。
+    v8.2 改善:
+      v7並みの精度を確保するため、clahe / adaptive_morph をサポート。
+      これにより照明ムラや低コントラストのQRコードも検出しやすくなる。
+
+    サポートする前処理:
+      - bgr: 元画像そのまま
+      - gray: グレースケール
+      - clahe: CLAHE（照明ムラ対策）
+      - adaptive_morph: 自適応二値化 + モルフォロジー
     """
 
     if image_bgr is None:
@@ -1170,15 +1182,72 @@ def _preprocess_variants_for_qr(image_bgr: np.ndarray, variant_names: list[str])
         names = ["bgr"]
 
     out: list[tuple[str, np.ndarray]] = []
+
+    # gray は複数の前処理で使うので、必要なら1回だけ生成
+    gray: Optional[np.ndarray] = None
+
+    def _get_gray() -> Optional[np.ndarray]:
+        nonlocal gray
+        if gray is None:
+            try:
+                gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+            except Exception:
+                return None
+        return gray
+
     for name in names:
         if name == "bgr":
             out.append(("bgr", image_bgr))
+
         elif name == "gray":
-            try:
-                gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-                out.append(("gray", cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)))
-            except Exception:
-                continue
+            g = _get_gray()
+            if g is not None:
+                out.append(("gray", cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)))
+
+        elif name == "clahe":
+            # CLAHE（照明ムラ対策）
+            g = _get_gray()
+            if g is not None:
+                try:
+                    clahe_cfg = PIPELINE_DEFAULTS.get("qr", {}).get("clahe", {})
+                    if not clahe_cfg:
+                        clahe_cfg = PIPELINE_DEFAULTS.get("marker", {}).get("clahe", {})
+                    clip_limit = float(clahe_cfg.get("clipLimit", 2.0))
+                    tile_grid = tuple(int(x) for x in clahe_cfg.get("tileGridSize", [8, 8]))
+                    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid)
+                    g2 = clahe.apply(g)
+                    out.append(("clahe", cv2.cvtColor(g2, cv2.COLOR_GRAY2BGR)))
+                except Exception:
+                    continue
+
+        elif name == "adaptive_morph":
+            # 自適応二値化 + モルフォロジー（v7の detect_qr_codes_robust 相当）
+            g = _get_gray()
+            if g is not None:
+                try:
+                    at_cfg = PIPELINE_DEFAULTS.get("qr", {}).get("adaptive_threshold", {})
+                    if not at_cfg:
+                        at_cfg = PIPELINE_DEFAULTS.get("marker", {}).get("adaptive_threshold", {})
+                    block_size = int(at_cfg.get("block_size", 51))
+                    c_val = int(at_cfg.get("C", 5))
+
+                    kernel_xy = PIPELINE_DEFAULTS.get("qr", {}).get("wechat", {}).get("adaptive_morph_kernel", [5, 5])
+                    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, tuple(int(x) for x in kernel_xy))
+
+                    bw = cv2.adaptiveThreshold(
+                        g,
+                        255,
+                        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                        cv2.THRESH_BINARY,
+                        block_size,
+                        c_val,
+                    )
+                    bw2 = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel)
+                    bw2 = cv2.morphologyEx(bw2, cv2.MORPH_OPEN, kernel)
+                    out.append(("adaptive_morph", cv2.cvtColor(bw2, cv2.COLOR_GRAY2BGR)))
+                except Exception:
+                    continue
+
         else:
             # 未対応は無視（設定ミスで落ちないようにする）
             continue
@@ -1796,155 +1865,181 @@ def decide_form_by_rotations(
 ) -> FormDecision:
     """回転スキャンで、最良の判定（A/B/Unknown）を返す。
 
-    v8.2 改善（ユーザー要望）:
-      - 3) で rectify 後に enforce_landscape しているため、縦横（90度回転）探索は不要
-      - 上下反転だけ確認すればよいので、2方向（0度/180度）のみを試す
-      - その中の **最上位角度** を用いてフォーム判定と角度確定を行う
+    v8.3 改善（ユーザー要望）:
+      フォールバック構造に変更:
+        1. A探索（見つかればA確定）
+        2. Aが見つからない → Bのfast探索
+        3. fastで見つかればB確定
+        4. fastで見つからない → robustで再挑戦
+        5. robustでも見つからなければUnknown
 
     方針:
       - 0/180 のみを評価する（回転ステップ探索はしない）
       - フォームBの判定は WeChat QR のみ（OpenCV QRCodeDetector によるフォールバックはしない）
-      - A/B どちらもスコアが低い（閾値未満） or 近すぎる場合は Unknown 扱い
     """
-
-    def _eval(angle: float, *, enable_formB: bool) -> dict[str, Any]:
-        # 改善4（原因②）:
-        # rectify 段階で enforce_landscape 済みなので、
-        # ループ内での重複適用は座標系を崩す可能性があるため行わない。
-        rotated = rotate_image_bound(rectified_bgr, angle)
-        h, w = rotated.shape[:2]
-        if h > w:
-            return {"angle": float(angle), "skip": True}
-
-        okA, scoreA, detA = score_formA(rotated, marker_preproc=marker_preproc)
-
-        # Aが十分強い場合はB判定を省略（WeChatは重い）
-        strong_th = float((PIPELINE_DEFAULTS.get("formA_strong") or {}).get("score_threshold") or 0.0)
-        a_is_strong = bool(okA) and (strong_th > 0) and (float(scoreA) >= strong_th)
-
-        if enable_formB and (not a_is_strong):
-            okBf, scoreBf, detBf = score_formB_fast(rotated)
-        else:
-            okBf, scoreBf, detBf = (
-                False,
-                0.0,
-                {"qrs": [], "disabled": True, "skipped_by_formA_strong": bool(a_is_strong)},
-            )
-
-        return {
-            "angle": float(angle),
-            "skip": False,
-            "A": {"ok": bool(okA), "score": float(scoreA), "detail": detA},
-            "B_fast": {"ok": bool(okBf), "score": float(scoreBf), "detail": detBf},
-        }
-
-    # ----------------------------------
-    # scan: 2方向のみ（0/180）
-    # ----------------------------------
 
     scan_angles = [float(a) for a in (PIPELINE_DEFAULTS.get("rotation_scan") or {}).get("scan_angles_2_deg", [])]
     if not scan_angles:
         scan_angles = [0.0, 180.0]
 
     scan_results: list[dict[str, Any]] = []
+
+    # ----------------------------------
+    # Step 1: A探索（見つかればA確定）
+    # ----------------------------------
+
+    def _eval_formA(angle: float) -> dict[str, Any]:
+        rotated = rotate_image_bound(rectified_bgr, angle)
+        h, w = rotated.shape[:2]
+        if h > w:
+            return {"angle": float(angle), "skip": True}
+        okA, scoreA, detA = score_formA(rotated, marker_preproc=marker_preproc)
+        return {
+            "angle": float(angle),
+            "skip": False,
+            "A": {"ok": bool(okA), "score": float(scoreA), "detail": detA},
+        }
+
     bestA: Optional[FormDecision] = None
-    bestB_fast: Optional[FormDecision] = None
 
     with ThreadPoolExecutor(max_workers=min(int(max_workers), len(scan_angles))) as ex:
-        futures = [ex.submit(_eval, a, enable_formB=True) for a in scan_angles]
+        futures = [ex.submit(_eval_formA, a) for a in scan_angles]
         for fut in as_completed(futures):
             r = fut.result()
             if not r or r.get("skip"):
                 continue
             scan_results.append(r)
-
             angle = float(r["angle"])
             if (r.get("A") or {}).get("ok"):
-                candA = FormDecision(True, "A", angle, float(r["A"]["score"]), {"A": r["A"]["detail"], "phase": "scan2"})
+                candA = FormDecision(True, "A", angle, float(r["A"]["score"]), {"A": r["A"]["detail"], "phase": "formA_found"})
                 if bestA is None or candA.score > bestA.score:
                     bestA = candA
+
+    # Aが見つかった場合は即座にA確定
+    if bestA is not None:
+        # Unknown判定: スコアが低すぎる場合
+        if float(unknown_score_threshold) > 0 and bestA.score < float(unknown_score_threshold):
+            return FormDecision(False, None, None, float(bestA.score), {"reason": "below_threshold", "a_score": bestA.score, "b_score": float("-inf")})
+        return bestA
+
+    # ----------------------------------
+    # Step 2: Aが見つからない → Bのfast探索
+    # ----------------------------------
+
+    def _eval_formB_fast(angle: float) -> dict[str, Any]:
+        rotated = rotate_image_bound(rectified_bgr, angle)
+        h, w = rotated.shape[:2]
+        if h > w:
+            return {"angle": float(angle), "skip": True}
+        okBf, scoreBf, detBf = score_formB_fast(rotated)
+        return {
+            "angle": float(angle),
+            "skip": False,
+            "B_fast": {"ok": bool(okBf), "score": float(scoreBf), "detail": detBf},
+        }
+
+    bestB_fast: Optional[FormDecision] = None
+
+    with ThreadPoolExecutor(max_workers=min(int(max_workers), len(scan_angles))) as ex:
+        futures = [ex.submit(_eval_formB_fast, a) for a in scan_angles]
+        for fut in as_completed(futures):
+            r = fut.result()
+            if not r or r.get("skip"):
+                continue
+            # scan_resultsに追加（B_fast情報をマージ）
+            for sr in scan_results:
+                if abs(sr.get("angle", -999) - r.get("angle", -999)) < 1e-6:
+                    sr["B_fast"] = r.get("B_fast")
+                    break
+            else:
+                scan_results.append(r)
+
+            angle = float(r["angle"])
             if (r.get("B_fast") or {}).get("ok"):
                 candB = FormDecision(
                     True,
                     "B",
                     angle,
                     float(r["B_fast"]["score"]),
-                    {"B_fast": r["B_fast"]["detail"], "phase": "scan2"},
+                    {"B_fast": r["B_fast"]["detail"], "phase": "formB_fast_found"},
                 )
                 if bestB_fast is None or candB.score > bestB_fast.score:
                     bestB_fast = candB
 
-    if not scan_results:
-        return FormDecision(False, None, None, 0.0, {"reason": "scan_all_skipped", "scan_angles": scan_angles})
+    # fastで見つかればB確定
+    if bestB_fast is not None:
+        # Unknown判定: スコアが低すぎる場合
+        if float(unknown_score_threshold) > 0 and bestB_fast.score < float(unknown_score_threshold):
+            return FormDecision(False, None, None, float(bestB_fast.score), {"reason": "below_threshold", "a_score": float("-inf"), "b_score": bestB_fast.score})
+        return bestB_fast
 
-    # 2方向で見つからない場合は Unknown（救済処置は行わない）
-    if bestA is None and bestB_fast is None:
-        return FormDecision(
-            False,
-            None,
-            None,
-            0.0,
-            {
-                "reason": "no_detection",
-                "scan": scan_results,
-                "scan_angles": scan_angles,
-                "note": "scan2_only",
-            },
-        )
+    # ----------------------------------
+    # Step 3: fastで見つからない → robustで再挑戦
+    # ----------------------------------
 
-    # Unknown 判定: スコアが低すぎる / A-Bが近すぎる
-    # （どちらかが None の場合は -inf として扱う）
-    a_score = float(bestA.score) if bestA is not None else float("-inf")
-    b_score = float(bestB_fast.score) if bestB_fast is not None else float("-inf")
-
-    # しきい値: 最大スコアが一定未満なら Unknown
-    top_score = max(a_score, b_score)
-    if float(unknown_score_threshold) > 0 and top_score < float(unknown_score_threshold):
-        return FormDecision(False, None, None, float(top_score), {"reason": "below_threshold", "a_score": a_score, "b_score": b_score})
-
-    # マージン: A/B の差が小さすぎたら Unknown
-    if float(unknown_margin) > 0 and bestA is not None and bestB_fast is not None:
-        if abs(a_score - b_score) < float(unknown_margin):
-            return FormDecision(False, None, None, float(top_score), {"reason": "ambiguous", "a_score": a_score, "b_score": b_score})
-
-    # A があり、B_fast より良ければ A を優先
-    if bestA is not None and (bestB_fast is None or bestA.score >= bestB_fast.score):
-        return bestA
-
-    # ここに来る時点で bestB は存在する想定
-    if bestB_fast is None:
-        return FormDecision(False, None, None, float(top_score), {"reason": "no_detection", "note": "unexpected_b_fast_none"})
-
-    # Bが勝った場合のみ、同一角度でrobust確定を1回だけ試す
-    aa: Optional[float]
-    try:
-        aa = float(bestB_fast.angle_deg) % 360.0 if bestB_fast.angle_deg is not None else None
-    except Exception:
-        aa = None
-
-    if aa is not None:
-        rotated = rotate_image_bound(rectified_bgr, float(aa))
+    def _eval_formB_robust(angle: float) -> dict[str, Any]:
+        rotated = rotate_image_bound(rectified_bgr, angle)
         h, w = rotated.shape[:2]
-        if h <= w:
-            okB, scoreB, detB = score_formB(rotated)
-            if okB:
-                return FormDecision(
+        if h > w:
+            return {"angle": float(angle), "skip": True}
+        okB, scoreB, detB = score_formB(rotated)
+        return {
+            "angle": float(angle),
+            "skip": False,
+            "B_robust": {"ok": bool(okB), "score": float(scoreB), "detail": detB},
+        }
+
+    bestB_robust: Optional[FormDecision] = None
+
+    with ThreadPoolExecutor(max_workers=min(int(max_workers), len(scan_angles))) as ex:
+        futures = [ex.submit(_eval_formB_robust, a) for a in scan_angles]
+        for fut in as_completed(futures):
+            r = fut.result()
+            if not r or r.get("skip"):
+                continue
+            # scan_resultsに追加（B_robust情報をマージ）
+            for sr in scan_results:
+                if abs(sr.get("angle", -999) - r.get("angle", -999)) < 1e-6:
+                    sr["B_robust"] = r.get("B_robust")
+                    break
+            else:
+                scan_results.append(r)
+
+            angle = float(r["angle"])
+            if (r.get("B_robust") or {}).get("ok"):
+                candB = FormDecision(
                     True,
                     "B",
-                    float(aa),
-                    float(scoreB),
-                    {
-                        "B": detB,
-                        "B_fast": bestB_fast.detail.get("B_fast") if bestB_fast.detail else {},
-                        "phase": "scan2_robust_confirm",
-                    },
+                    angle,
+                    float(r["B_robust"]["score"]),
+                    {"B": r["B_robust"]["detail"], "phase": "formB_robust_fallback"},
                 )
+                if bestB_robust is None or candB.score > bestB_robust.score:
+                    bestB_robust = candB
 
-    # robust で失敗した場合は fast 判定を採用
-    if bestB_fast.detail is None:
-        bestB_fast.detail = {}
-    bestB_fast.detail.setdefault("note", "robust_failed_use_fast")
-    return bestB_fast
+    # robustで見つかればB確定
+    if bestB_robust is not None:
+        # Unknown判定: スコアが低すぎる場合
+        if float(unknown_score_threshold) > 0 and bestB_robust.score < float(unknown_score_threshold):
+            return FormDecision(False, None, None, float(bestB_robust.score), {"reason": "below_threshold", "a_score": float("-inf"), "b_score": bestB_robust.score})
+        return bestB_robust
+
+    # ----------------------------------
+    # Step 4: robustでも見つからなければUnknown
+    # ----------------------------------
+
+    return FormDecision(
+        False,
+        None,
+        None,
+        0.0,
+        {
+            "reason": "no_detection",
+            "scan": scan_results,
+            "scan_angles": scan_angles,
+            "note": "fallback_all_failed",
+        },
+    )
 
 
 
