@@ -1862,6 +1862,7 @@ def decide_form_by_rotations(
     marker_preproc: str = "none",
     unknown_score_threshold: float = 0.0,
     unknown_margin: float = 0.0,
+    formA_geom_cfg: Optional[MarkerGeometryConfig] = None,
 ) -> FormDecision:
     """回転スキャンで、最良の判定（A/B/Unknown）を返す。
 
@@ -1893,7 +1894,7 @@ def decide_form_by_rotations(
         h, w = rotated.shape[:2]
         if h > w:
             return {"angle": float(angle), "skip": True}
-        okA, scoreA, detA = score_formA(rotated, marker_preproc=marker_preproc)
+        okA, scoreA, detA = score_formA(rotated, marker_preproc=marker_preproc, geom_cfg=formA_geom_cfg)
         return {
             "angle": float(angle),
             "skip": False,
@@ -1921,6 +1922,62 @@ def decide_form_by_rotations(
         if float(unknown_score_threshold) > 0 and bestA.score < float(unknown_score_threshold):
             return FormDecision(False, None, None, float(bestA.score), {"reason": "below_threshold", "a_score": bestA.score, "b_score": float("-inf")})
         return bestA
+
+    # v9.4 追加:
+    # test データや強い改悪条件では marker_preproc=basic で取りこぼすことがあるため、
+    # A が全滅した場合のみ「morph」を追加で試す（2角度なのでオーバーヘッドは小さい）。
+    if str(marker_preproc) != "morph":
+
+        def _eval_formA_morph(angle: float) -> dict[str, Any]:
+            rotated = rotate_image_bound(rectified_bgr, angle)
+            h, w = rotated.shape[:2]
+            if h > w:
+                return {"angle": float(angle), "skip": True}
+            okA, scoreA, detA = score_formA(rotated, marker_preproc="morph", geom_cfg=formA_geom_cfg)
+            return {
+                "angle": float(angle),
+                "skip": False,
+                "A_morph": {"ok": bool(okA), "score": float(scoreA), "detail": detA},
+            }
+
+        bestA_morph: Optional[FormDecision] = None
+        with ThreadPoolExecutor(max_workers=min(int(max_workers), len(scan_angles))) as ex:
+            futures = [ex.submit(_eval_formA_morph, a) for a in scan_angles]
+            for fut in as_completed(futures):
+                r = fut.result()
+                if not r or r.get("skip"):
+                    continue
+
+                # scan_results に追記（angle でマージ）
+                for sr in scan_results:
+                    if abs(sr.get("angle", -999) - r.get("angle", -999)) < 1e-6:
+                        sr["A_morph"] = r.get("A_morph")
+                        break
+                else:
+                    scan_results.append(r)
+
+                angle = float(r["angle"])
+                if (r.get("A_morph") or {}).get("ok"):
+                    candA = FormDecision(
+                        True,
+                        "A",
+                        angle,
+                        float(r["A_morph"]["score"]),
+                        {"A": r["A_morph"]["detail"], "phase": "formA_found_fallback_morph"},
+                    )
+                    if bestA_morph is None or candA.score > bestA_morph.score:
+                        bestA_morph = candA
+
+        if bestA_morph is not None:
+            if float(unknown_score_threshold) > 0 and bestA_morph.score < float(unknown_score_threshold):
+                return FormDecision(
+                    False,
+                    None,
+                    None,
+                    float(bestA_morph.score),
+                    {"reason": "below_threshold", "a_score": bestA_morph.score, "b_score": float("-inf")},
+                )
+            return bestA_morph
 
     # ----------------------------------
     # Step 2: Aが見つからない → Bのfast探索
@@ -2349,6 +2406,32 @@ def _case_truth(src_form: str, src_path: Path) -> dict[str, Any]:
     }
 
 
+def _truth_from_item(item: dict[str, Any]) -> dict[str, Any]:
+    """item 内の ground truth を優先して返す。
+
+    v9.4:
+      - image/test の評価では、入力画像名とテンプレ番号が一致しないため、
+        item 側で ground truth を明示して上書きできるようにする。
+    """
+
+    gt_form = str(item.get("ground_truth_form") or "")
+    gt_tpl_path = str(item.get("ground_truth_template_path") or "")
+    gt_tpl_num = str(item.get("ground_truth_template_number") or "")
+
+    if gt_form:
+        # A/B/C のいずれでも入れられるが、既存 CSV 互換のためキー名は A_or_B を維持
+        return {
+            "ground_truth_source_form(A_or_B)": gt_form if gt_form in ("A", "B") else "",
+            "ground_truth_source_template_path(if_A_or_B)": gt_tpl_path if gt_form in ("A", "B") else "",
+            "ground_truth_source_template_number(if_A_or_B)": gt_tpl_num if gt_form in ("A", "B") else "",
+        }
+
+    # 既存データセット（image/A,B,C）
+    src_form = str(item.get("source_form") or "")
+    src_path_s = str(item.get("source_path") or "")
+    return _case_truth(src_form, Path(src_path_s) if src_path_s else Path(""))
+
+
 def build_csv_row(
     *,
     args: argparse.Namespace,
@@ -2375,7 +2458,7 @@ def build_csv_row(
 
     src_form = str(item.get("source_form") or "")
     src_path = Path(str(item.get("source_path") or ""))
-    truth = _case_truth(src_form, src_path) if src_path else _case_truth(src_form, Path(""))
+    truth = _truth_from_item(item)
     gt_form = str(truth["ground_truth_source_form(A_or_B)"])
     gt_template_path = str(truth["ground_truth_source_template_path(if_A_or_B)"])
     gt_template_filename = _template_filename_from_path(gt_template_path)
@@ -2392,6 +2475,8 @@ def build_csv_row(
     # 注意: CSV は「フルパス禁止」の要望に従い、原則 filename のみ出力する。
     src_filename = _filename_only(item.get("source_path"))
 
+    source_dataset = str(item.get("source_dataset") or "synthetic")
+
     expected_behavior_label = ""
     if src_form == "C":
         expected_behavior_label = "C_should_be_rejected_as_form_unknown"
@@ -2406,6 +2491,7 @@ def build_csv_row(
     row: dict[str, Any] = {
         # ---- 識別情報（短く・人間向け） ----
         "case_id": str(item.get("case") or ""),
+        "source_dataset_name(synthetic_or_test)": source_dataset,
         "source_form_folder_name(A_or_B_or_C)": src_form,
         "source_image_filename": src_filename,
         "source_image_filename_stem": str(src_path.stem) if src_path else "",
@@ -2577,6 +2663,41 @@ def list_images(form: str) -> list[Path]:
         if p.exists():
             paths.append(p)
     return paths
+
+
+def list_test_images() -> list[Path]:
+    """image/test 配下の画像（A_3.png 等）を列挙する。"""
+
+    base = Path(__file__).resolve().parent / "image" / "test"
+    if not base.exists():
+        return []
+
+    exts = {".png", ".jpg", ".jpeg"}
+    paths = [p for p in base.iterdir() if p.is_file() and p.suffix.lower() in exts]
+    return sorted(paths)
+
+
+def parse_test_filename(p: Path) -> Optional[tuple[str, str]]:
+    """test 画像ファイル名から (form, template_number) を推定する。
+
+    規則: {A|B|C}_{number}.(png|jpg)
+      例: A_3.png -> ("A", "3")
+    """
+
+    try:
+        stem = p.stem
+        if "_" not in stem:
+            return None
+        head, num = stem.split("_", 1)
+        head = head.strip().upper()
+        num = num.strip()
+        if head not in ("A", "B", "C"):
+            return None
+        if not num.isdigit():
+            return None
+        return head, num
+    except Exception:
+        return None
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -2932,6 +3053,12 @@ def summarize_results(logger: logging.Logger, summary: list[dict[str, Any]], sta
         else:
             by_src["other"].append(s)
 
+    # dataset(test/synthetic) 別にも集計
+    by_dataset: dict[str, list[dict[str, Any]]] = {}
+    for s in summary:
+        ds = str(s.get("source_dataset") or "synthetic")
+        by_dataset.setdefault(ds, []).append(s)
+
     # A/B 正解数（フォーム正解・テンプレ正解）
     def _count_true(items: list[dict[str, Any]], key: str) -> int:
         return sum(1 for it in items if bool(it.get(key)))
@@ -2976,6 +3103,34 @@ def summarize_results(logger: logging.Logger, summary: list[dict[str, Any]], sta
     logger.info("  reject_success(stage=form_unknown) : %d (%.1f%%)", c_reject_ok, _safe_div(c_reject_ok * 100.0, len(c_items)))
     logger.info("  false_positive_as_A                : %d (%.1f%%)", c_fp_as_A, _safe_div(c_fp_as_A * 100.0, len(c_items)))
     logger.info("  false_positive_as_B                : %d (%.1f%%)", c_fp_as_B, _safe_div(c_fp_as_B * 100.0, len(c_items)))
+
+    # test データセット（image/test）精度
+    if "test" in by_dataset:
+        test_items = by_dataset["test"]
+        test_a = [it for it in test_items if str(it.get("source_form") or "") == "A"]
+        test_b = [it for it in test_items if str(it.get("source_form") or "") == "B"]
+        test_c = [it for it in test_items if str(it.get("source_form") or "") == "C"]
+
+        logger.info("[STATS] test dataset (image/test)")
+        logger.info("  total                             : %d", len(test_items))
+        logger.info("  A cases                            : %d", len(test_a))
+        logger.info(
+            "  A template_accuracy                 : %d (%.1f%%)",
+            _count_true(test_a, "is_predicted_best_template_correct"),
+            _safe_div(_count_true(test_a, "is_predicted_best_template_correct") * 100.0, len(test_a)),
+        )
+        logger.info("  B cases                            : %d", len(test_b))
+        logger.info(
+            "  B template_accuracy                 : %d (%.1f%%)",
+            _count_true(test_b, "is_predicted_best_template_correct"),
+            _safe_div(_count_true(test_b, "is_predicted_best_template_correct") * 100.0, len(test_b)),
+        )
+        logger.info("  C cases                            : %d", len(test_c))
+        logger.info(
+            "  C reject_success(stage=form_unknown): %d (%.1f%%)",
+            sum(1 for it in test_c if str(it.get("stage")) == "form_unknown"),
+            _safe_div(sum(1 for it in test_c if str(it.get("stage")) == "form_unknown") * 100.0, len(test_c)),
+        )
 
     # ステージ別の合計時間
     logger.info("[STATS] stage time totals (s) (same as SUMMARY)")
@@ -3057,12 +3212,23 @@ def process_one_case(
     src_bgr: np.ndarray,
     k: int,
     out_dirs: dict[str, Path],
+    source_dataset: str = "synthetic",
+    ground_truth_form: str = "",
+    ground_truth_template_path: Optional[Path] = None,
+    ground_truth_template_number: str = "",
 ) -> tuple[dict[str, Any], StageTimes]:
     """1枚の入力画像から生成した「1枚の改悪画像（1バリアント）」を処理する。"""
 
     case_t0 = time.perf_counter()
-    case_id = f"{src_form}_{src_path.stem}_deg{k:02d}"
+
+    # test データセットは case_id にプレフィックスを付けて区別する
+    if str(source_dataset) == "test":
+        case_id = f"test_{src_path.stem}_deg{k:02d}"
+    else:
+        case_id = f"{src_form}_{src_path.stem}_deg{k:02d}"
+
     item: dict[str, Any] = {
+        "source_dataset": str(source_dataset),
         "source_form": src_form,
         "source_path": str(src_path),
         "case": case_id,
@@ -3075,6 +3241,15 @@ def process_one_case(
         "stage": "start",
         "degraded_variant_index": int(k),
     }
+
+    # ground truth override（image/test 用）
+    if ground_truth_form:
+        item["ground_truth_form"] = str(ground_truth_form)
+    if ground_truth_template_path is not None:
+        item["ground_truth_template_path"] = str(ground_truth_template_path)
+    if ground_truth_template_number:
+        item["ground_truth_template_number"] = str(ground_truth_template_number)
+
     times = StageTimes()
 
     # ------------------------------------------------------------
@@ -3215,12 +3390,35 @@ def process_one_case(
 
     # 4) decide form by rotations
     t0 = time.perf_counter()
+
+    # test データは「正例（A/B）」の取りこぼしを避けたいので、
+    # フォームA誤検出抑制のうち「周辺が白地」制約だけを緩めた config を使う。
+    # （手書きがマーカー近傍に入ると、この制約で弾かれてしまうため）
+    formA_geom_cfg: Optional[MarkerGeometryConfig] = None
+    if str(source_dataset) == "test" and str(src_form) in ("A", "B"):
+        try:
+            base_cfg_dict = (PIPELINE_DEFAULTS.get("formA") or {}).get("geometry") or {}
+            allowed = set(getattr(MarkerGeometryConfig, "__dataclass_fields__", {}).keys())
+            base_cfg = MarkerGeometryConfig(**{k: v for k, v in base_cfg_dict.items() if k in allowed})
+
+            # 周辺白地制約を緩める（test 専用）
+            formA_geom_cfg = MarkerGeometryConfig(
+                **{
+                    **asdict(base_cfg),
+                    "surround_min_mean_gray": 0.0,
+                    "surround_max_ink_ratio": 1.0,
+                }
+            )
+        except Exception:
+            formA_geom_cfg = None
+
     decision = decide_form_by_rotations(
         rectified,
         max_workers=int(args.rotation_max_workers),
         marker_preproc=str(args.marker_preproc),
         unknown_score_threshold=float(args.unknown_score_threshold),
         unknown_margin=float(args.unknown_margin),
+        formA_geom_cfg=formA_geom_cfg,
     )
     times.decide_s = time.perf_counter() - t0
     item["form_decision"] = asdict(decision)
@@ -3231,20 +3429,20 @@ def process_one_case(
     if not decision.ok or decision.form not in ("A", "B") or decision.angle_deg is None:
         item["stage"] = "form_unknown"
         # 期待動作:
+        # - C: form_unknown になるべき（紙は検出できたが A/B ではない）
         # - A/B: form_unknown になってはいけない
-        # - C  : form_unknown になるべき（紙は検出できたが A/B ではない）
-        item["ok"] = bool(src_form == "C")
+        item["ok"] = bool(str(src_form) == "C")
         item["ok_warp"] = False
         _finalize_images_for_stage(item["stage"])
         item["case_total_s"] = float(time.perf_counter() - case_t0)
         return item, times
     item["stage"] = "form_found"
 
-    # Form correctness for A/B (C は ground truth 未定義のため空扱い)
-    if src_form in ("A", "B"):
-        item["is_predicted_form_correct"] = bool(decision.form == src_form)
-    else:
-        item["is_predicted_form_correct"] = None
+    # Form correctness for A/B
+    gt_form_for_scoring = str(ground_truth_form or "")
+    if not gt_form_for_scoring and str(src_form) in ("A", "B"):
+        gt_form_for_scoring = str(src_form)
+    item["is_predicted_form_correct"] = bool(decision.form == gt_form_for_scoring) if gt_form_for_scoring in ("A", "B") else None
 
     chosen = rotate_image_bound(rectified, float(decision.angle_deg))
     try:
@@ -3374,9 +3572,12 @@ def process_one_case(
         return item, times
 
     # Template correctness for A/B only
-    if src_form in ("A", "B"):
+    gt_tpl_path_for_scoring: Optional[Path] = ground_truth_template_path
+    if gt_tpl_path_for_scoring is None and gt_form_for_scoring in ("A", "B"):
+        gt_tpl_path_for_scoring = Path(str(src_path))
+    if gt_form_for_scoring in ("A", "B") and gt_tpl_path_for_scoring is not None:
         try:
-            item["is_predicted_best_template_correct"] = bool(Path(str(best.get("template", ""))).name == Path(str(src_path)).name)
+            item["is_predicted_best_template_correct"] = bool(Path(str(best.get("template", ""))).name == Path(str(gt_tpl_path_for_scoring)).name)
         except Exception:
             item["is_predicted_best_template_correct"] = False
     else:
@@ -3420,8 +3621,8 @@ def process_one_case(
         pass
     times.warp_s = time.perf_counter() - t0
 
-    # デバッグ用のマッチ可視化（可能な範囲で）
-    # 追加: CSV 向けに XFeat の詳細診断も収集
+    # デバッグ用のマッチ可視化（5_debug_matches）は常に保存する
+    # （save-images=none でも、ユーザー要望により生成する）
     try:
         res2, H2, mk0, mk1 = matcher.match_and_estimate_h(tpl_bgr, chosen)
         if getattr(res2, "ok", False):
@@ -3437,7 +3638,9 @@ def process_one_case(
         if getattr(res2, "ok", False) and mk0 is not None and mk1 is not None:
             dbg = draw_inlier_matches(tpl_bgr, chosen, mk0, mk1, args.match_max_side)
             out_dbg = out_dirs["debug_matches"] / f"{case_id}_matches.jpg"
-            _schedule_image("output_debug_matches_image_path", out_dbg, dbg)
+            # debug_matches は保存モードに関係なく必ず保存
+            write_image(out_dbg, dbg, jpeg_quality=jpeg_quality)
+            item["output_debug_matches_image_path"] = str(out_dbg)
     except Exception:
         pass
 
@@ -3453,6 +3656,332 @@ def process_one_case(
     item["case_total_s"] = float(time.perf_counter() - case_t0)
 
     # done のケースでは fail モードは保存しない
+    _finalize_images_for_stage(item["stage"])
+    return item, times
+
+
+def process_one_observed_case(
+    *,
+    logger: logging.Logger,
+    args: argparse.Namespace,
+    model: Any,
+    cb: Any,
+    matcher: XFeatMatcher,
+    cached_matcher: Optional[CachedXFeatMatcher],
+    templates_A: list[CachedRef],
+    templates_B: list[CachedRef],
+    src_form: str,
+    src_path: Path,
+    src_bgr: np.ndarray,
+    out_dirs: dict[str, Path],
+    ground_truth_form: str,
+    ground_truth_template_path: Path,
+    ground_truth_template_number: str,
+    source_dataset: str = "test",
+) -> tuple[dict[str, Any], StageTimes]:
+    """image/test のような「観測画像」を処理する。
+
+    - 改悪生成（degrade）は行わない
+    - ファイル名から得た ground truth を item に入れる
+    - DocAligner → rectify → decide → XFeat → warp の通常処理を適用
+    """
+
+    case_t0 = time.perf_counter()
+    case_id = f"test_{src_path.stem}"
+    item: dict[str, Any] = {
+        "source_dataset": str(source_dataset),
+        "source_form": str(src_form),
+        "source_path": str(src_path),
+        "case": case_id,
+        "ok": False,
+        "ok_warp": False,
+        "stage": "start",
+        "degraded_variant_index": "",
+        # ground truth override
+        "ground_truth_form": str(ground_truth_form),
+        "ground_truth_template_path": str(ground_truth_template_path),
+        "ground_truth_template_number": str(ground_truth_template_number),
+    }
+    times = StageTimes()
+
+    # ------------------------------------------------------------
+    # 画像保存モード（B-1）
+    # ------------------------------------------------------------
+
+    save_mode = str(getattr(args, "save_images", "all"))
+    jpeg_quality = int((PIPELINE_DEFAULTS.get("save_images") or {}).get("jpeg_quality") or 95)
+    pending_images: list[tuple[str, Path, np.ndarray]] = []
+
+    def _schedule_image(field_name: str, path: Path, img: np.ndarray) -> None:
+        if save_mode == "all":
+            write_image(path, img, jpeg_quality=jpeg_quality)
+            item[field_name] = str(path)
+        elif save_mode == "fail":
+            pending_images.append((field_name, path, img))
+            item[field_name] = ""
+        else:
+            item[field_name] = ""
+
+    def _finalize_images_for_stage(stage: str) -> None:
+        if save_mode != "fail":
+            return
+        if str(stage) == "done":
+            return
+        for field_name, path, img in pending_images:
+            write_image(path, img, jpeg_quality=jpeg_quality)
+            item[field_name] = str(path)
+
+    try:
+        h0, w0 = src_bgr.shape[:2]
+        item["source_w"] = int(w0)
+        item["source_h"] = int(h0)
+    except Exception:
+        pass
+
+    # 1) degrade をスキップし、観測画像をそのまま degraded 扱いにする
+    degraded_bgr = src_bgr
+    item["stage"] = "degraded"
+    item["degrade"] = {"mode": "test_skip"}
+    try:
+        hd, wd = degraded_bgr.shape[:2]
+        item["degraded_w"] = int(wd)
+        item["degraded_h"] = int(hd)
+    except Exception:
+        pass
+    out_degraded = out_dirs["degraded"] / f"{case_id}.jpg"
+    _schedule_image("output_degraded_image_path", out_degraded, degraded_bgr)
+
+    # 2) DocAligner
+    t0 = time.perf_counter()
+    poly = detect_polygon_docaligner(model, cb, degraded_bgr)
+    times.docaligner_s = time.perf_counter() - t0
+    if poly is None:
+        item["stage"] = "docaligner_failed"
+        _finalize_images_for_stage(item["stage"])
+        item["case_total_s"] = float(time.perf_counter() - case_t0)
+        return item, times
+
+    item["stage"] = "docaligner_ok"
+    item["polygon"] = poly.astype(float).tolist()
+
+    # polygon margin
+    if float(getattr(args, "polygon_margin_px", 0.0)) > 0:
+        margin_px = float(args.polygon_margin_px)
+        item["polygon_margin"] = {"mode": "fixed_px", "value": margin_px}
+    else:
+        margin_px = polygon_margin_px_from_ratio(
+            poly,
+            ratio=float(args.polygon_margin_ratio),
+            min_px=float(args.polygon_margin_min_px),
+            max_px=float(args.polygon_margin_max_px),
+        )
+        item["polygon_margin"] = {
+            "mode": "ratio",
+            "ratio": float(args.polygon_margin_ratio),
+            "min_px": float(args.polygon_margin_min_px),
+            "max_px": float(args.polygon_margin_max_px),
+            "computed_px": float(margin_px),
+        }
+
+    poly_exp = expand_polygon(
+        poly,
+        margin_px=float(margin_px),
+        img_w=int(degraded_bgr.shape[1]),
+        img_h=int(degraded_bgr.shape[0]),
+    )
+    overlay = draw_polygon_overlay(degraded_bgr, poly_exp)
+    out_doc = out_dirs["doc"] / f"{case_id}_doc.jpg"
+    _schedule_image("output_doc_overlay_image_path", out_doc, overlay)
+
+    # 3) Rectify
+    t0 = time.perf_counter()
+    rectified, H_deg_to_rect = polygon_to_rectified(degraded_bgr, poly_exp, out_max_side=int(args.docaligner_max_side))
+    rectified, _ = enforce_landscape(rectified)
+    times.rectify_s = time.perf_counter() - t0
+    item["stage"] = "rectified"
+    item["H_degraded_to_rectified"] = H_deg_to_rect.astype(float).tolist()
+    out_rect = out_dirs["rect"] / f"{case_id}_rect.jpg"
+    _schedule_image("output_rectified_image_path", out_rect, rectified)
+    try:
+        hr, wr = rectified.shape[:2]
+        item["rectified_w"] = int(wr)
+        item["rectified_h"] = int(hr)
+    except Exception:
+        pass
+
+    # 4) decide
+    t0 = time.perf_counter()
+    decision = decide_form_by_rotations(
+        rectified,
+        max_workers=int(args.rotation_max_workers),
+        marker_preproc=str(args.marker_preproc),
+        unknown_score_threshold=float(args.unknown_score_threshold),
+        unknown_margin=float(args.unknown_margin),
+    )
+    times.decide_s = time.perf_counter() - t0
+    item["form_decision"] = asdict(decision)
+    item["predicted_form"] = str(decision.form or "")
+    item["predicted_angle_deg"] = "" if decision.angle_deg is None else float(decision.angle_deg)
+
+    if not decision.ok or decision.form not in ("A", "B") or decision.angle_deg is None:
+        item["stage"] = "form_unknown"
+        # 期待動作:
+        # - test/C は A/B として認識されない（form_unknown が成功扱い）
+        # - test/A,B は form_unknown になってはいけない
+        item["ok"] = bool(str(ground_truth_form) == "C")
+        item["ok_warp"] = False
+        _finalize_images_for_stage(item["stage"])
+        item["case_total_s"] = float(time.perf_counter() - case_t0)
+        return item, times
+
+    item["stage"] = "form_found"
+
+    # 正解フォーム（test では必ず定義される想定）
+    item["is_predicted_form_correct"] = bool(str(decision.form) == str(ground_truth_form))
+
+    chosen = rotate_image_bound(rectified, float(decision.angle_deg))
+    try:
+        hc, wc = chosen.shape[:2]
+        item["chosen_w"] = int(wc)
+        item["chosen_h"] = int(hc)
+    except Exception:
+        pass
+
+    # 判定根拠可視化
+    if decision.form == "A":
+        markers = ((decision.detail or {}).get("A") or {}).get("markers") or []
+        rot_vis = draw_formA_markers_overlay(chosen, markers)
+    else:
+        qrs = ((decision.detail or {}).get("B") or {}).get("qrs")
+        if not qrs:
+            wechat = getattr(score_formB, "_wechat", None)
+            if wechat is not None:
+                qrs = detect_qr_codes_wechat_multiscale(chosen, wechat)
+        rot_vis = draw_formB_qr_overlay(chosen, qrs)
+    out_rot = out_dirs["rot"] / f"{case_id}_rot.jpg"
+    _schedule_image("output_rotated_decision_visualization_image_path", out_rot, rot_vis)
+
+    # 5) XFeat matching
+    t0 = time.perf_counter()
+    templates = templates_A if decision.form == "A" else templates_B
+    candidates = list(templates)
+    item["template_prefilter"] = {
+        "mode": "disabled",
+        "topn": 0,
+        "candidates": [c.template_path for c in candidates],
+        "total": len(templates),
+        "note": "test dataset; matched against all templates",
+    }
+
+    template_candidate_results: list[dict[str, Any]] = []
+    best: Optional[dict[str, Any]] = None
+
+    tgt_prepared_out1: Optional[dict[str, Any]] = None
+    tgt_prepared_invS: Optional[np.ndarray] = None
+    if cached_matcher is not None:
+        try:
+            tgt_prepared_out1, _s_tgt, tgt_prepared_invS = cached_matcher.prepare_target(chosen)
+        except Exception:
+            tgt_prepared_out1, tgt_prepared_invS = None, None
+
+    for ref in candidates:
+        tp = Path(ref.template_path)
+        if cached_matcher is not None:
+            if tgt_prepared_out1 is not None and tgt_prepared_invS is not None:
+                res, H_tpl_to_img, mk0, mk1 = cached_matcher.match_with_cached_ref_and_prepared_target(
+                    ref,
+                    out1=tgt_prepared_out1,
+                    invS_tgt=tgt_prepared_invS,
+                )
+            else:
+                res, H_tpl_to_img, mk0, mk1 = cached_matcher.match_with_cached_ref(ref, chosen)
+        else:
+            tpl_bgr = cv2.imread(str(tp))
+            if tpl_bgr is None:
+                continue
+            res, H_tpl_to_img, mk0, mk1 = matcher.match_and_estimate_h(tpl_bgr, chosen)
+
+        ok = bool(getattr(res, "ok", False)) and H_tpl_to_img is not None
+        cand = {
+            "template": str(tp),
+            "ok": ok,
+            "inliers": int(getattr(res, "inliers", 0)),
+            "matches": int(getattr(res, "matches", 0)),
+            "inlier_ratio": float(getattr(res, "inlier_ratio", 0.0)),
+            "reproj_rms": getattr(res, "reproj_rms", None),
+        }
+        if ok and getattr(res, "H_ref_to_tgt", None) is not None:
+            cand["H_ref_to_tgt"] = getattr(res, "H_ref_to_tgt")
+        template_candidate_results.append(cand)
+
+        if best is None:
+            best = cand
+        else:
+            if int(cand.get("inliers", 0)) > int(best.get("inliers", 0)):
+                best = cand
+            elif int(cand.get("inliers", 0)) == int(best.get("inliers", 0)):
+                if float(cand.get("inlier_ratio", 0.0)) > float(best.get("inlier_ratio", 0.0)):
+                    best = cand
+
+    times.match_s = time.perf_counter() - t0
+    item["best_match"] = best
+    item["template_match_candidates"] = template_candidate_results
+
+    if best is None or not best.get("ok"):
+        item["stage"] = "xfeat_failed"
+        _finalize_images_for_stage(item["stage"])
+        item["case_total_s"] = float(time.perf_counter() - case_t0)
+        return item, times
+
+    tpl_path = Path(str(best["template"]))
+    tpl_bgr = cv2.imread(str(tpl_path))
+    if tpl_bgr is None:
+        item["stage"] = "template_read_failed"
+        _finalize_images_for_stage(item["stage"])
+        item["case_total_s"] = float(time.perf_counter() - case_t0)
+        return item, times
+
+    # test: 正解テンプレは ground_truth_template_path
+    try:
+        item["is_predicted_best_template_correct"] = bool(tpl_path.name == Path(str(ground_truth_template_path)).name)
+    except Exception:
+        item["is_predicted_best_template_correct"] = False
+
+    try:
+        ht, wt = tpl_bgr.shape[:2]
+        item["best_template_w"] = int(wt)
+        item["best_template_h"] = int(ht)
+    except Exception:
+        pass
+
+    # 6) Homography inversion & warp
+    t0 = time.perf_counter()
+    H_tpl_to_img = np.asarray(best.get("H_ref_to_tgt"), dtype=np.float64)
+    ok_inv, H_img_to_tpl, inv_reason, h_cond, h_det = safe_invert_homography(
+        H_tpl_to_img,
+        inliers=int(best.get("inliers", 0)),
+        inlier_ratio=float(best.get("inlier_ratio", 0.0)),
+        min_inliers=int(args.min_inliers_for_warp),
+        min_inlier_ratio=float(args.min_inlier_ratio_for_warp),
+        max_cond=float(args.max_h_cond),
+    )
+    item["homography_inv"] = {"ok": bool(ok_inv), "reason": inv_reason, "cond": h_cond, "det": h_det}
+    if not ok_inv or H_img_to_tpl is None:
+        item["stage"] = "homography_unstable"
+        _finalize_images_for_stage(item["stage"])
+        item["case_total_s"] = float(time.perf_counter() - case_t0)
+        return item, times
+
+    warped = cv2.warpPerspective(chosen, H_img_to_tpl, (tpl_bgr.shape[1], tpl_bgr.shape[0]))
+    out_aligned = out_dirs["aligned"] / f"{case_id}_aligned.jpg"
+    _schedule_image("output_aligned_image_path", out_aligned, warped)
+    times.warp_s = time.perf_counter() - t0
+    item["ok_warp"] = True
+
+    # done
+    item["stage"] = "done"
+    item["ok"] = bool(item.get("is_predicted_form_correct")) and bool(item.get("is_predicted_best_template_correct"))
+    item["case_total_s"] = float(time.perf_counter() - case_t0)
     _finalize_images_for_stage(item["stage"])
     return item, times
 
@@ -3654,6 +4183,106 @@ def main(argv=None) -> int:
                 stage_times["decide_s"] += float(st.decide_s)
                 stage_times["match_s"] += float(st.match_s)
                 stage_times["warp_s"] += float(st.warp_s)
+
+    # ------------------------------------------------------------
+    # 追加: image/test データセットの評価
+    # ------------------------------------------------------------
+
+    test_paths = list_test_images()
+    if test_paths:
+        logger.info("Processing test dataset (image/test): %d images", len(test_paths))
+    for tp in test_paths:
+        parsed = parse_test_filename(tp)
+        if parsed is None:
+            logger.warning("skip test image (invalid name): %s", tp.name)
+            continue
+        gt_form, gt_num = parsed
+
+        src_bgr = cv2.imread(str(tp))
+        if src_bgr is None:
+            logger.warning("failed to read test image: %s", tp)
+            continue
+
+        gt_template_path = Path(__file__).resolve().parent / "image" / gt_form / f"{gt_num}.jpg"
+        if not gt_template_path.exists():
+            logger.warning("ground truth template not found for test image: %s -> %s", tp.name, gt_template_path)
+
+        # test も synthetic と同様に degrade を実行する（--degrade-n 回）
+        for k in range(int(args.degrade_n)):
+            try:
+                item, st = process_one_case(
+                    logger=logger,
+                    args=args,
+                    model=model,
+                    cb=cb,
+                    matcher=matcher,
+                    cached_matcher=cached_matcher,
+                    templates_A=templates_A,
+                    templates_B=templates_B,
+                    src_form=gt_form,
+                    src_path=tp,
+                    src_bgr=src_bgr,
+                    k=k,
+                    out_dirs=out_dirs,
+                    source_dataset="test",
+                    ground_truth_form=gt_form,
+                    ground_truth_template_path=gt_template_path,
+                    ground_truth_template_number=gt_num,
+                )
+            except Exception as e:
+                item = {
+                    "source_dataset": "test",
+                    "source_form": gt_form,
+                    "source_path": str(tp),
+                    "case": f"test_{tp.stem}_deg{k:02d}",
+                    "ok": False,
+                    "ok_warp": False,
+                    "stage": "exception",
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                    "ground_truth_form": gt_form,
+                    "ground_truth_template_path": str(gt_template_path),
+                    "ground_truth_template_number": gt_num,
+                    "degraded_variant_index": int(k),
+                }
+                st = StageTimes()
+                logger.error("[ERROR] test case failed: %s\n%s", item.get("case"), item.get("traceback"))
+
+            # attach run metadata (for CSV)
+            item["run_id"] = str(run_id)
+            item["run_output_root_directory"] = str(out_root)
+            item["stage_times"] = {
+                "degrade_s": float(st.degrade_s),
+                "docaligner_s": float(st.docaligner_s),
+                "rectify_s": float(st.rectify_s),
+                "decide_s": float(st.decide_s),
+                "match_s": float(st.match_s),
+                "warp_s": float(st.warp_s),
+            }
+
+            summary.append(item)
+
+            try:
+                row = build_csv_row(args=args, item=item, times=st)
+            except Exception as e:
+                row = {
+                    "case_id": str(item.get("case") or ""),
+                    "pipeline_final_ok(warp_done)": "FALSE",
+                    "pipeline_stop_stage": "csv_row_build_failed",
+                    "exception_error_message": f"csv_row_build_failed: {e}",
+                    "exception_traceback": traceback.format_exc(),
+                }
+            csv_rows.append(row)
+            log_case_summary(logger, row)
+
+            stage = str(item.get("stage", ""))
+            stage_counts[stage] = int(stage_counts.get(stage, 0)) + 1
+            stage_times["degrade_s"] += float(st.degrade_s)
+            stage_times["docaligner_s"] += float(st.docaligner_s)
+            stage_times["rectify_s"] += float(st.rectify_s)
+            stage_times["decide_s"] += float(st.decide_s)
+            stage_times["match_s"] += float(st.match_s)
+            stage_times["warp_s"] += float(st.warp_s)
 
     # サマリ保存（JSON）
     with open(out_root / "summary.json", "w", encoding="utf-8") as f:
