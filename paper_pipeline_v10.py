@@ -17,8 +17,8 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v10.py
 特に以下を重視：
 
 - 解像度差に強い処理（polygon margin の比率化）
-- 大量処理時に原因追跡しやすいログ/サマリ（logging + stage集計 + 所要時間）
 - 検出率向上（マーカー/QR の前処理オプション）
+- 改悪の現実寄せ（紙がしなっているような歪み / 撮影時の影の混入）
 - 高速化（テンプレ特徴キャッシュ。※グローバル特徴での候補絞り込みは互換用だが現在は無効）
 - 安定性（Unknown 判定、逆ホモグラフィの信頼度チェック）
 
@@ -32,6 +32,7 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v10.py
 処理フロー（1 case = 1 枚の入力から生成した 1 枚の改悪画像）:
 
 1) 改悪生成（`APA/test_recovery_paper.py` の実装を流用）
+   - v10.5: 紙のしなり（非線形ワープ）と、撮影時の影（照明ムラ）を追加
 2) DocAligner により紙領域 polygon（4点）を推定
    - 失敗したら `stage=docaligner_failed` で終了
 3) polygon を（紙サイズ比の margin で）外側に拡張 → 透視補正（rectify）
@@ -157,10 +158,52 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
         "min_abs_rot_deg": 0.0,  # 最小回転量（0なら小さな回転も許可）
         "rotation_mode": "uniform",  # 回転角の出し方（"uniform" または "snap"）
         "snap_step_deg": 90.0,  # rotation_mode="snap" の場合の角度刻み
-        "perspective_jitter": 0.08,  # 射影ゆがみ量（大きいほど難しい）
-        "min_visible_area_ratio": 0.25,  # 生成画像でテンプレが見えている最小比率
+        # 歪みが強すぎるとのフィードバックがあったため弱めに調整
+        "perspective_jitter": 0.04,  # 射影ゆがみ量（大きいほど難しい）
+        "min_visible_area_ratio": 0.35,  # 生成画像でテンプレが見えている最小比率（欠けを減らす）
         "max_attempts": 50,  # 改悪生成の最大試行回数
         "seed": 45,  # 乱数シード（再現性）
+
+        # v10.5: 紙がしなっているような歪み（非線形ワープ）
+        # 目的:
+        #   - 撮影で起きる「紙のたわみ」により、単純な射影変換だけでは表現できない歪みを追加する。
+        #   - ただし難しすぎると全滅するため、弱め〜中程度をデフォルトとする。
+        "bend": {
+            "enable": True,
+            "prob": 0.60,  # この確率でしなりを入れる（0..1）
+            "amplitude_ratio": 0.008,  # 画面短辺に対する振幅比（例: 0.008 -> 1800pxなら約14px）
+            "amplitude_min_px": 3.0,
+            "amplitude_max_px": 22.0,
+            "freq_choices": [1, 2],  # 波の周期数
+        },
+
+        # v10.5: 撮影時の影（照明ムラ）の混入
+        # 目的:
+        #   - 斜め方向の影/周辺減光を軽く入れて、現実の撮影に近づける。
+        "shadow": {
+            "enable": True,
+            "prob": 0.90,  # この確率で影を入れる（0..1）
+            # 影の強さ（0..1）: 強すぎると「汚れ」に見えるので弱めに調整
+            "strength_min": 0.10,
+            "strength_max": 0.30,
+            # 光が当たっている感じ（明るい側）
+            "highlight_min": 0.06,
+            "highlight_max": 0.16,
+            # 影マスク平滑化 sigma（大きいほど滑らか）
+            "blur_sigma_min": 25.0,
+            "blur_sigma_max": 80.0,
+            # 周辺減光の強さ（0..1）
+            "vignette_strength": 0.25,
+            # bend と連動した薄い帯（折れ陰影）
+            "band_strength": 0.05,
+            # 紙境界を馴染ませるためのソフトマスクぼかし
+            "edge_blur_sigma": 6.0,
+        },
+
+        # NOTE:
+        # `warp_template_to_random_view()` 側でも軽い blur/noise を入れている。
+        # v10.5 では「紙のしなり」「影」を主目的として追加し、
+        # post の追加劣化は行わない（過度な難化・二重劣化を避ける）。
     },
 
     # WeChat QRモデル
@@ -171,7 +214,7 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
     # XFeat（テンプレマッチング）
     "xfeat": {
         "device_default": "cpu",  # 既定の実行デバイス（auto/cpu/cuda のうち default に使う）
-        "top_k": 1024,  # 特徴点数（大きいほど高精度だが遅い）
+        "top_k": 2048,  # 特徴点数（大きいほど高精度だが遅い）
         "match_max_side_px": 1200,  # マッチング前にリサイズする最大辺(px)
     },
 
@@ -198,7 +241,7 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
         "rectified_max_side_px": 2400,  # 透視補正後の紙画像の最大辺(px)
         "pad_px": 100,  # DocAligner入力前に周囲へ足すパディング(px)
         "polygon_margin": {
-            "ratio": 0.03,  # polygonを外側に広げる比率（紙の長辺に対する割合）
+            "ratio": 0.1,  # polygonを外側に広げる比率（紙の長辺に対する割合）
             "min_px": 10.0,  # ratio計算の下限(px)
             "max_px": 200.0,  # ratio計算の上限(px)（0以下なら無制限）
             "fixed_px": 0.0,  # 固定pxマージン（>0の場合 ratio を上書き）
@@ -310,7 +353,7 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
 
     # warp 許可条件（テンプレ座標へのワープを行うための条件）
     "warp": {
-        "min_inliers": 10,  # warpを許可する最小inlier数
+        "min_inliers": 100,  # warpを許可する最小inlier数
         "min_inlier_ratio": 0.15,  # warpを許可する最小inlier_ratio
         "max_h_cond": 1e6,  # Homographyの条件数上限（大きいと不安定）
     },
@@ -394,6 +437,299 @@ def write_image(
         return bool(cv2.imwrite(str(path), image_bgr))
     except Exception:
         return False
+
+
+# ------------------------------------------------------------
+# 追加の改悪（v10.5）: 紙のしなり / 影（照明ムラ）
+# ------------------------------------------------------------
+
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return float(max(lo, min(hi, v)))
+
+
+def maybe_apply_bend(
+    image_bgr: np.ndarray,
+    rng: random.Random,
+    cfg: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """紙のしなり（非線形ワープ）を軽く入れる。
+
+    実装方針:
+      - 画像全体を「サイン波の変位場」で remap する
+      - 射影変換では表現できない「たわみ」を擬似的に作る
+
+    注意:
+      - ここは *改悪生成専用* のため、物理的正確さより「それっぽさ」を優先
+      - 破綻しやすいので振幅を小さめに制限
+    """
+
+    if image_bgr is None:
+        return image_bgr, {"applied": False, "reason": "image_is_none"}
+
+    enable = bool(cfg.get("enable", True))
+    prob = float(cfg.get("prob", 1.0))
+    if (not enable) or (prob <= 0.0) or (rng.random() > prob):
+        return image_bgr, {"applied": False, "enable": enable, "prob": prob}
+
+    h, w = image_bgr.shape[:2]
+    if h < 16 or w < 16:
+        return image_bgr, {"applied": False, "reason": "too_small", "h": h, "w": w}
+
+    amp_ratio = float(cfg.get("amplitude_ratio", 0.0) or 0.0)
+    amp_min = float(cfg.get("amplitude_min_px", 0.0) or 0.0)
+    amp_max = float(cfg.get("amplitude_max_px", 1e9) or 1e9)
+    amp = float(min(h, w)) * amp_ratio
+    amp = _clamp(amp, amp_min, amp_max)
+
+    freq_choices = cfg.get("freq_choices") or [1, 2]
+    try:
+        freq_choices = [int(x) for x in list(freq_choices) if int(x) >= 1]
+    except Exception:
+        freq_choices = [1, 2]
+    freq = int(rng.choice(freq_choices)) if freq_choices else 1
+
+    # 曲げ方向をランダムに選ぶ
+    mode = str(cfg.get("mode") or "auto")
+    if mode == "auto":
+        mode = rng.choice(["x_to_y", "y_to_x"])  # xに応じてyが揺れる / yに応じてxが揺れる
+    if mode not in ("x_to_y", "y_to_x"):
+        mode = "x_to_y"
+
+    phase = rng.uniform(0.0, 2.0 * math.pi)
+
+    # remap 用の座標場
+    xs = np.arange(w, dtype=np.float32)
+    ys = np.arange(h, dtype=np.float32)
+    map_x, map_y = np.meshgrid(xs, ys)
+
+    if mode == "x_to_y":
+        # x方向にサイン波 → yに変位
+        disp = amp * np.sin((2.0 * math.pi * float(freq) * map_x / float(max(1, w))) + phase)
+        map_y = map_y + disp.astype(np.float32)
+    else:
+        # y方向にサイン波 → xに変位
+        disp = amp * np.sin((2.0 * math.pi * float(freq) * map_y / float(max(1, h))) + phase)
+        map_x = map_x + disp.astype(np.float32)
+
+    warped = cv2.remap(
+        image_bgr,
+        map_x.astype(np.float32),
+        map_y.astype(np.float32),
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+    meta = {
+        "applied": True,
+        "prob": prob,
+        "mode": mode,
+        "amplitude_px": float(amp),
+        "freq": int(freq),
+        "phase_rad": float(phase),
+    }
+    return warped, meta
+
+
+def maybe_apply_bend_with_mask(
+    image_bgr: np.ndarray,
+    mask_u8: Optional[np.ndarray],
+    rng: random.Random,
+    cfg: dict[str, Any],
+) -> tuple[np.ndarray, Optional[np.ndarray], dict[str, Any]]:
+    """bend を画像とマスクに同一の変位場で適用する。
+
+    目的:
+      - bend（非線形歪み）と、紙領域マスクの整合性を保つ
+      - 後段の shadow/light を "紙の上だけ" に適用しやすくする
+    """
+
+    img2, meta = maybe_apply_bend(image_bgr, rng=rng, cfg=cfg)
+    if not meta.get("applied"):
+        return img2, mask_u8, meta
+
+    if mask_u8 is None:
+        return img2, None, meta
+
+    # maybe_apply_bend と同じ変位場を再現する必要があるため、
+    # meta のパラメータから map を再生成して remap する。
+    try:
+        h, w = image_bgr.shape[:2]
+        mode = str(meta.get("mode") or "x_to_y")
+        amp = float(meta.get("amplitude_px") or 0.0)
+        freq = int(meta.get("freq") or 1)
+        phase = float(meta.get("phase_rad") or 0.0)
+
+        xs = np.arange(w, dtype=np.float32)
+        ys = np.arange(h, dtype=np.float32)
+        map_x, map_y = np.meshgrid(xs, ys)
+
+        if mode == "x_to_y":
+            disp = amp * np.sin((2.0 * math.pi * float(freq) * map_x / float(max(1, w))) + phase)
+            map_y = map_y + disp.astype(np.float32)
+        else:
+            disp = amp * np.sin((2.0 * math.pi * float(freq) * map_y / float(max(1, h))) + phase)
+            map_x = map_x + disp.astype(np.float32)
+
+        m = mask_u8
+        if m.ndim == 3:
+            m = cv2.cvtColor(m, cv2.COLOR_BGR2GRAY)
+        m2 = cv2.remap(
+            m,
+            map_x.astype(np.float32),
+            map_y.astype(np.float32),
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        m2 = np.clip(m2, 0, 255).astype(np.uint8)
+        return img2, m2, meta
+    except Exception as e:
+        meta["mask_warp_error"] = str(e)
+        return img2, mask_u8, meta
+
+
+def maybe_apply_shadow(
+    image_bgr: np.ndarray,
+    rng: random.Random,
+    cfg: dict[str, Any],
+    *,
+    paper_mask_u8: Optional[np.ndarray] = None,
+    bend_meta: Optional[dict[str, Any]] = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """影/光（紙に対して自然なライティング）を入れる。
+
+    改善点（今回のユーザー指摘に対応）:
+      - 画像全体ではなく「紙領域だけ」に適用する
+      - 境界はソフトマスク（ぼかし）で馴染ませる
+      - 影だけでなくハイライト（明るい側）も入れて“光が当たっている”感じを作る
+      - bend のパラメータと弱く連動した「帯状の陰影」を薄く入れる（折れ/たわみの表現）
+    """
+
+    if image_bgr is None:
+        return image_bgr, {"applied": False, "reason": "image_is_none"}
+
+    enable = bool(cfg.get("enable", True))
+    prob = float(cfg.get("prob", 1.0))
+    if (not enable) or (prob <= 0.0) or (rng.random() > prob):
+        return image_bgr, {"applied": False, "enable": enable, "prob": prob}
+
+    h, w = image_bgr.shape[:2]
+    if h < 16 or w < 16:
+        return image_bgr, {"applied": False, "reason": "too_small", "h": h, "w": w}
+
+    strength_min = float(cfg.get("strength_min", 0.0) or 0.0)
+    strength_max = float(cfg.get("strength_max", 0.0) or 0.0)
+    strength = rng.uniform(strength_min, strength_max) if strength_max >= strength_min else float(strength_min)
+
+    # ハイライト（明るい側）の強さ（0..1）
+    highlight_min = float(cfg.get("highlight_min", 0.0) or 0.0)
+    highlight_max = float(cfg.get("highlight_max", 0.0) or 0.0)
+    highlight = rng.uniform(highlight_min, highlight_max) if highlight_max >= highlight_min else float(highlight_min)
+
+    vignette_strength = float(cfg.get("vignette_strength", 0.0) or 0.0)
+
+    blur_sigma_min = float(cfg.get("blur_sigma_min", 0.0) or 0.0)
+    blur_sigma_max = float(cfg.get("blur_sigma_max", 0.0) or 0.0)
+    blur_sigma = rng.uniform(blur_sigma_min, blur_sigma_max) if blur_sigma_max >= blur_sigma_min else float(blur_sigma_min)
+
+    # 斜め影の方向
+    angle_deg = rng.uniform(0.0, 360.0)
+    ang = math.radians(angle_deg)
+    dx = math.cos(ang)
+    dy = math.sin(ang)
+
+    # 正規化座標 [-1..1]
+    xs = (np.linspace(-1.0, 1.0, w, dtype=np.float32))[None, :]
+    ys = (np.linspace(-1.0, 1.0, h, dtype=np.float32))[:, None]
+
+    # 影/光グラデ（0..1）: 方向ベクトルに投影して正規化
+    t = (dx * xs) + (dy * ys)  # [-sqrt(2)..sqrt(2)]
+    t01 = (t - float(t.min())) / float(max(1e-6, (t.max() - t.min())))
+
+    # 暗い側（shadow）と明るい側（highlight）を同時に作る
+    # - t01 が 1 に近い側を暗く、0 に近い側を明るく
+    light = 1.0 - (float(strength) * t01) + (float(highlight) * (1.0 - t01))
+
+    # 周辺減光（中心=1、端=1-v）
+    if vignette_strength > 0:
+        rr = np.sqrt(xs**2 + ys**2) / 1.41421356  # 0..1
+        vig = 1.0 - float(vignette_strength) * (rr**2)
+        light = light * vig
+
+    # bend と弱く連動する帯（折れ陰影）: sin/cos を使って薄い縞を入れる
+    band_strength = float(cfg.get("band_strength", 0.0) or 0.0)
+    if band_strength > 0 and bend_meta and bool(bend_meta.get("applied")):
+        try:
+            mode_b = str(bend_meta.get("mode") or "x_to_y")
+            freq_b = int(bend_meta.get("freq") or 1)
+            phase_b = float(bend_meta.get("phase_rad") or 0.0)
+            if mode_b == "x_to_y":
+                # x方向に帯
+                band = np.cos((2.0 * math.pi * float(freq_b) * xs) + phase_b)
+                band = np.repeat(band, h, axis=0)
+            else:
+                band = np.cos((2.0 * math.pi * float(freq_b) * ys) + phase_b)
+                band = np.repeat(band, w, axis=1)
+            # cos in [-1..1] -> [0.8..1.2] くらいの弱い変調
+            light = light * (1.0 + float(band_strength) * band)
+        except Exception:
+            pass
+
+    # 強い影/ハイライトを許容しつつ、破綻を避けるための安全クリップ
+    light = np.clip(light, 0.12, 1.55).astype(np.float32)
+
+    # 滑らかにする
+    if blur_sigma > 0.1:
+        # ksize=(0,0) を指定すると sigma から適切なカーネルサイズを OpenCV が選ぶ
+        light = cv2.GaussianBlur(light, (0, 0), sigmaX=float(blur_sigma), sigmaY=float(blur_sigma))
+
+    # 紙マスクが無ければ従来通り「全体に乗算」だが、基本は紙だけに適用
+    if paper_mask_u8 is None:
+        out = image_bgr.astype(np.float32) * light[:, :, None]
+        out = np.clip(out, 0, 255).astype(np.uint8)
+        meta = {
+            "applied": True,
+            "prob": prob,
+            "strength": float(strength),
+            "highlight": float(highlight),
+            "angle_deg": float(angle_deg),
+            "blur_sigma": float(blur_sigma),
+            "vignette_strength": float(vignette_strength),
+            "band_strength": float(band_strength),
+            "mask_mode": "none_full_image",
+        }
+        return out, meta
+
+    # mask を 0..1 の alpha にして、境界をぼかして自然に馴染ませる
+    pm = paper_mask_u8
+    if pm.ndim == 3:
+        pm = cv2.cvtColor(pm, cv2.COLOR_BGR2GRAY)
+    pm_f = pm.astype(np.float32) / 255.0
+    edge_blur_sigma = float(cfg.get("edge_blur_sigma", 6.0) or 6.0)
+    if edge_blur_sigma > 0.1:
+        pm_f = cv2.GaussianBlur(pm_f, (0, 0), sigmaX=edge_blur_sigma, sigmaY=edge_blur_sigma)
+    pm_f = np.clip(pm_f, 0.0, 1.0)
+
+    # 紙領域のみライティング適用（背景はそのまま）
+    img_f = image_bgr.astype(np.float32)
+    lit = img_f * light[:, :, None]
+    out = (img_f * (1.0 - pm_f[:, :, None])) + (lit * pm_f[:, :, None])
+    out = np.clip(out, 0, 255).astype(np.uint8)
+
+    meta = {
+        "applied": True,
+        "prob": prob,
+        "strength": float(strength),
+        "highlight": float(highlight),
+        "angle_deg": float(angle_deg),
+        "blur_sigma": float(blur_sigma),
+        "vignette_strength": float(vignette_strength),
+        "band_strength": float(band_strength),
+        "edge_blur_sigma": float(edge_blur_sigma),
+        "mask_mode": "paper_only",
+    }
+    return out, meta
 
 
 # ------------------------------------------------------------
@@ -3313,6 +3649,75 @@ def process_one_case(
         min_visible_area_ratio=float(args.min_visible_area_ratio),
         max_attempts=int(args.max_attempts),
     )
+
+    # v10.5: 追加改悪（紙のしなり / 影）
+    # NOTE:
+    # ここで追加処理を実画像に適用しないと、PIPELINE_DEFAULTS に設定を足しただけでは
+    # 出力が何も変わらない。
+    try:
+        deg_cfg = (PIPELINE_DEFAULTS.get("degrade") or {})
+        bend_cfg = (deg_cfg.get("bend") or {}) if isinstance(deg_cfg, dict) else {}
+        shadow_cfg = (deg_cfg.get("shadow") or {}) if isinstance(deg_cfg, dict) else {}
+
+        # まず「紙領域マスク」を作る（src->degraded のホモグラフィから）
+        # - 影/光を "紙の上だけ" に適用するため
+        # - bend を入れる場合はマスクにも同じワープを掛けて整合させる
+        paper_mask_u8: Optional[np.ndarray] = None
+        try:
+            Hm = np.asarray(H_src_to_deg, dtype=np.float64)
+            sh, sw = src_bgr.shape[:2]
+            mask_src = np.full((int(sh), int(sw)), 255, dtype=np.uint8)
+            if Hm.shape == (3, 3):
+                paper_mask_u8 = cv2.warpPerspective(
+                    mask_src,
+                    Hm,
+                    (int(degraded_bgr.shape[1]), int(degraded_bgr.shape[0])),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+            elif Hm.shape == (2, 3):
+                paper_mask_u8 = cv2.warpAffine(
+                    mask_src,
+                    Hm,
+                    (int(degraded_bgr.shape[1]), int(degraded_bgr.shape[0])),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+            else:
+                paper_mask_u8 = None
+        except Exception:
+            paper_mask_u8 = None
+
+        # bend は（画像＋マスク）へ同一変位場で適用
+        degraded_bgr, paper_mask_u8, bend_meta = maybe_apply_bend_with_mask(
+            degraded_bgr,
+            paper_mask_u8,
+            rng=rng,
+            cfg=dict(bend_cfg),
+        )
+
+        # shadow/light は紙領域だけに適用し、境界をソフトに馴染ませる
+        degraded_bgr, shadow_meta = maybe_apply_shadow(
+            degraded_bgr,
+            rng=rng,
+            cfg=dict(shadow_cfg),
+            paper_mask_u8=paper_mask_u8,
+            bend_meta=bend_meta,
+        )
+
+        # meta に記録（CSVにも出る）
+        if isinstance(degrade_meta, dict):
+            degrade_meta["bend"] = bend_meta
+            degrade_meta["shadow"] = shadow_meta
+            degrade_meta["extra_degrade_v10_5"] = True
+    except Exception as e:
+        # 改悪付加で落ちてもパイプライン全体は止めない
+        if isinstance(degrade_meta, dict):
+            degrade_meta.setdefault("extra_degrade_v10_5", False)
+            degrade_meta["extra_degrade_error"] = str(e)
+
     times.degrade_s = time.perf_counter() - t0
     out_degraded = out_dirs["degraded"] / f"{case_id}.jpg"
     _schedule_image("output_degraded_image_path", out_degraded, degraded_bgr)
@@ -3610,11 +4015,14 @@ def process_one_case(
         item["case_total_s"] = float(time.perf_counter() - case_t0)
         return item, times
 
-    warped = cv2.warpPerspective(chosen, H_img_to_tpl, (tpl_bgr.shape[1], tpl_bgr.shape[0]))
+    # Homography でテンプレ座標へ warp（従来どおり）
+    warped_final = cv2.warpPerspective(chosen, H_img_to_tpl, (tpl_bgr.shape[1], tpl_bgr.shape[0]))
+
+    # 最終の aligned を保存
     out_aligned = out_dirs["aligned"] / f"{case_id}_aligned.jpg"
-    _schedule_image("output_aligned_image_path", out_aligned, warped)
+    _schedule_image("output_aligned_image_path", out_aligned, warped_final)
     try:
-        ha, wa = warped.shape[:2]
+        ha, wa = warped_final.shape[:2]
         item["aligned_w"] = int(wa)
         item["aligned_h"] = int(ha)
     except Exception:
@@ -3972,9 +4380,9 @@ def process_one_observed_case(
         item["case_total_s"] = float(time.perf_counter() - case_t0)
         return item, times
 
-    warped = cv2.warpPerspective(chosen, H_img_to_tpl, (tpl_bgr.shape[1], tpl_bgr.shape[0]))
+    warped_final = cv2.warpPerspective(chosen, H_img_to_tpl, (tpl_bgr.shape[1], tpl_bgr.shape[0]))
     out_aligned = out_dirs["aligned"] / f"{case_id}_aligned.jpg"
-    _schedule_image("output_aligned_image_path", out_aligned, warped)
+    _schedule_image("output_aligned_image_path", out_aligned, warped_final)
     times.warp_s = time.perf_counter() - t0
     item["ok_warp"] = True
 
