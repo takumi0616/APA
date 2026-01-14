@@ -19,21 +19,10 @@
 改善1
 ```
 現在、改善処理の中で1つ対応していないものがあり、それは光や影を書類から取り除き、書類の白い部分は均一な白になってほしいです
-「7)Homography でテンプレ座標へ warp」の処理の後に8)として行うようにして、その処理後のものを最終成果物としてください
-remove_shadows_and_normalizeを適切に実装してください
-
+「5) UVDoc による成形（しわ/湾曲の補正）」の処理の後に6)として行うようにして実装してください
+背景除算法（Background Division Method）
 OpenCV (Background Division)
-# Homography でテンプレ座標へ warp（従来どおり）
-warped_raw = cv2.warpPerspective(chosen_for_match, H_img_to_tpl, (tpl_bgr.shape[1], tpl_bgr.shape[0]))
-
-# 【追加】影除去・白レベル正規化を実行
-# warp処理自体はピクセル補間でわずかにボケるため、その後にかけるときれいに仕上がる
-warped_final = remove_shadows_and_normalize(warped_raw)
-
-# 最終の aligned を保存（計測対象）
-out_aligned = out_dirs["aligned"] / f"{case_id}_aligned.jpg"
 ```
-
 
 プログラムを改善してください
 
