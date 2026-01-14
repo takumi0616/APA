@@ -726,13 +726,14 @@ class XFeatMatcher:
                 mkpts1,
             )
 
+        # 高精度優先（時間は増えるが収束率/安定性を上げる）
         H, mask = cv2.findHomography(
             mkpts0,
             mkpts1,
             cv2.USAC_MAGSAC,
-            3.5,
-            maxIters=1_000,
-            confidence=0.999,
+            3.0,
+            maxIters=5_000,
+            confidence=0.9999,
         )
 
         if H is None or mask is None:
