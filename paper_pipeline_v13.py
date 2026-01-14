@@ -60,10 +60,13 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v13.py
 5) UVDoc による成形（しわ/湾曲の補正）
    - https://github.com/tanguymagne/UVDoc
    - 4) で確定した回転後画像を UVDoc で unwarp し、より平坦な紙画像を得る
-6) XFeat matching によるテンプレ照合
+6) 背景除算法（Background Division Method）による照明ムラ/影の除去（新規）
+   - OpenCV の background division（divide）を用いて、影・周辺減光などを軽減する
+   - 目的: 書類の白地ができるだけ均一な白に近づくよう補正し、後段の特徴点マッチングを安定化させる
+7) XFeat matching によるテンプレ照合
    - テンプレは `APA/image/A` または `APA/image/B`（`1.jpg`〜`6.jpg`）
    - フォームAなら `APA/image/A` の全テンプレ、フォームBなら `APA/image/B` の全テンプレに対して局所特徴（XFeat）で照合する。
-7) Homography を信頼度チェックの上で逆行列化し、テンプレ座標へ warp
+8) Homography を信頼度チェックの上で逆行列化し、テンプレ座標へ warp
    - 不安定なら `stage=homography_unstable` で終了
 
 出力
@@ -75,8 +78,9 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v13.py
 - `3_rectified/`      : 透視補正した紙画像
 - `4_rectified_rot/`  : フォーム確定に使った回転後画像（根拠も描画）
 - `5_uvdoc_unwarp/`   : UVDoc による成形（unwarp）後の紙画像
-- `6_debug_matches/`  : best template のマッチ可視化
-- `7_aligned/`        : best template にワープした結果
+- `6_bgdiv/`          : 背景除算法（Background Division）後の画像
+- `7_debug_matches/`  : best template のマッチ可視化
+- `8_aligned/`        : best template にワープした結果
 - `summary.json` / `summary.csv`
 - `run.log`           : 実行ログ（logging）
 
@@ -88,7 +92,9 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v13.py
 
 ディレクトリ自体は作られるが、`fail/none` の場合は中身が空になることがある。
 
-※ v13.7: `--save-images` の設定に関わらず、`7_aligned/` は成果物として必ず保存される。
+※ v13.7: `--save-images` の設定に関わらず、`7_aligned/` は成果物として必ず保存される（※v13.8 で `8_aligned/` に移動）。
+※ v13.8: 背景除算法（stage6）を追加したため、成果物は `8_aligned/` に移動。
+   `--save-images` の設定に関わらず、`8_aligned/` は成果物として必ず保存される。
 
 注意
 ----
@@ -105,16 +111,23 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v13.py
 改善点メモ
 ----
 
-v13.7（本タスク）
+v13.8（本タスク）
 ----------------
 - 改悪生成（degrade）は **最初に全ケース分をまとめて生成**し、その所要時間は計測対象外とする。
   - 生成した改悪画像を 1 枚ずつパイプライン本体へ投入する。
 - 時間計測（case_total / stage_time / run_elapsed）は「本処理」のみを対象とし、
   以下は **計測対象外** とする。
-  - 途中画像保存（1_degraded/〜6_debug_matches/）
-  - `6_debug_matches/` のマッチ可視化生成
+  - 途中画像保存（1_degraded/〜7_debug_matches/）
+  - `7_debug_matches/` のマッチ可視化生成
   - `summary.json` / `summary.csv` の書き出し
-- 計測に含める画像保存は **`7_aligned/` の保存だけ** とする。
+- 計測に含める画像保存は **`8_aligned/` の保存だけ** とする。
+v13.8.1
+------
+- v13.8 の stage6（背景除算法）を **test dataset（image/test）側の処理にも適用**する。
+
+- stage6 の出力解像度（bgdiv_w/bgdiv_h）も item に保存して CSV に反映する。
+ 
+- 追加: UVDoc の後に **背景除算法（Background Division Method）** を stage6 として挿入する。
 
 """
 
@@ -363,6 +376,24 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
         "ckpt_path": str(_UVDOCDIR / "model" / "best_model.pkl"),
     },
 
+    # 背景除算法（Background Division Method）
+    # 目的:
+    #   - 影/照明ムラ/周辺減光を軽減し、紙の白地をできるだけ均一にする
+    #   - XFeat のマッチングを安定化させる
+    # 実装:
+    #   - LAB 色空間の L（明度）に対して大きめの GaussianBlur をかけて背景を推定
+    #   - cv2.divide(L, bg, scale=255) で背景除算
+    #   - a/b（色成分）は保持し、L のみを補正して BGR に戻す
+    "background_division": {
+        "enable": True,
+        # sigma = max(h,w) * sigma_ratio
+        "sigma_ratio": 0.02,
+        "sigma_min": 15.0,
+        "sigma_max": 80.0,
+        # bg が極端に小さいと divide が発散するため、下限を設ける
+        "bg_min": 8.0,
+    },
+
     # XFeat（テンプレマッチング）
     "xfeat": {
         "device_default": "cpu",  # 既定の実行デバイス（auto/cpu/cuda のうち default に使う）
@@ -371,7 +402,7 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
         # - match_max_side_px を増やすと細部が残り、マッチング精度が上がりやすい
         #   （ただしメモリ/時間コストが増える）
         "top_k": 1024,
-        "match_max_side_px": 1200,
+        "match_max_side_px": 1024,
     },
 
     # フォーム判定（回転スキャン）
@@ -395,7 +426,7 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
         "model": "fastvit_sa24",  # DocAlignerのモデル名
         "type": "heatmap",  # 推論タイプ（"point" / "heatmap"）
         # 透視補正後の紙画像が小さすぎると、マーカー/QRの判定や UVDoc の精度が落ちる。
-        "rectified_max_side_px": 1024,
+        "rectified_max_side_px": 2048,
         "pad_px": 100,  # DocAligner入力前に周囲へ足すパディング(px)
         "polygon_margin": {
             "ratio": 0.1,  # polygonを外側に広げる比率（紙の長辺に対する割合）
@@ -502,7 +533,7 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
 
     # 可視化（デバッグ画像）
     "visual": {
-        "polygon_line_thickness": 6,  # polygon枠線の太さ
+        "polygon_line_thickness": 4,  # polygon枠線の太さ
         "polygon_point_radius": 10,  # 角点の半径
         "polygon_label_font_scale": 1.0,  # 角ラベル（TL/TR...）のフォント倍率
         "polygon_label_thickness": 2,  # 角ラベルの太さ
@@ -526,11 +557,6 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
         # 取りこぼし（特に test_A_6 など）を減らすため、既定を少し緩める。
         # ただし、cond/det チェックは残るため破綻ケースは弾かれる。
         "min_inliers": 70,  # warpを許可する最小inlier数
-        # 高精度優先:
-        # XFeat + LightGlue では matches が多くなりやすく、
-        # 「inliers は十分あるが inlier_ratio だけ低い」ケースが起きうる。
-        # その場合でも det/cond チェックで破綻はある程度弾けるため、
-        # ratio の下限は少し緩め、warp 到達率（=KPI）を上げる。
         "min_inlier_ratio": 0.07,  # warpを許可する最小inlier_ratio
         "max_h_cond": 1e6,  # Homographyの条件数上限（大きいと不安定）
     },
@@ -614,6 +640,63 @@ def write_image(
         return bool(cv2.imwrite(str(path), image_bgr))
     except Exception:
         return False
+
+
+# ------------------------------------------------------------
+# 背景除算法（Background Division Method）
+# ------------------------------------------------------------
+
+
+def apply_background_division(image_bgr: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+    """背景除算法（Background Division Method）で照明ムラ/影を軽減する。
+
+    実装:
+      - LAB に変換し、L（明度）だけを補正する
+      - L の大きいガウシアンぼかしで背景（低周波）を推定
+      - cv2.divide(L, bg, scale=255) で背景除算
+
+    期待効果:
+      - 紙の白地が均一になりやすい
+      - 後段の XFeat マッチングが安定しやすい
+    """
+
+    cfg = dict((PIPELINE_DEFAULTS.get("background_division") or {}))
+    if not bool(cfg.get("enable", True)):
+        return image_bgr, {"applied": False, "reason": "disabled"}
+
+    if image_bgr is None:
+        return image_bgr, {"applied": False, "reason": "image_is_none"}
+
+    h, w = image_bgr.shape[:2]
+    if h < 16 or w < 16:
+        return image_bgr, {"applied": False, "reason": "too_small", "h": h, "w": w}
+
+    sigma_ratio = float(cfg.get("sigma_ratio", 0.02) or 0.02)
+    sigma_min = float(cfg.get("sigma_min", 15.0) or 15.0)
+    sigma_max = float(cfg.get("sigma_max", 80.0) or 80.0)
+    bg_min = float(cfg.get("bg_min", 8.0) or 8.0)
+
+    sigma = float(max(h, w)) * sigma_ratio
+    sigma = _clamp(sigma, sigma_min, sigma_max)
+
+    try:
+        lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+        L, A, B = cv2.split(lab)
+
+        # 背景（低周波）推定
+        bg = cv2.GaussianBlur(L, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        bg = np.maximum(bg.astype(np.float32), bg_min)
+
+        # 背景除算（白地を均一化）
+        L_corr = cv2.divide(L.astype(np.float32), bg, scale=255.0)
+        L_corr = np.clip(L_corr, 0, 255).astype(np.uint8)
+
+        lab2 = cv2.merge([L_corr, A, B])
+        out = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+        return out, {"applied": True, "sigma": float(sigma), "bg_min": float(bg_min)}
+    except Exception as e:
+        # 失敗しても処理は継続（補正なしで返す）
+        return image_bgr, {"applied": False, "reason": f"exception:{e}"}
 
 
 # ------------------------------------------------------------
@@ -3100,8 +3183,9 @@ def build_csv_row(
         "elapsed_time_stage_3_rectify_seconds": f"{times.rectify_s:.6f}",
         "elapsed_time_stage_4_form_decision_seconds": f"{times.decide_s:.6f}",
         "elapsed_time_stage_5_uvdoc_unwarp_seconds": f"{times.uvdoc_s:.6f}",
-        "elapsed_time_stage_6_xfeat_matching_seconds": f"{times.match_s:.6f}",
-        "elapsed_time_stage_7_warp_seconds": f"{times.warp_s:.6f}",
+        "elapsed_time_stage_6_background_division_seconds": f"{times.bgdiv_s:.6f}",
+        "elapsed_time_stage_7_xfeat_matching_seconds": f"{times.match_s:.6f}",
+        "elapsed_time_stage_8_warp_seconds": f"{times.warp_s:.6f}",
 
         # ---- 実行メタ情報（フルパスなし） ----
         "run_id": str(item.get("run_id") or ""),
@@ -3114,6 +3198,7 @@ def build_csv_row(
         "output_rectified_image_filename": _filename_only(item.get("output_rectified_image_path")),
         "output_rotated_decision_visualization_image_filename": _filename_only(item.get("output_rotated_decision_visualization_image_path")),
         "output_uvdoc_unwarped_image_filename": _filename_only(item.get("output_uvdoc_unwarped_image_path")),
+        "output_background_division_image_filename": _filename_only(item.get("output_background_division_image_path")),
         "output_debug_matches_image_filename": _filename_only(item.get("output_debug_matches_image_path")),
         "output_aligned_image_filename": _filename_only(item.get("output_aligned_image_path")),
 
@@ -3128,6 +3213,8 @@ def build_csv_row(
         "rectified_rotated_for_decision_image_resolution_height_px": str(item.get("chosen_h") or ""),
         "uvdoc_unwarped_image_resolution_width_px": str(item.get("uvdoc_w") or ""),
         "uvdoc_unwarped_image_resolution_height_px": str(item.get("uvdoc_h") or ""),
+        "background_division_image_resolution_width_px": str(item.get("bgdiv_w") or ""),
+        "background_division_image_resolution_height_px": str(item.get("bgdiv_h") or ""),
         "best_template_resolution_width_px": str(item.get("best_template_w") or ""),
         "best_template_resolution_height_px": str(item.get("best_template_h") or ""),
         "aligned_output_resolution_width_px": str(item.get("aligned_w") or ""),
@@ -3554,8 +3641,9 @@ def log_case_summary(logger: logging.Logger, row: dict[str, Any]) -> None:
     t3 = str(row.get("elapsed_time_stage_3_rectify_seconds") or "")
     t4 = str(row.get("elapsed_time_stage_4_form_decision_seconds") or "")
     t5 = str(row.get("elapsed_time_stage_5_uvdoc_unwarp_seconds") or "")
-    t6 = str(row.get("elapsed_time_stage_6_xfeat_matching_seconds") or "")
-    t7 = str(row.get("elapsed_time_stage_7_warp_seconds") or "")
+    t6 = str(row.get("elapsed_time_stage_6_background_division_seconds") or "")
+    t7 = str(row.get("elapsed_time_stage_7_xfeat_matching_seconds") or "")
+    t8 = str(row.get("elapsed_time_stage_8_warp_seconds") or "")
 
     # Ground truth が無い場合（例: C）は、正誤カラムは空欄にする
     truth_part = f"gt_form={gt_form} pred_form={pred_form}"
@@ -3566,7 +3654,7 @@ def log_case_summary(logger: logging.Logger, row: dict[str, Any]) -> None:
         f"[CASE] id={case_id} ok={ok} ok_warp={ok_warp} stage={stage} "
         f"unknown_reason={unknown_reason} {truth_part} "
         f"best_template={best_tpl_name} inliers={inliers} inlier_ratio={inlier_ratio} "
-        f"time_total_s={t_total} (1_degrade={t1},2_doc={t2},3_rectify={t3},4_decide={t4},5_uvdoc={t5},6_match={t6},7_warp={t7}) "
+        f"time_total_s={t_total} (1_degrade={t1},2_doc={t2},3_rectify={t3},4_decide={t4},5_uvdoc={t5},6_bgdiv={t6},7_match={t7},8_warp={t8}) "
         f"src={src}"
     )
 
@@ -3769,6 +3857,7 @@ class StageTimes:
     rectify_s: float = 0.0
     decide_s: float = 0.0
     uvdoc_s: float = 0.0
+    bgdiv_s: float = 0.0
     match_s: float = 0.0
     warp_s: float = 0.0
 
@@ -3885,7 +3974,7 @@ def process_one_case(
       - 改悪生成（degrade）は main で全件生成済みであり、ここでは行わない。
       - 時間計測は「本処理」のみ（docaligner/rectify/decide/uvdoc/match/warp）とし、
         途中画像の保存や 6_debug_matches の可視化生成は計測から除外する。
-      - 計測に含める画像保存は 7_aligned の保存のみ。
+      - 計測に含める画像保存は 8_aligned の保存のみ。
     """
 
     di = degraded_input
@@ -4152,9 +4241,23 @@ def process_one_case(
     except Exception:
         pass
 
-    chosen_for_match = chosen_unwarped
+    # 6) 背景除算法（Background Division）（計測対象：補正のみ。画像保存は計測外）
+    t0 = time.perf_counter()
+    bgdiv_bgr, bgdiv_meta = apply_background_division(chosen_unwarped)
+    times.bgdiv_s = time.perf_counter() - t0
+    item["background_division"] = bgdiv_meta
+    out_bgdiv = out_dirs["bgdiv"] / f"{case_id}_bgdiv.jpg"
+    _schedule_image("output_background_division_image_path", out_bgdiv, bgdiv_bgr)
+    try:
+        hb, wb = bgdiv_bgr.shape[:2]
+        item["bgdiv_w"] = int(wb)
+        item["bgdiv_h"] = int(hb)
+    except Exception:
+        pass
 
-    # 6) XFeat matching（計測対象：照合のみ。画像保存は計測外）
+    chosen_for_match = bgdiv_bgr
+
+    # 7) XFeat matching（計測対象：照合のみ。画像保存は計測外）
     #   ユーザー要望: "絞り込みをやめる"。
     #   フォームAなら APA/image/A の全テンプレ、フォームBなら APA/image/B の全テンプレへ
     #   局所特徴（XFeat）で照合して最良を選ぶ。
@@ -4253,7 +4356,15 @@ def process_one_case(
         item["ok"] = False
         item["ok_warp"] = False
         _finalize_images_for_stage(item["stage"])
-        item["case_total_s"] = float(times.degrade_s + times.docaligner_s + times.rectify_s + times.decide_s + times.uvdoc_s + times.match_s)
+        item["case_total_s"] = float(
+            times.degrade_s
+            + times.docaligner_s
+            + times.rectify_s
+            + times.decide_s
+            + times.uvdoc_s
+            + times.bgdiv_s
+            + times.match_s
+        )
         return item, times
 
     tpl_path = Path(str(best["template"]))
@@ -4263,7 +4374,15 @@ def process_one_case(
         item["ok"] = False
         item["ok_warp"] = False
         _finalize_images_for_stage(item["stage"])
-        item["case_total_s"] = float(times.degrade_s + times.docaligner_s + times.rectify_s + times.decide_s + times.uvdoc_s + times.match_s)
+        item["case_total_s"] = float(
+            times.degrade_s
+            + times.docaligner_s
+            + times.rectify_s
+            + times.decide_s
+            + times.uvdoc_s
+            + times.bgdiv_s
+            + times.match_s
+        )
         return item, times
 
     # Template correctness for A/B only
@@ -4285,7 +4404,7 @@ def process_one_case(
     except Exception:
         pass
 
-    # (7) 逆ホモグラフィ（逆行列）安定性 + warp + 7_aligned 保存
+    # (8) 逆ホモグラフィ（逆行列）安定性 + warp + 8_aligned 保存
     # 計測対象に含める画像保存は aligned のみ。
     t0 = time.perf_counter()
     H_tpl_to_img = np.asarray(best.get("H_ref_to_tgt"), dtype=np.float64)
@@ -4304,7 +4423,16 @@ def process_one_case(
         item["ok_warp"] = False
         _finalize_images_for_stage(item["stage"])
         times.warp_s = time.perf_counter() - t0
-        item["case_total_s"] = float(times.degrade_s + times.docaligner_s + times.rectify_s + times.decide_s + times.uvdoc_s + times.match_s + times.warp_s)
+        item["case_total_s"] = float(
+            times.degrade_s
+            + times.docaligner_s
+            + times.rectify_s
+            + times.decide_s
+            + times.uvdoc_s
+            + times.bgdiv_s
+            + times.match_s
+            + times.warp_s
+        )
         return item, times
 
     # Homography でテンプレ座標へ warp（従来どおり）
@@ -4345,7 +4473,16 @@ def process_one_case(
         item["ok"] = bool(item.get("is_predicted_form_correct")) and bool(item.get("is_predicted_best_template_correct"))
     else:
         item["ok"] = False
-    item["case_total_s"] = float(times.degrade_s + times.docaligner_s + times.rectify_s + times.decide_s + times.uvdoc_s + times.match_s + times.warp_s)
+    item["case_total_s"] = float(
+        times.degrade_s
+        + times.docaligner_s
+        + times.rectify_s
+        + times.decide_s
+        + times.uvdoc_s
+        + times.bgdiv_s
+        + times.match_s
+        + times.warp_s
+    )
 
     # done のケースでは fail モードは保存しない
     _finalize_images_for_stage(item["stage"])
@@ -4583,9 +4720,24 @@ def process_one_observed_case(
     except Exception:
         pass
 
-    chosen_for_match = chosen_unwarped
+    # 背景除算法（Background Division）
+    t0 = time.perf_counter()
+    bgdiv_bgr, bgdiv_meta = apply_background_division(chosen_unwarped)
+    times.bgdiv_s = time.perf_counter() - t0
+    item["background_division"] = bgdiv_meta
+    out_bgdiv = out_dirs["bgdiv"] / f"{case_id}_bgdiv.jpg"
+    _schedule_image("output_background_division_image_path", out_bgdiv, bgdiv_bgr)
 
-    # 6) XFeat matching
+    try:
+        hb, wb = bgdiv_bgr.shape[:2]
+        item["bgdiv_w"] = int(wb)
+        item["bgdiv_h"] = int(hb)
+    except Exception:
+        pass
+
+    chosen_for_match = bgdiv_bgr
+
+    # 7) XFeat matching
     t0 = time.perf_counter()
     templates = templates_A if decision.form == "A" else templates_B
     candidates = list(templates)
@@ -4654,7 +4806,15 @@ def process_one_observed_case(
     if best is None or not best.get("ok"):
         item["stage"] = "xfeat_failed"
         _finalize_images_for_stage(item["stage"])
-        item["case_total_s"] = float(times.degrade_s + times.docaligner_s + times.rectify_s + times.decide_s + times.uvdoc_s + times.match_s)
+        item["case_total_s"] = float(
+            times.degrade_s
+            + times.docaligner_s
+            + times.rectify_s
+            + times.decide_s
+            + times.uvdoc_s
+            + times.bgdiv_s
+            + times.match_s
+        )
         return item, times
 
     tpl_path = Path(str(best["template"]))
@@ -4662,7 +4822,15 @@ def process_one_observed_case(
     if tpl_bgr is None:
         item["stage"] = "template_read_failed"
         _finalize_images_for_stage(item["stage"])
-        item["case_total_s"] = float(times.degrade_s + times.docaligner_s + times.rectify_s + times.decide_s + times.uvdoc_s + times.match_s)
+        item["case_total_s"] = float(
+            times.degrade_s
+            + times.docaligner_s
+            + times.rectify_s
+            + times.decide_s
+            + times.uvdoc_s
+            + times.bgdiv_s
+            + times.match_s
+        )
         return item, times
 
     # test: 正解テンプレは ground_truth_template_path
@@ -4678,7 +4846,7 @@ def process_one_observed_case(
     except Exception:
         pass
 
-    # 6) Homography inversion & warp
+    # 8) Homography inversion & warp
     t0 = time.perf_counter()
     H_tpl_to_img = np.asarray(best.get("H_ref_to_tgt"), dtype=np.float64)
     ok_inv, H_img_to_tpl, inv_reason, h_cond, h_det = safe_invert_homography(
@@ -4693,7 +4861,16 @@ def process_one_observed_case(
     if not ok_inv or H_img_to_tpl is None:
         item["stage"] = "homography_unstable"
         _finalize_images_for_stage(item["stage"])
-        item["case_total_s"] = float(times.degrade_s + times.docaligner_s + times.rectify_s + times.decide_s + times.uvdoc_s + times.match_s + times.warp_s)
+        item["case_total_s"] = float(
+            times.degrade_s
+            + times.docaligner_s
+            + times.rectify_s
+            + times.decide_s
+            + times.uvdoc_s
+            + times.bgdiv_s
+            + times.match_s
+            + times.warp_s
+        )
         return item, times
 
     warped_final = cv2.warpPerspective(chosen_for_match, H_img_to_tpl, (tpl_bgr.shape[1], tpl_bgr.shape[0]))
@@ -4707,7 +4884,16 @@ def process_one_observed_case(
     # done
     item["stage"] = "done"
     item["ok"] = bool(item.get("is_predicted_form_correct")) and bool(item.get("is_predicted_best_template_correct"))
-    item["case_total_s"] = float(times.degrade_s + times.docaligner_s + times.rectify_s + times.decide_s + times.uvdoc_s + times.match_s + times.warp_s)
+    item["case_total_s"] = float(
+        times.degrade_s
+        + times.docaligner_s
+        + times.rectify_s
+        + times.decide_s
+        + times.uvdoc_s
+        + times.bgdiv_s
+        + times.match_s
+        + times.warp_s
+    )
     _finalize_images_for_stage(item["stage"])
     return item, times
 
@@ -4743,8 +4929,9 @@ def main(argv=None) -> int:
         "rect": mkdir(out_root / "3_rectified"),
         "rot": mkdir(out_root / "4_rectified_rot"),
         "uvdoc": mkdir(out_root / "5_uvdoc_unwarp"),
-        "debug_matches": mkdir(out_root / "6_debug_matches"),
-        "aligned": mkdir(out_root / "7_aligned"),
+        "bgdiv": mkdir(out_root / "6_bgdiv"),
+        "debug_matches": mkdir(out_root / "7_debug_matches"),
+        "aligned": mkdir(out_root / "8_aligned"),
     }
 
     # 重いモデルをロード
@@ -4918,6 +5105,7 @@ def main(argv=None) -> int:
         "rectify_s": 0.0,
         "decide_s": 0.0,
         "uvdoc_s": 0.0,
+        "bgdiv_s": 0.0,
         "match_s": 0.0,
         "warp_s": 0.0,
     }
@@ -5033,6 +5221,7 @@ def main(argv=None) -> int:
             "rectify_s": float(st.rectify_s),
             "decide_s": float(st.decide_s),
             "uvdoc_s": float(st.uvdoc_s),
+            "bgdiv_s": float(st.bgdiv_s),
             "match_s": float(st.match_s),
             "warp_s": float(st.warp_s),
         }
@@ -5060,6 +5249,7 @@ def main(argv=None) -> int:
         stage_times["rectify_s"] += float(st.rectify_s)
         stage_times["decide_s"] += float(st.decide_s)
         stage_times["uvdoc_s"] += float(st.uvdoc_s)
+        stage_times["bgdiv_s"] += float(st.bgdiv_s)
         stage_times["match_s"] += float(st.match_s)
         stage_times["warp_s"] += float(st.warp_s)
 
