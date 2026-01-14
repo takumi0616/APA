@@ -1,3 +1,15 @@
+以下のプログラムと実行結果を見てください
+目標平均実行時間が2秒以内ということですが、達成できていません
+もっと言えばtestの平均が2秒以内ですがまだ駄目です
+
+しかし、ハイパーパラメータ系の解像度を落とすことは避けたいです（むしろ2048まで上げたいです）
+
+改善方法について、それぞれ検討してください
+CPU環境であることは必須要件です
+日本語で解説
+
+APA\paper_pipeline_v13.py
+```
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """paper_pipeline_v13.py
@@ -128,14 +140,6 @@ v13.8.1
 - stage6 の出力解像度（bgdiv_w/bgdiv_h）も item に保存して CSV に反映する。
  
 - 追加: UVDoc の後に **背景除算法（Background Division Method）** を stage6 として挿入する。
-
-v13.9（本タスク）
-----------------
-- stage6（背景除算法）を、指定どおり **OpenCV Background Division（cv2.divide）** の実装に統一。
-  - LAB 色空間へ変換し、L（明度）のみを補正（a/b は保持）
-  - `bg = GaussianBlur(L)` で背景（低周波）推定
-  - `L_corr = cv2.divide(L, bg, scale=255)` で照明ムラ/影を軽減
-  - 目的: 書類の白地ができるだけ均一な白に近づくよう補正し、後段の特徴点マッチングを安定化
 
 """
 
@@ -5330,3 +5334,1309 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+```
+
+APA\test_recovery_paper.py
+```
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""test_recovery_paper.py
+
+目的
+----
+フォームA/Bのテンプレ（正解）画像を基準にして、
+
+- テンプレから自動生成した改悪画像（回転/射影/背景合成など）
+
+を XFeat matching で位置合わせ（Homography 推定）できるかを評価する。
+
+重要な方針（ユーザー指示）
+--------------------------
+- bad/ は無視（改悪はテンプレから生成）
+- 品質改善（2値化/影補正など）は実装しない
+- XFeat matching による Homography 性能を見たい
+
+使い方（例）
+------------
+静止画像（テンプレ→改悪生成→評価）:
+
+  python APA/test_recovery_paper.py --mode images --form A
+  python APA/test_recovery_paper.py --mode images --form B
+
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import time
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+import cv2
+import numpy as np
+
+# XFeat deps
+import torch
+
+
+# ------------------------------------------------------------
+# Windows environment: keep stdout UTF-8 friendly
+# ------------------------------------------------------------
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+
+# ------------------------------------------------------------
+# Utilities
+# ------------------------------------------------------------
+
+
+def ensure_portable_git_on_path() -> None:
+    """torch.hub may try to call git; this PC uses portable Git not on PATH."""
+
+    portable_git_bin = r"C:\Users\takumi\develop\git\bin"
+    if os.path.exists(portable_git_bin):
+        os.environ["PATH"] = portable_git_bin + os.pathsep + os.environ.get("PATH", "")
+
+
+def now_run_id() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def mkdir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def to_uint8(img: np.ndarray) -> np.ndarray:
+    if img.dtype == np.uint8:
+        return img
+    img = np.clip(img, 0, 255)
+    return img.astype(np.uint8)
+
+
+def order_quad_tl_tr_br_bl(pts: np.ndarray) -> np.ndarray:
+    """Order 4 points to TL/TR/BR/BL."""
+
+    pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1).reshape(-1)
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    tr = pts[np.argmin(diff)]
+    bl = pts[np.argmax(diff)]
+    return np.stack([tl, tr, br, bl], axis=0)
+
+
+# ------------------------------------------------------------
+# Synthetic degradation generation
+# ------------------------------------------------------------
+
+
+def random_background(h: int, w: int, rng: random.Random) -> np.ndarray:
+    """Generate a simple random background (noise + gradients)."""
+
+    bg = np.zeros((h, w, 3), dtype=np.uint8)
+
+    # base color
+    base = np.array([rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255)], dtype=np.uint8)
+    bg[:, :] = base
+
+    # gradient overlay
+    gx = np.linspace(0, 1, w, dtype=np.float32)
+    gy = np.linspace(0, 1, h, dtype=np.float32)
+    g = (np.outer(gy, gx) * 255.0).astype(np.float32)
+    g3 = np.stack([g, g, g], axis=-1)
+    bg = to_uint8(0.6 * bg.astype(np.float32) + 0.4 * g3)
+
+    # noise (milder)
+    n = np.zeros((h, w, 3), dtype=np.float32)
+    n[:, :, 0] = np.random.normal(0, 8, size=(h, w))
+    n[:, :, 1] = np.random.normal(0, 8, size=(h, w))
+    n[:, :, 2] = np.random.normal(0, 8, size=(h, w))
+    bg = to_uint8(bg.astype(np.float32) + n)
+
+    # random lines (milder)
+    for _ in range(rng.randint(3, 10)):
+        x1, y1 = rng.randint(0, w - 1), rng.randint(0, h - 1)
+        x2, y2 = rng.randint(0, w - 1), rng.randint(0, h - 1)
+        color = (rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255))
+        cv2.line(bg, (x1, y1), (x2, y2), color, rng.randint(1, 2), lineType=cv2.LINE_AA)
+
+    return bg
+
+
+def warp_template_to_random_view(
+    template_bgr: np.ndarray,
+    out_size: tuple[int, int],
+    rng: random.Random,
+    max_rotation_deg: float = 12.0,
+    min_abs_rotation_deg: float = 0.0,
+    rotation_mode: str = "uniform",
+    snap_step_deg: float = 90.0,
+    perspective_jitter: float = 0.08,
+    min_visible_area_ratio: float = 0.25,
+    max_attempts: int = 50,
+    save_steps_dir: Optional[Path] = None,
+    step_prefix: str = "",
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Create a degraded image by warping template into a random quadrilateral on a random background.
+
+    Returns:
+        degraded_bgr, H_ref_to_deg
+    """
+
+    h, w = template_bgr.shape[:2]
+    out_w, out_h = out_size
+
+    # IMPORTANT:
+    # 以前は、回転後に頂点を単純クリップしていたため、
+    #   - 紙が画面外に逃げる
+    #   - 紙が極端に小さくなる
+    #   - マスクがほぼ0（紙が写っていない）
+    # のケースが出ていた。
+    #
+    # ここでは「紙が必ず画面内に十分写る」まで再生成する。
+
+    # ------------------------------------------------------------
+    # Safety constraints (ユーザー要望):
+    #   - 紙が極端に小さくならない
+    #   - 奥行き(透視)が強すぎて「長辺/短辺が入れ替わる」ような不自然な台形にならない
+    # ------------------------------------------------------------
+
+    margin = int(min(out_w, out_h) * 0.06)
+    # 紙サイズは「常識的に大きめ」を基本とする（画面の 75%〜92% 程度）
+    base_w_min = int(out_w * 0.75)
+    base_w_max = int(out_w * 0.92)
+    min_visible_area_px = int(out_w * out_h * float(min_visible_area_ratio))
+
+    # fit-to-frame の縮小が大きい（紙が小さくなる）場合は棄却
+    min_fit_scale = 0.78
+
+    # 透視が強すぎる（上下/左右の辺長比が極端）場合は棄却
+    max_perspective_edge_ratio = 1.55  # 例: bottom/top が 1.55 を超えると「奥行きが強すぎる」
+
+    # 最短辺が最長辺に比べて短すぎる場合は棄却（細長い/潰れた形状の排除）
+    min_edge_len_ratio = 0.58
+
+    dst_quad = None
+    base_w = 0
+    base_h = 0
+    angle = 0.0
+    fit_scale_used: float = 1.0
+    visible_area_ratio_used: float = 0.0
+    quad_area_ratio_used: float = 0.0
+    edge_ratio_top_bottom: float = 1.0
+    edge_ratio_left_right: float = 1.0
+    edge_len_min: float = 0.0
+    edge_len_max: float = 0.0
+    for _attempt in range(max_attempts):
+        # Make the paper occupy larger area so that it keeps enough resolution.
+        base_w = rng.randint(base_w_min, base_w_max)
+        base_h = int(base_w * (h / w))
+        base_h = max(120, min(base_h, int(out_h * 0.85)))
+
+        # destination quad center
+        # 紙が画面外に逃げて縮小されないよう、中心座標は「紙サイズから逆算」して安全域でサンプルする。
+        cx_lo = int(base_w // 2 + margin)
+        cx_hi = int(out_w - 1 - base_w // 2 - margin)
+        cy_lo = int(base_h // 2 + margin)
+        cy_hi = int(out_h - 1 - base_h // 2 - margin)
+        if cx_lo >= cx_hi or cy_lo >= cy_hi:
+            continue
+
+        cx = rng.randint(cx_lo, cx_hi)
+        cy = rng.randint(cy_lo, cy_hi)
+
+        # start from axis-aligned rectangle
+        x1, y1 = cx - base_w // 2, cy - base_h // 2
+        x2, y2 = cx + base_w // 2, cy + base_h // 2
+        rect = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+
+        # rotation
+        # rotation_mode:
+        #   - uniform: 0〜360一様（max_rotation_deg>=180時） or [-max_rot, +max_rot]
+        #   - snap:   snap_step_deg刻み（デフォルト90度）にスナップして「上下逆/横向き」を確実に作る
+        if max_rotation_deg >= 180:
+            if rotation_mode == "snap":
+                step = float(max(1.0, snap_step_deg))
+                # 0, step, 2*step, ... の候補からランダム（0度近傍は min_abs_rotation_deg で除外）
+                candidates = [i * step for i in range(int(round(360.0 / step)))]
+                rng.shuffle(candidates)
+                angle = 0.0
+                for cand in candidates:
+                    dist0 = min(cand % 360.0, 360.0 - (cand % 360.0))
+                    if dist0 >= float(min_abs_rotation_deg):
+                        angle = float(cand % 360.0)
+                        break
+            else:
+                for _ in range(100):
+                    angle = rng.uniform(0.0, 360.0)
+                    dist0 = min(angle, 360.0 - angle)
+                    if dist0 >= float(min_abs_rotation_deg):
+                        break
+                else:
+                    angle = rng.uniform(0.0, 360.0)
+        else:
+            angle = rng.uniform(-max_rotation_deg, max_rotation_deg)
+
+        M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+        rect_rot = cv2.transform(rect.reshape(-1, 1, 2), M).reshape(4, 2)
+
+        # perspective jitter
+        jitter = perspective_jitter * min(base_w, base_h)
+        rect_rot += np.array(
+            [[rng.uniform(-jitter, jitter), rng.uniform(-jitter, jitter)] for _ in range(4)],
+            dtype=np.float32,
+        )
+
+        # --- Keep the quad inside the output by scaling (not clipping) ---
+        # Clipping can collapse the quad and effectively remove the paper.
+        # Instead, if some corners go out of bounds, scale the quad towards the center.
+        inset = 2.0
+        dx = rect_rot[:, 0] - cx
+        dy = rect_rot[:, 1] - cy
+        max_dx = float(np.max(np.abs(dx))) if len(dx) else 0.0
+        max_dy = float(np.max(np.abs(dy))) if len(dy) else 0.0
+        allow_x = float(min(cx, (out_w - 1) - cx)) - inset
+        allow_y = float(min(cy, (out_h - 1) - cy)) - inset
+        if allow_x <= 1 or allow_y <= 1:
+            continue
+
+        sx = allow_x / max_dx if max_dx > 1e-6 else 1.0
+        sy = allow_y / max_dy if max_dy > 1e-6 else 1.0
+        s = float(min(1.0, sx, sy))
+        if s < 1.0:
+            rect_rot = np.stack([cx + dx * s, cy + dy * s], axis=1).astype(np.float32)
+
+        # 縮小が大きすぎる（紙が小さくなる）場合は棄却して作り直す
+        if float(s) < float(min_fit_scale):
+            continue
+
+        # Accept only if all corners are inside
+        if (
+            (rect_rot[:, 0].min() >= 0)
+            and (rect_rot[:, 1].min() >= 0)
+            and (rect_rot[:, 0].max() <= out_w - 1)
+            and (rect_rot[:, 1].max() <= out_h - 1)
+        ):
+            # IMPORTANT:
+            # ここでは「並べ替え」をしない。
+            # rect は [TL, TR, BR, BL] の順番で生成しており、
+            # 回転・射影後もこの“対応関係”を保ったまま Homography を作るべき。
+            # order_quad_* で画面上のTL/TR/BR/BLに並べ替えると、
+            # 角の対応が崩れて意図した回転（例：QRが下側）が壊れる。
+            cand = rect_rot.astype(np.float32)
+
+            # 形状の安全チェック（過度な透視/潰れを防止）
+            try:
+                # TL/TR/BR/BL の対応関係を前提に辺長を評価する
+                top = float(np.linalg.norm(cand[1] - cand[0]))
+                right = float(np.linalg.norm(cand[2] - cand[1]))
+                bottom = float(np.linalg.norm(cand[2] - cand[3]))
+                left = float(np.linalg.norm(cand[3] - cand[0]))
+
+                edges = [top, right, bottom, left]
+                e_min = float(min(edges))
+                e_max = float(max(edges))
+                if e_max <= 1e-6:
+                    continue
+
+                # 透視が強いと top と bottom（または left と right）が極端に離れる
+                tb = max(top, bottom) / max(1e-6, min(top, bottom))
+                lr = max(left, right) / max(1e-6, min(left, right))
+                if tb > float(max_perspective_edge_ratio) or lr > float(max_perspective_edge_ratio):
+                    continue
+
+                # 潰れすぎ（細長すぎ）を排除
+                if (e_min / e_max) < float(min_edge_len_ratio):
+                    continue
+
+                # 面積が小さすぎる（見た目の縮小/潰れ）を排除
+                area = float(abs(cv2.contourArea(cand.reshape(-1, 1, 2))))
+                base_area = float(base_w * base_h)
+                if base_area <= 1:
+                    continue
+                area_ratio = area / base_area
+                # 透視変形しても、基準矩形の 60% 未満は不自然になりやすい
+                if area_ratio < 0.60:
+                    continue
+            except Exception:
+                continue
+
+            # quick visible-area check by warping a ones mask
+            tmp_mask = cv2.warpPerspective(
+                np.ones((h, w), dtype=np.uint8) * 255,
+                cv2.getPerspectiveTransform(
+                    np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32),
+                    cand,
+                ),
+                (out_w, out_h),
+            )
+            visible_px = int(cv2.countNonZero(tmp_mask))
+            if visible_px >= min_visible_area_px:
+                dst_quad = cand
+                fit_scale_used = float(s)
+                visible_area_ratio_used = float(visible_px) / float(max(1, out_w * out_h))
+                quad_area_ratio_used = float(area_ratio)
+                edge_ratio_top_bottom = float(max(top, bottom) / max(1e-6, min(top, bottom)))
+                edge_ratio_left_right = float(max(left, right) / max(1e-6, min(left, right)))
+                edge_len_min = float(e_min)
+                edge_len_max = float(e_max)
+                break
+
+    if dst_quad is None:
+        # 最後の手段:
+        # これ以上リトライしても失敗する場合、極端な改悪を出すより
+        # 「安全な矩形（ほぼ正面）」を返す。
+        base_w = int(out_w * 0.85)
+        base_h = int(base_w * (h / w))
+        base_h = max(120, min(base_h, int(out_h * 0.85)))
+        cx = int(out_w // 2)
+        cy = int(out_h // 2)
+        x1, y1 = cx - base_w // 2, cy - base_h // 2
+        x2, y2 = cx + base_w // 2, cy + base_h // 2
+        dst_quad = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+        angle = 0.0
+        fit_scale_used = 1.0
+        visible_area_ratio_used = float(base_w * base_h) / float(max(1, out_w * out_h))
+        quad_area_ratio_used = 1.0
+        edge_ratio_top_bottom = 1.0
+        edge_ratio_left_right = 1.0
+        edge_len_min = float(min(base_w, base_h))
+        edge_len_max = float(max(base_w, base_h))
+
+    src_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
+    H = cv2.getPerspectiveTransform(src_quad, dst_quad)
+
+    bg = random_background(out_h, out_w, rng)
+    if save_steps_dir is not None:
+        mkdir(save_steps_dir)
+        cv2.imwrite(str(save_steps_dir / f"{step_prefix}01_background.jpg"), bg)
+
+    warped = cv2.warpPerspective(template_bgr, H, (out_w, out_h))
+    if save_steps_dir is not None:
+        cv2.imwrite(str(save_steps_dir / f"{step_prefix}02_warped_template.jpg"), warped)
+
+    # mask for blending
+    mask = cv2.warpPerspective(np.ones((h, w), dtype=np.uint8) * 255, H, (out_w, out_h))
+    if save_steps_dir is not None:
+        cv2.imwrite(str(save_steps_dir / f"{step_prefix}03_mask.jpg"), mask)
+    mask3 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    degraded = np.where(mask3 > 0, warped, bg)
+    if save_steps_dir is not None:
+        cv2.imwrite(str(save_steps_dir / f"{step_prefix}04_composited.jpg"), degraded)
+
+    # add *mild* blur/noise to simulate capturing conditions
+    if rng.random() < 0.35:
+        k = 3
+        degraded = cv2.GaussianBlur(degraded, (k, k), rng.uniform(0.4, 0.8))
+    if rng.random() < 0.35:
+        degraded = to_uint8(degraded.astype(np.float32) + np.random.normal(0, 4, size=degraded.shape))
+
+    if save_steps_dir is not None:
+        cv2.imwrite(str(save_steps_dir / f"{step_prefix}05_final_degraded.jpg"), degraded)
+
+    meta = {
+        "angle_deg": float(angle),
+        "rotation_mode": str(rotation_mode),
+        "snap_step_deg": float(snap_step_deg),
+        "base_w": int(base_w),
+        "base_h": int(base_h),
+        "out_w": int(out_w),
+        "out_h": int(out_h),
+        "perspective_jitter": float(perspective_jitter),
+        "min_visible_area_ratio": float(min_visible_area_ratio),
+        "visible_area_ratio": float(visible_area_ratio_used),
+        "fit_scale": float(fit_scale_used),
+        "quad_area_ratio_to_base": float(quad_area_ratio_used),
+        "edge_ratio_top_bottom": float(edge_ratio_top_bottom),
+        "edge_ratio_left_right": float(edge_ratio_left_right),
+        "edge_len_min": float(edge_len_min),
+        "edge_len_max": float(edge_len_max),
+        "safety": {
+            "min_fit_scale": float(min_fit_scale),
+            "max_perspective_edge_ratio": float(max_perspective_edge_ratio),
+            "min_edge_len_ratio": float(min_edge_len_ratio),
+        },
+        "max_attempts": int(max_attempts),
+    }
+    return degraded, H, meta
+
+
+# ------------------------------------------------------------
+# Form feature detection (for debug/metadata only)
+# ------------------------------------------------------------
+
+
+def detect_qr_codes_multiscale(image_bgr: np.ndarray) -> list[dict[str, Any]]:
+    """フォームB想定: OpenCV QRCodeDetector のマルチスケール検出（test_capture_formB.py を踏襲）。"""
+
+    qr_results: list[dict[str, Any]] = []
+    qr_detector = cv2.QRCodeDetector()
+    height, width = image_bgr.shape[:2]
+
+    scales = [0.5, 0.25, 1.0, 0.125, 0.75]
+    for scale in scales:
+        if scale == 1.0:
+            test_image = image_bgr
+        else:
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            if new_width < 100 or new_height < 100:
+                continue
+            test_image = cv2.resize(image_bgr, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+        try:
+            data, points, _ = qr_detector.detectAndDecode(test_image)
+            if data and points is not None:
+                pts = points[0]
+                if scale != 1.0:
+                    pts = pts / scale
+                pts = pts.astype(np.float32)
+                qr_results.append(
+                    {
+                        "data": data,
+                        "points": pts.tolist(),
+                        "scale": scale,
+                    }
+                )
+                break
+        except Exception:
+            pass
+
+    return qr_results
+
+
+def detect_formA_marker_boxes(image_bgr: np.ndarray) -> list[dict[str, Any]]:
+    """フォームA想定: 3点マークを検出し、各マーカーの角点（矩形4隅 or approx）を返す。
+
+    注: ここでの角点は、まずは安定性優先で bbox の 4隅を採用する。
+        （輪郭近似で4点が取れた場合はそれを利用）
+
+    元実装: APA/test_capture_formA.py
+    """
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = image_bgr.shape[:2]
+
+    # corner regions
+    # NOTE:
+    # paper_pipeline 側では DocAligner の polygon margin / rectify により、
+    # マーカーが画像の“角から少し内側”に入ることがある。
+    # 15% だと取りこぼすことがあったため、少し広げる。
+    corner_margin_x = int(w * 0.20)
+    corner_margin_y = int(h * 0.20)
+    corners = {
+        "top_left": (0, 0, corner_margin_x, corner_margin_y),
+        "top_right": (w - corner_margin_x, 0, w, corner_margin_y),
+        "bottom_left": (0, h - corner_margin_y, corner_margin_x, h),
+        "bottom_right": (w - corner_margin_x, h - corner_margin_y, w, h),
+    }
+
+    # size range
+    min_size = min(w, h) * 0.005
+    max_size = min(w, h) * 0.08
+    min_area = min_size**2
+    max_area = max_size**2
+
+    # binarization trials
+    bin_list: list[tuple[str, np.ndarray]] = []
+    for th in (50, 80, 120):
+        _, b = cv2.threshold(gray, th, 255, cv2.THRESH_BINARY_INV)
+        bin_list.append((f"th_{th}", b))
+    _, b_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    bin_list.append(("otsu", b_otsu))
+
+    found: dict[str, dict[str, Any]] = {}
+    kernel = np.ones((3, 3), np.uint8)
+
+    for method, binary in bin_list:
+        binary_clean = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        binary_clean = cv2.morphologyEx(binary_clean, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(binary_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            x, y, ww, hh = cv2.boundingRect(contour)
+            area_rect = ww * hh
+            area_contour = float(cv2.contourArea(contour))
+            if not (min_area < area_contour < max_area):
+                continue
+            ar = float(ww) / float(hh) if hh else 0.0
+            if not (0.4 < ar < 2.5):
+                continue
+
+            cx, cy = x + ww // 2, y + hh // 2
+            corner_name = None
+            for name, (x1, y1, x2, y2) in corners.items():
+                if x1 <= cx <= x2 and y1 <= cy <= y2:
+                    corner_name = name
+                    break
+            if corner_name not in ("top_left", "top_right", "bottom_left"):
+                continue
+
+            fill_ratio = area_contour / float(area_rect) if area_rect else 0.0
+            if fill_ratio <= 0.4:
+                continue
+
+            mask = np.zeros(gray.shape, dtype=np.uint8)
+            cv2.drawContours(mask, [contour], 0, 255, -1)
+            mean_val = float(cv2.mean(gray, mask=mask)[0])
+            if mean_val >= 180:
+                continue
+
+            eps = 0.05 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, eps, True)
+
+            # score
+            aspect_score = 1.0 - abs(ar - 1.0) * 0.5
+            intensity_score = (180.0 - mean_val) / 180.0
+            score = aspect_score * 0.25 + fill_ratio * 0.35 + intensity_score * 0.4
+
+            # corners
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                pts = approx.reshape(4, 2).astype(np.float32)
+                pts = order_quad_tl_tr_br_bl(pts)
+            else:
+                pts = np.array(
+                    [[x, y], [x + ww - 1, y], [x + ww - 1, y + hh - 1], [x, y + hh - 1]],
+                    dtype=np.float32,
+                )
+
+            info = {
+                "corner": corner_name,
+                "bbox": [int(x), int(y), int(ww), int(hh)],
+                "points": pts.tolist(),
+                "score": float(score),
+                "method": method,
+            }
+
+            if corner_name not in found or score > float(found[corner_name]["score"]):
+                found[corner_name] = info
+
+    # keep TL/TR/BL
+    return [found[k] for k in ("top_left", "top_right", "bottom_left") if k in found]
+
+
+# ------------------------------------------------------------
+# XFeat matching / homography
+# ------------------------------------------------------------
+
+
+@dataclass
+class XFeatHomographyResult:
+    ok: bool
+    ref_kpts: int
+    tgt_kpts: int
+    matches: int
+    inliers: int
+    inlier_ratio: float
+    reproj_rms: Optional[float]
+    H_ref_to_tgt: Optional[list[list[float]]]
+
+
+def resize_keep_aspect(img: np.ndarray, max_side: int) -> tuple[np.ndarray, float]:
+    """Resize so that max(H,W) == max_side (if larger). Returns (resized, scale)."""
+
+    h, w = img.shape[:2]
+    m = max(h, w)
+    if m <= max_side:
+        return img, 1.0
+    s = float(max_side) / float(m)
+    new_w = max(1, int(round(w * s)))
+    new_h = max(1, int(round(h * s)))
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return resized, s
+
+
+def scale_matrix(s: float) -> np.ndarray:
+    return np.array([[s, 0, 0], [0, s, 0], [0, 0, 1]], dtype=np.float64)
+
+
+def compute_reproj_rms(H: np.ndarray, src_pts: np.ndarray, dst_pts: np.ndarray) -> float:
+    """Compute RMS reprojection error on matched points."""
+
+    src = src_pts.reshape(-1, 1, 2).astype(np.float32)
+    dst = dst_pts.reshape(-1, 1, 2).astype(np.float32)
+    proj = cv2.perspectiveTransform(src, H)
+    err = np.linalg.norm(proj - dst, axis=2).reshape(-1)
+    return float(np.sqrt(np.mean(err**2))) if len(err) else float("nan")
+
+
+def refine_homography_least_squares(
+    H_init: np.ndarray,
+    mkpts0: np.ndarray,
+    mkpts1: np.ndarray,
+    inlier_mask: np.ndarray,
+) -> tuple[np.ndarray, Optional[float]]:
+    """Refine homography using inliers only.
+
+    Why:
+      cv2.findHomography(..., USAC_MAGSAC, ...) is robust, but the returned H can
+      be slightly suboptimal for warp quality. A common approach is:
+        1) robust estimation -> inlier mask
+        2) least-squares re-fit on inliers
+
+    Returns:
+      (H_refined, reproj_rms_on_inliers)
+    """
+
+    H0 = np.asarray(H_init, dtype=np.float64)
+    mask = np.asarray(inlier_mask, dtype=bool).reshape(-1)
+    if mask.size != len(mkpts0) or mask.size != len(mkpts1):
+        return H0, None
+
+    if int(mask.sum()) < 4:
+        return H0, None
+
+    p0 = np.asarray(mkpts0, dtype=np.float32)[mask]
+    p1 = np.asarray(mkpts1, dtype=np.float32)[mask]
+
+    # method=0 => a simple (non-robust) least squares fit.
+    H_ls, _ = cv2.findHomography(p0, p1, 0)
+    if H_ls is None:
+        return H0, None
+
+    try:
+        rms = compute_reproj_rms(np.asarray(H_ls, dtype=np.float64), p0, p1)
+    except Exception:
+        rms = None
+
+    return np.asarray(H_ls, dtype=np.float64), rms
+
+
+class XFeatMatcher:
+    def __init__(self, top_k: int = 4096, device: str = "cpu", match_max_side: int = 1200):
+        ensure_portable_git_on_path()
+        self.device = device
+        self.top_k = top_k
+        self.match_max_side = match_max_side
+        self.xfeat = torch.hub.load(
+            "verlab/accelerated_features",
+            "XFeat",
+            pretrained=True,
+            top_k=top_k,
+        ).to(device)
+        self.xfeat.eval()
+
+    def match_and_estimate_h(self, ref_bgr: np.ndarray, tgt_bgr: np.ndarray) -> tuple[XFeatHomographyResult, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        """Return result + (H, mkpts0, mkpts1)"""
+
+        t0 = time.time()
+
+        # Resize for matching stability/speed (then scale H back)
+        ref_small, s_ref = resize_keep_aspect(ref_bgr, self.match_max_side)
+        tgt_small, s_tgt = resize_keep_aspect(tgt_bgr, self.match_max_side)
+
+        out0 = self.xfeat.detectAndCompute(ref_small, top_k=self.top_k)[0]
+        out1 = self.xfeat.detectAndCompute(tgt_small, top_k=self.top_k)[0]
+        # (Upstream requires image_size for some matchers; keep it)
+        out0.update({"image_size": (ref_small.shape[1], ref_small.shape[0])})
+        out1.update({"image_size": (tgt_small.shape[1], tgt_small.shape[0])})
+
+        matches = self.xfeat.match_lighterglue(out0, out1)
+        if isinstance(matches, (list, tuple)) and len(matches) >= 2:
+            mkpts0, mkpts1 = matches[0], matches[1]
+        elif isinstance(matches, dict) and "mkpts0" in matches and "mkpts1" in matches:
+            mkpts0, mkpts1 = matches["mkpts0"], matches["mkpts1"]
+        else:
+            return (
+                XFeatHomographyResult(False, 0, 0, 0, 0, 0.0, None, None),
+                None,
+                None,
+                None,
+            )
+
+        mkpts0 = np.asarray(mkpts0, dtype=np.float32)
+        mkpts1 = np.asarray(mkpts1, dtype=np.float32)
+
+        # These points are in "small" coordinate system.
+        ref_kpts = int(len(out0.get("keypoints", [])) or 0)
+        tgt_kpts = int(len(out1.get("keypoints", [])) or 0)
+
+        if len(mkpts0) < 4:
+            return (
+                XFeatHomographyResult(False, ref_kpts, tgt_kpts, int(len(mkpts0)), 0, 0.0, None, None),
+                None,
+                mkpts0,
+                mkpts1,
+            )
+
+        # 高精度優先（時間は増えるが収束率/安定性を上げる）
+        H, mask = cv2.findHomography(
+            mkpts0,
+            mkpts1,
+            cv2.USAC_MAGSAC,
+            3.0,
+            maxIters=5_000,
+            confidence=0.9999,
+        )
+
+        if H is None or mask is None:
+            return (
+                XFeatHomographyResult(False, ref_kpts, tgt_kpts, int(len(mkpts0)), 0, 0.0, None, None),
+                None,
+                mkpts0,
+                mkpts1,
+            )
+
+        mask = mask.reshape(-1).astype(bool)
+        inliers = int(mask.sum())
+        matches_n = int(len(mask))
+        inlier_ratio = float(inliers) / float(matches_n) if matches_n else 0.0
+
+        # Refine H by least-squares on inliers for better warp quality.
+        reproj = None
+        if inliers >= 4:
+            try:
+                H_refined, rms = refine_homography_least_squares(H, mkpts0, mkpts1, mask)
+                if H_refined is not None:
+                    H = H_refined
+                reproj = rms if rms is not None else compute_reproj_rms(H, mkpts0[mask], mkpts1[mask])
+            except Exception:
+                reproj = compute_reproj_rms(H, mkpts0[mask], mkpts1[mask])
+
+        _ = time.time() - t0
+
+        # scale H back to full resolution: H_full = inv(S_tgt) * H_small * S_ref
+        S_ref = scale_matrix(s_ref)
+        S_tgt = scale_matrix(s_tgt)
+        H_full = np.linalg.inv(S_tgt) @ H @ S_ref
+
+        return (
+            XFeatHomographyResult(
+                ok=True,
+                ref_kpts=ref_kpts,
+                tgt_kpts=tgt_kpts,
+                matches=matches_n,
+                inliers=inliers,
+                inlier_ratio=inlier_ratio,
+                reproj_rms=reproj,
+                H_ref_to_tgt=H_full.astype(float).tolist(),
+            ),
+            H_full,
+            mkpts0,
+            mkpts1,
+        )
+
+
+# ------------------------------------------------------------
+# Visualization
+# ------------------------------------------------------------
+
+
+def draw_inlier_matches(
+    ref_bgr: np.ndarray,
+    tgt_bgr: np.ndarray,
+    mkpts0: np.ndarray,
+    mkpts1: np.ndarray,
+    match_max_side: int,
+) -> np.ndarray:
+    """Draw projected ref corners on tgt + inlier matches."""
+
+    # NOTE:
+    # mkpts0/mkpts1 are in the "matching" coordinate system (resized images).
+    # For visualization to look correct, we must draw on the SAME resized images.
+    # This prevents the left/right size mismatch and “not matching” appearance.
+
+    ref_vis, _ = resize_keep_aspect(ref_bgr, match_max_side)
+    tgt_vis, _ = resize_keep_aspect(tgt_bgr, match_max_side)
+
+    Hm, mask = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 3.5)
+    if Hm is None or mask is None:
+        return tgt_vis
+    mask = mask.reshape(-1).astype(bool)
+
+    h, w = ref_vis.shape[:2]
+    corners = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32).reshape(-1, 1, 2)
+    warped = cv2.perspectiveTransform(corners, Hm)
+
+    tgt2 = tgt_vis.copy()
+    for i in range(len(warped)):
+        p1 = tuple(warped[i - 1][0].astype(int))
+        p2 = tuple(warped[i][0].astype(int))
+        cv2.line(tgt2, p1, p2, (0, 255, 0), 4)
+
+    k0 = [cv2.KeyPoint(float(p[0]), float(p[1]), 5) for p in mkpts0]
+    k1 = [cv2.KeyPoint(float(p[0]), float(p[1]), 5) for p in mkpts1]
+    matches = [cv2.DMatch(i, i, 0) for i, m in enumerate(mask) if m]
+    canvas = cv2.drawMatches(ref_vis, k0, tgt2, k1, matches, None, matchColor=(0, 255, 0), flags=2)
+    return canvas
+
+
+# ------------------------------------------------------------
+# Image mode
+# ------------------------------------------------------------
+
+
+def load_templates(form: str) -> list[Path]:
+    base = Path(__file__).resolve().parent / "image" / form
+    paths = []
+    for i in range(1, 7):
+        p = base / f"{i}.jpg"
+        if p.exists():
+            paths.append(p)
+    return paths
+
+
+def run_images_mode(args: argparse.Namespace) -> int:
+    out_root = mkdir(Path(args.out) / f"run_{now_run_id()}_{args.form}_images")
+    debug_dir = mkdir(out_root / "debug")
+    warped_dir = mkdir(out_root / "warped")
+    degraded_dir = mkdir(out_root / "degraded")
+    steps_root = mkdir(out_root / "degrade_steps") if args.save_degrade_steps else None
+
+    # reproducibility
+    rng = random.Random(args.seed)
+    np.random.seed(args.seed)
+
+    templates = load_templates(args.form)
+    if not templates:
+        print(f"[ERROR] templates not found: APA/image/{args.form}/*.jpg")
+        return 1
+
+    if args.only_template is not None:
+        templates = [p for p in templates if p.stem == str(args.only_template)]
+        if not templates:
+            print(f"[ERROR] only_template={args.only_template} not found.")
+            return 1
+
+    device = "cuda" if args.device == "auto" and torch.cuda.is_available() else (args.device if args.device != "auto" else "cpu")
+    matcher = XFeatMatcher(top_k=args.top_k, device=device, match_max_side=args.match_max_side)
+
+    summary: list[dict[str, Any]] = []
+
+    for tp in templates:
+        template_bgr = cv2.imread(str(tp))
+        if template_bgr is None:
+            print(f"[WARN] failed to read: {tp}")
+            continue
+
+        template_features: dict[str, Any] = {}
+        if args.detect_features:
+            if args.form == "A":
+                template_features["markers"] = detect_formA_marker_boxes(template_bgr)
+            if args.form == "B":
+                template_features["qrs"] = detect_qr_codes_multiscale(template_bgr)
+
+        # generate N degraded variants
+        for k in range(args.degrade_n):
+            name = f"{tp.stem}_deg{k:02d}"
+            step_dir = (steps_root / name) if steps_root is not None else None
+            degraded_bgr, H_gt, degrade_meta = warp_template_to_random_view(
+                template_bgr,
+                out_size=(args.degrade_w, args.degrade_h),
+                rng=rng,
+                max_rotation_deg=args.max_rot,
+                min_abs_rotation_deg=args.min_abs_rot,
+                rotation_mode=args.rotation_mode,
+                snap_step_deg=args.snap_step_deg,
+                perspective_jitter=args.perspective,
+                min_visible_area_ratio=args.min_visible_area_ratio,
+                max_attempts=args.max_attempts,
+                save_steps_dir=step_dir,
+                step_prefix="",
+            )
+            cv2.imwrite(str(degraded_dir / f"{name}.jpg"), degraded_bgr)
+
+            # Safety check: ensure the paper is actually visible in the degraded image.
+            # (This should already be satisfied by the generator constraints, but keep
+            # a cheap post-check so that we can catch unexpected failures early.)
+            # Use edge density as a lightweight proxy.
+            try:
+                gray_chk = cv2.cvtColor(degraded_bgr, cv2.COLOR_BGR2GRAY)
+                edges_chk = cv2.Canny(gray_chk, 50, 150)
+                edge_ratio = float((edges_chk > 0).mean())
+                if edge_ratio < 0.001:
+                    print(f"[WARN] degraded may not contain enough paper pixels: {name} edge_ratio={edge_ratio:.6f}")
+            except Exception:
+                pass
+
+            res, H, mk0, mk1 = matcher.match_and_estimate_h(template_bgr, degraded_bgr)
+            item: dict[str, Any] = {
+                "template": str(tp),
+                "case": name,
+                "ok": res.ok,
+                "degrade": degrade_meta,
+                "H_gt_ref_to_tgt": H_gt.astype(float).tolist(),
+                **asdict(res),
+            }
+
+            if args.detect_features:
+                item["template_features"] = template_features
+                if args.form == "A":
+                    item["degraded_features"] = {"markers": detect_formA_marker_boxes(degraded_bgr)}
+                if args.form == "B":
+                    item["degraded_features"] = {"qrs": detect_qr_codes_multiscale(degraded_bgr)}
+            summary.append(item)
+
+            if not res.ok or H is None or mk0 is None or mk1 is None:
+                continue
+
+            # warp degraded back to template plane (inverse H)
+            H_inv = np.linalg.inv(H)
+            warped = cv2.warpPerspective(degraded_bgr, H_inv, (template_bgr.shape[1], template_bgr.shape[0]))
+            cv2.imwrite(str(warped_dir / f"{name}_warped.jpg"), warped)
+
+            # debug matches image
+            try:
+                dbg = draw_inlier_matches(
+                    template_bgr,
+                    degraded_bgr,
+                    mk0,
+                    mk1,
+                    args.match_max_side,
+                )
+                cv2.imwrite(str(debug_dir / f"{name}_matches.jpg"), dbg)
+            except Exception:
+                pass
+
+        print(f"[OK] processed template: {tp.name}")
+
+    # save summary
+    with open(out_root / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    # simple csv
+    csv_path = out_root / "summary.csv"
+    header = [
+        "template",
+        "case",
+        "ok",
+        "ref_kpts",
+        "tgt_kpts",
+        "matches",
+        "inliers",
+        "inlier_ratio",
+        "reproj_rms",
+    ]
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write(",".join(header) + "\n")
+        for it in summary:
+            row = [
+                str(it.get("template", "")),
+                str(it.get("case", "")),
+                str(it.get("ok", "")),
+                str(it.get("ref_kpts", "")),
+                str(it.get("tgt_kpts", "")),
+                str(it.get("matches", "")),
+                str(it.get("inliers", "")),
+                str(it.get("inlier_ratio", "")),
+                str(it.get("reproj_rms", "")),
+            ]
+            f.write(",".join(row) + "\n")
+
+    print(f"\n[DONE] outputs: {out_root}")
+    return 0
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["images"], required=True)
+    p.add_argument("--form", choices=["A", "B"], required=True)
+    p.add_argument("--out", type=str, default=str(Path(__file__).resolve().parent / "output_recovery"))
+
+    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    p.add_argument("--top-k", type=int, default=2048)
+    p.add_argument(
+        "--match-max-side",
+        type=int,
+        default=1200,
+        help="XFeat matching 用の最大辺（大きいほど精度↑/速度↓）",
+    )
+    p.add_argument(
+        "--detect-features",
+        action="store_true",
+        help="フォームA(マーカー)/B(QR)の検出も行い、summary.jsonに入れる（Homographyには未使用）",
+    )
+
+    # images mode options
+    p.add_argument("--degrade-n", type=int, default=5)
+    # 改悪画像が小さすぎると現実の撮影条件と乖離するため、デフォルトを少し大きめにする
+    p.add_argument("--degrade-w", type=int, default=2400)
+    p.add_argument("--degrade-h", type=int, default=1800)
+    # Make default degradation milder (user feedback)
+    p.add_argument("--max-rot", type=float, default=12.0)
+    p.add_argument(
+        "--min-abs-rot",
+        type=float,
+        default=0.0,
+        help=(
+            "フル回転モード（--max-rot>=180）時に、0度に近い回転を避けたい場合の下限（度）。"
+            " 例: --max-rot 180 --min-abs-rot 120 とすると、ほぼ上下逆/横向きが必ず混ざる。"
+        ),
+    )
+    p.add_argument("--perspective", type=float, default=0.08)
+
+    p.add_argument(
+        "--rotation-mode",
+        choices=["uniform", "snap"],
+        default="uniform",
+        help=(
+            "回転角の生成方法。uniform=連続一様乱数、snap=角度を一定刻みにスナップ（上下逆/横向きを確実に作る）。"
+        ),
+    )
+    p.add_argument(
+        "--snap-step-deg",
+        type=float,
+        default=90.0,
+        help="rotation-mode=snap のときの刻み角度（度）。例: 90 -> 0/90/180/270",
+    )
+    p.add_argument(
+        "--min-visible-area-ratio",
+        type=float,
+        default=0.25,
+        help="改悪画像内で紙（テンプレ）が占める最小面積比（0〜1）。紙が写っていないケースを防ぐ。",
+    )
+    p.add_argument(
+        "--max-attempts",
+        type=int,
+        default=50,
+        help="紙が十分写る改悪を生成するための最大リトライ回数。",
+    )
+    p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument(
+        "--save-degrade-steps",
+        action="store_true",
+        help="改悪生成の途中経過（背景/ワープ/マスク/合成/最終）を out_root/degrade_steps/<case>/ に保存する",
+    )
+
+    p.add_argument(
+        "--only-template",
+        type=int,
+        default=None,
+        help="デバッグ用：テンプレ番号（1〜6）を指定した場合、その1枚だけ処理する",
+    )
+
+    return p
+
+
+def main() -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    print("=" * 70)
+    print("test_recovery_paper")
+    print("=" * 70)
+    print(f"OpenCV: {cv2.__version__}")
+    print(f"torch: {torch.__version__}")
+    print(f"mode: {args.mode} / form: {args.form}")
+
+    if args.mode == "images":
+        return run_images_mode(args)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+```
+
+APA\output_pipeline\run_20260114_133812\run.log
+```
+2026-01-14 13:38:12 [INFO] ======================================================================
+2026-01-14 13:38:12 [INFO] paper_pipeline_v13
+2026-01-14 13:38:12 [INFO] ======================================================================
+2026-01-14 13:38:12 [INFO] OpenCV: 4.12.0
+2026-01-14 13:38:12 [INFO] torch : 2.9.1+cpu
+2026-01-14 13:38:12 [INFO] src-forms: A,B,C
+2026-01-14 13:38:12 [INFO] [INFO] Loading DocAligner...
+2026-01-14 13:38:14 [INFO] [OK] DocAligner loaded
+2026-01-14 13:38:14 [INFO] [INFO] Loading XFeat...
+2026-01-14 13:38:16 [INFO] [OK] XFeat loaded
+2026-01-14 13:38:16 [INFO] [OK] WeChat QR detector initialized: C:\Users\takumi\develop\APA\models\wechat_qrcode (pool_size=8)
+2026-01-14 13:38:16 [INFO] [OK] UVDoc loaded: ckpt=C:\Users\takumi\develop\APA\third_party\UVDoc\model\best_model.pkl img_size=(488, 712)
+2026-01-14 13:38:16 [INFO] [OK] CachedXFeatMatcher enabled
+2026-01-14 13:38:19 [INFO] [OK] template cache built: A=6 B=6
+2026-01-14 13:38:19 [INFO] [INFO] Pre-generating degraded images (NOT timed)...
+2026-01-14 13:38:19 [INFO] [DEGRADE] form A: 6 images
+2026-01-14 13:39:09 [INFO] [DEGRADE] form B: 6 images
+2026-01-14 13:40:02 [INFO] [DEGRADE] form C: 6 images
+2026-01-14 13:41:02 [INFO] [DEGRADE] test dataset (image/test): 4 images
+2026-01-14 13:41:41 [INFO] [OK] Pre-generated degraded inputs: 110
+2026-01-14 13:41:44 [INFO] [CASE] id=A_1_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=363 inlier_ratio=0.6836158192090396 time_total_s=3.173306 (1_degrade=0.000000,2_doc=0.213465,3_rectify=0.010096,4_decide=0.847393,5_uvdoc=0.433295,6_bgdiv=0.349318,7_match=1.255596,8_warp=0.064142) src=1.jpg
+2026-01-14 13:41:47 [INFO] [CASE] id=A_1_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=511 inlier_ratio=0.9060283687943262 time_total_s=2.280851 (1_degrade=0.000000,2_doc=0.216877,3_rectify=0.010910,4_decide=0.326823,5_uvdoc=0.391782,6_bgdiv=0.213382,7_match=1.058799,8_warp=0.062278) src=1.jpg
+2026-01-14 13:41:48 [WARNING] [CASE] id=A_1_deg02 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=0.783704 (1_degrade=0.000000,2_doc=0.220950,3_rectify=0.010918,4_decide=0.551837,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=1.jpg
+2026-01-14 13:41:49 [WARNING] [CASE] id=A_1_deg03 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=0.983472 (1_degrade=0.000000,2_doc=0.205817,3_rectify=0.010612,4_decide=0.767043,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=1.jpg
+2026-01-14 13:41:51 [INFO] [CASE] id=A_1_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=396 inlier_ratio=0.7888446215139442 time_total_s=2.402860 (1_degrade=0.000000,2_doc=0.196696,3_rectify=0.010088,4_decide=0.388501,5_uvdoc=0.439955,6_bgdiv=0.218310,7_match=1.086282,8_warp=0.063027) src=1.jpg
+2026-01-14 13:41:54 [INFO] [CASE] id=A_2_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=459 inlier_ratio=0.936734693877551 time_total_s=2.468975 (1_degrade=0.000000,2_doc=0.216599,3_rectify=0.010883,4_decide=0.392648,5_uvdoc=0.393815,6_bgdiv=0.215314,7_match=1.161412,8_warp=0.078303) src=2.jpg
+2026-01-14 13:41:58 [INFO] [CASE] id=A_2_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=438 inlier_ratio=0.8673267326732673 time_total_s=3.230146 (1_degrade=0.000000,2_doc=0.213101,3_rectify=0.011750,4_decide=1.295545,5_uvdoc=0.359520,6_bgdiv=0.207127,7_match=1.079896,8_warp=0.063206) src=2.jpg
+2026-01-14 13:41:58 [WARNING] [CASE] id=A_2_deg02 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=0.209997 (1_degrade=0.000000,2_doc=0.209997,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=2.jpg
+2026-01-14 13:42:02 [INFO] [CASE] id=A_2_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=432 inlier_ratio=0.8503937007874016 time_total_s=3.406333 (1_degrade=0.000000,2_doc=0.199729,3_rectify=0.012249,4_decide=1.182637,5_uvdoc=0.438734,6_bgdiv=0.219358,7_match=1.269855,8_warp=0.083770) src=2.jpg
+2026-01-14 13:42:05 [INFO] [CASE] id=A_2_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=407 inlier_ratio=0.8905908096280087 time_total_s=3.450300 (1_degrade=0.000000,2_doc=0.254187,3_rectify=0.012162,4_decide=0.997618,5_uvdoc=0.516095,6_bgdiv=0.269795,7_match=1.335242,8_warp=0.065200) src=2.jpg
+2026-01-14 13:42:09 [INFO] [CASE] id=A_3_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=435 inlier_ratio=0.8734939759036144 time_total_s=3.089618 (1_degrade=0.000000,2_doc=0.221610,3_rectify=0.010960,4_decide=0.752370,5_uvdoc=0.569072,6_bgdiv=0.304139,7_match=1.148379,8_warp=0.083089) src=3.jpg
+2026-01-14 13:42:12 [INFO] [CASE] id=A_3_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=460 inlier_ratio=0.9108910891089109 time_total_s=3.061641 (1_degrade=0.000000,2_doc=0.215883,3_rectify=0.010155,4_decide=0.640700,5_uvdoc=0.505489,6_bgdiv=0.238993,7_match=1.376513,8_warp=0.073907) src=3.jpg
+2026-01-14 13:42:15 [INFO] [CASE] id=A_3_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=518 inlier_ratio=0.9700374531835206 time_total_s=2.892623 (1_degrade=0.000000,2_doc=0.266492,3_rectify=0.010707,4_decide=0.597643,5_uvdoc=0.542610,6_bgdiv=0.227687,7_match=1.180285,8_warp=0.067200) src=3.jpg
+2026-01-14 13:42:15 [WARNING] [CASE] id=A_3_deg03 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=0.203264 (1_degrade=0.000000,2_doc=0.203264,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=3.jpg
+2026-01-14 13:42:18 [INFO] [CASE] id=A_3_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=484 inlier_ratio=0.9546351084812623 time_total_s=2.641301 (1_degrade=0.000000,2_doc=0.195087,3_rectify=0.010674,4_decide=0.764688,5_uvdoc=0.413636,6_bgdiv=0.203896,7_match=0.978510,8_warp=0.074809) src=3.jpg
+2026-01-14 13:42:22 [INFO] [CASE] id=A_4_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=416 inlier_ratio=0.8286852589641435 time_total_s=3.133529 (1_degrade=0.000000,2_doc=0.236019,3_rectify=0.010602,4_decide=0.641848,5_uvdoc=0.546016,6_bgdiv=0.310820,7_match=1.323024,8_warp=0.065200) src=4.jpg
+2026-01-14 13:42:25 [INFO] [CASE] id=A_4_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=429 inlier_ratio=0.8265895953757225 time_total_s=2.869261 (1_degrade=0.000000,2_doc=0.278889,3_rectify=0.010240,4_decide=0.448647,5_uvdoc=0.568116,6_bgdiv=0.235195,7_match=1.257041,8_warp=0.071133) src=4.jpg
+2026-01-14 13:42:26 [WARNING] [CASE] id=A_4_deg02 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=0.920464 (1_degrade=0.000000,2_doc=0.223106,3_rectify=0.010790,4_decide=0.686568,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=4.jpg
+2026-01-14 13:42:29 [INFO] [CASE] id=A_4_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=472 inlier_ratio=0.916504854368932 time_total_s=2.909697 (1_degrade=0.000000,2_doc=0.220909,3_rectify=0.009787,4_decide=0.520163,5_uvdoc=0.537591,6_bgdiv=0.272699,7_match=1.272573,8_warp=0.075975) src=4.jpg
+2026-01-14 13:42:29 [WARNING] [CASE] id=A_4_deg04 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=0.232367 (1_degrade=0.000000,2_doc=0.232367,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=4.jpg
+2026-01-14 13:42:34 [INFO] [CASE] id=A_5_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=478 inlier_ratio=0.9428007889546351 time_total_s=4.175355 (1_degrade=0.000000,2_doc=0.228095,3_rectify=0.018530,4_decide=1.548973,5_uvdoc=0.507076,6_bgdiv=0.249223,7_match=1.547023,8_warp=0.076435) src=5.jpg
+2026-01-14 13:42:37 [INFO] [CASE] id=A_5_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=439 inlier_ratio=0.8762475049900199 time_total_s=2.784802 (1_degrade=0.000000,2_doc=0.243722,3_rectify=0.010655,4_decide=0.527163,5_uvdoc=0.535499,6_bgdiv=0.234741,7_match=1.162126,8_warp=0.070896) src=5.jpg
+2026-01-14 13:42:40 [INFO] [CASE] id=A_5_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=490 inlier_ratio=0.8909090909090909 time_total_s=2.559608 (1_degrade=0.000000,2_doc=0.234715,3_rectify=0.012669,4_decide=0.456801,5_uvdoc=0.539563,6_bgdiv=0.221699,7_match=1.020934,8_warp=0.073227) src=5.jpg
+2026-01-14 13:42:40 [WARNING] [CASE] id=A_5_deg03 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=0.219757 (1_degrade=0.000000,2_doc=0.219757,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=5.jpg
+2026-01-14 13:42:44 [INFO] [CASE] id=A_5_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=501 inlier_ratio=0.9506641366223909 time_total_s=3.462812 (1_degrade=0.000000,2_doc=0.188078,3_rectify=0.012113,4_decide=0.637454,5_uvdoc=0.488839,6_bgdiv=0.275793,7_match=1.776847,8_warp=0.083689) src=5.jpg
+2026-01-14 13:42:45 [WARNING] [CASE] id=A_6_deg00 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=1.176389 (1_degrade=0.000000,2_doc=0.247710,3_rectify=0.011408,4_decide=0.917270,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=6.jpg
+2026-01-14 13:42:48 [INFO] [CASE] id=A_6_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=478 inlier_ratio=0.8968105065666041 time_total_s=2.909507 (1_degrade=0.000000,2_doc=0.255091,3_rectify=0.015104,4_decide=0.796889,5_uvdoc=0.387634,6_bgdiv=0.228015,7_match=1.156992,8_warp=0.069781) src=6.jpg
+2026-01-14 13:42:49 [WARNING] [CASE] id=A_6_deg02 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=0.393566 (1_degrade=0.000000,2_doc=0.393566,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=6.jpg
+2026-01-14 13:42:53 [INFO] [CASE] id=A_6_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=445 inlier_ratio=0.8508604206500956 time_total_s=4.341439 (1_degrade=0.000000,2_doc=0.254998,3_rectify=0.011992,4_decide=1.417071,5_uvdoc=0.628978,6_bgdiv=0.254642,7_match=1.686516,8_warp=0.087242) src=6.jpg
+2026-01-14 13:42:57 [INFO] [CASE] id=A_6_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=450 inlier_ratio=0.896414342629482 time_total_s=3.108144 (1_degrade=0.000000,2_doc=0.263911,3_rectify=0.012960,4_decide=0.838626,5_uvdoc=0.535863,6_bgdiv=0.235009,7_match=1.155939,8_warp=0.065836) src=6.jpg
+2026-01-14 13:43:00 [INFO] [CASE] id=B_1_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=486 inlier_ratio=0.9257142857142857 time_total_s=3.175726 (1_degrade=0.000000,2_doc=0.290344,3_rectify=0.010232,4_decide=0.577150,5_uvdoc=0.614354,6_bgdiv=0.241202,7_match=1.367658,8_warp=0.074786) src=1.jpg
+2026-01-14 13:43:04 [INFO] [CASE] id=B_1_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=458 inlier_ratio=0.906930693069307 time_total_s=2.832484 (1_degrade=0.000000,2_doc=0.200272,3_rectify=0.011866,4_decide=0.414657,5_uvdoc=0.517943,6_bgdiv=0.249053,7_match=1.370249,8_warp=0.068443) src=1.jpg
+2026-01-14 13:43:07 [INFO] [CASE] id=B_1_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=475 inlier_ratio=0.9047619047619048 time_total_s=2.900208 (1_degrade=0.000000,2_doc=0.311313,3_rectify=0.024040,4_decide=0.651701,5_uvdoc=0.425506,6_bgdiv=0.214131,7_match=1.211332,8_warp=0.062185) src=1.jpg
+2026-01-14 13:43:10 [INFO] [CASE] id=B_1_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=465 inlier_ratio=0.9226190476190477 time_total_s=2.708313 (1_degrade=0.000000,2_doc=0.201536,3_rectify=0.010069,4_decide=0.720183,5_uvdoc=0.412386,6_bgdiv=0.205517,7_match=1.055149,8_warp=0.103473) src=1.jpg
+2026-01-14 13:43:13 [INFO] [CASE] id=B_1_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=1.jpg inliers=479 inlier_ratio=0.9300970873786408 time_total_s=2.820266 (1_degrade=0.000000,2_doc=0.272411,3_rectify=0.012569,4_decide=0.386342,5_uvdoc=0.569658,6_bgdiv=0.215763,7_match=1.289693,8_warp=0.073830) src=1.jpg
+2026-01-14 13:43:17 [INFO] [CASE] id=B_2_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=451 inlier_ratio=0.9056224899598394 time_total_s=3.372427 (1_degrade=0.000000,2_doc=0.217758,3_rectify=0.012691,4_decide=1.202755,5_uvdoc=0.416207,6_bgdiv=0.251867,7_match=1.208302,8_warp=0.062847) src=2.jpg
+2026-01-14 13:43:21 [INFO] [CASE] id=B_2_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=432 inlier_ratio=0.8762677484787018 time_total_s=3.305367 (1_degrade=0.000000,2_doc=0.213871,3_rectify=0.012365,4_decide=0.920659,5_uvdoc=0.600364,6_bgdiv=0.221876,7_match=1.260604,8_warp=0.075628) src=2.jpg
+2026-01-14 13:43:21 [WARNING] [CASE] id=B_2_deg02 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form=B pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=0.225922 (1_degrade=0.000000,2_doc=0.225922,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=2.jpg
+2026-01-14 13:43:24 [INFO] [CASE] id=B_2_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=2.jpg inliers=471 inlier_ratio=0.8920454545454546 time_total_s=2.916812 (1_degrade=0.000000,2_doc=0.212409,3_rectify=0.010170,4_decide=0.352958,5_uvdoc=0.485891,6_bgdiv=0.284797,7_match=1.503912,8_warp=0.066675) src=2.jpg
+2026-01-14 13:43:25 [WARNING] [CASE] id=B_2_deg04 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form=B pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=0.203040 (1_degrade=0.000000,2_doc=0.203040,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=2.jpg
+2026-01-14 13:43:28 [INFO] [CASE] id=B_3_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=398 inlier_ratio=0.7819253438113949 time_total_s=3.441110 (1_degrade=0.000000,2_doc=0.275249,3_rectify=0.015230,4_decide=1.232534,5_uvdoc=0.467688,6_bgdiv=0.216613,7_match=1.166388,8_warp=0.067407) src=3.jpg
+2026-01-14 13:43:32 [INFO] [CASE] id=B_3_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=361 inlier_ratio=0.7505197505197505 time_total_s=3.274589 (1_degrade=0.000000,2_doc=0.215086,3_rectify=0.009845,4_decide=0.840329,5_uvdoc=0.624131,6_bgdiv=0.249857,7_match=1.264164,8_warp=0.071176) src=3.jpg
+2026-01-14 13:43:35 [INFO] [CASE] id=B_3_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=516 inlier_ratio=0.9591078066914498 time_total_s=2.663619 (1_degrade=0.000000,2_doc=0.202271,3_rectify=0.009916,4_decide=0.653034,5_uvdoc=0.474502,6_bgdiv=0.208894,7_match=1.040868,8_warp=0.074134) src=3.jpg
+2026-01-14 13:43:39 [INFO] [CASE] id=B_3_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=452 inlier_ratio=0.9224489795918367 time_total_s=3.210243 (1_degrade=0.000000,2_doc=0.205192,3_rectify=0.014012,4_decide=1.033734,5_uvdoc=0.479626,6_bgdiv=0.226938,7_match=1.181867,8_warp=0.068875) src=3.jpg
+2026-01-14 13:43:42 [INFO] [CASE] id=B_3_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=439 inlier_ratio=0.9032921810699589 time_total_s=2.722155 (1_degrade=0.000000,2_doc=0.202320,3_rectify=0.010085,4_decide=0.453935,5_uvdoc=0.534310,6_bgdiv=0.214160,7_match=1.234053,8_warp=0.073291) src=3.jpg
+2026-01-14 13:43:45 [INFO] [CASE] id=B_4_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=532 inlier_ratio=0.9316987740805605 time_total_s=3.015821 (1_degrade=0.000000,2_doc=0.221654,3_rectify=0.009676,4_decide=0.645954,5_uvdoc=0.504259,6_bgdiv=0.236875,7_match=1.325258,8_warp=0.072146) src=4.jpg
+2026-01-14 13:43:49 [INFO] [CASE] id=B_4_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=504 inlier_ratio=0.8936170212765957 time_total_s=3.326786 (1_degrade=0.000000,2_doc=0.224249,3_rectify=0.012246,4_decide=1.043084,5_uvdoc=0.510372,6_bgdiv=0.229007,7_match=1.247213,8_warp=0.060615) src=4.jpg
+2026-01-14 13:43:53 [INFO] [CASE] id=B_4_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=397 inlier_ratio=0.7039007092198581 time_total_s=3.355748 (1_degrade=0.000000,2_doc=0.216501,3_rectify=0.010047,4_decide=0.970893,5_uvdoc=0.448533,6_bgdiv=0.278442,7_match=1.360419,8_warp=0.070914) src=4.jpg
+2026-01-14 13:43:53 [WARNING] [CASE] id=B_4_deg03 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form=B pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=0.257649 (1_degrade=0.000000,2_doc=0.257649,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=4.jpg
+2026-01-14 13:43:56 [INFO] [CASE] id=B_4_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=516 inlier_ratio=0.9068541300527241 time_total_s=2.602500 (1_degrade=0.000000,2_doc=0.237288,3_rectify=0.011917,4_decide=0.411831,5_uvdoc=0.541716,6_bgdiv=0.235584,7_match=1.102196,8_warp=0.061968) src=4.jpg
+2026-01-14 13:43:56 [WARNING] [CASE] id=B_5_deg00 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form=B pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=0.231239 (1_degrade=0.000000,2_doc=0.231239,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=5.jpg
+2026-01-14 13:43:56 [WARNING] [CASE] id=B_5_deg01 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form=B pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=0.217918 (1_degrade=0.000000,2_doc=0.217918,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=5.jpg
+2026-01-14 13:44:00 [INFO] [CASE] id=B_5_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=422 inlier_ratio=0.8099808061420346 time_total_s=3.597525 (1_degrade=0.000000,2_doc=0.205083,3_rectify=0.010760,4_decide=1.357091,5_uvdoc=0.521655,6_bgdiv=0.233392,7_match=1.188977,8_warp=0.080566) src=5.jpg
+2026-01-14 13:44:04 [INFO] [CASE] id=B_5_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=477 inlier_ratio=0.9103053435114504 time_total_s=3.675914 (1_degrade=0.000000,2_doc=0.225925,3_rectify=0.012008,4_decide=1.781275,5_uvdoc=0.366402,6_bgdiv=0.211781,7_match=1.013734,8_warp=0.064790) src=5.jpg
+2026-01-14 13:44:05 [WARNING] [CASE] id=B_5_deg04 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=below_threshold gt_form=B pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=0.914956 (1_degrade=0.000000,2_doc=0.206668,3_rectify=0.010239,4_decide=0.698050,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=5.jpg
+2026-01-14 13:44:08 [INFO] [CASE] id=B_6_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=423 inlier_ratio=0.7761467889908257 time_total_s=2.371998 (1_degrade=0.000000,2_doc=0.188686,3_rectify=0.010806,4_decide=0.394155,5_uvdoc=0.406857,6_bgdiv=0.209663,7_match=1.097641,8_warp=0.064190) src=6.jpg
+2026-01-14 13:44:11 [INFO] [CASE] id=B_6_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=495 inlier_ratio=0.9322033898305084 time_total_s=2.946749 (1_degrade=0.000000,2_doc=0.191247,3_rectify=0.012141,4_decide=1.002756,5_uvdoc=0.370404,6_bgdiv=0.258543,7_match=1.043677,8_warp=0.067981) src=6.jpg
+2026-01-14 13:44:14 [INFO] [CASE] id=B_6_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=460 inlier_ratio=0.888030888030888 time_total_s=2.511936 (1_degrade=0.000000,2_doc=0.200402,3_rectify=0.011138,4_decide=0.499956,5_uvdoc=0.418492,6_bgdiv=0.215555,7_match=1.097512,8_warp=0.068880) src=6.jpg
+2026-01-14 13:44:18 [INFO] [CASE] id=B_6_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=411 inlier_ratio=0.7934362934362934 time_total_s=3.086799 (1_degrade=0.000000,2_doc=0.196371,3_rectify=0.010599,4_decide=1.000495,5_uvdoc=0.387845,6_bgdiv=0.213892,7_match=1.200798,8_warp=0.076799) src=6.jpg
+2026-01-14 13:44:21 [INFO] [CASE] id=B_6_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=B pred_form=B form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=499 inlier_ratio=0.9257884972170687 time_total_s=3.112848 (1_degrade=0.000000,2_doc=0.191908,3_rectify=0.010010,4_decide=0.965383,5_uvdoc=0.378058,6_bgdiv=0.242744,7_match=1.253133,8_warp=0.071613) src=6.jpg
+2026-01-14 13:44:22 [INFO] [CASE] id=C_1_deg00 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=0.909077 (1_degrade=0.000000,2_doc=0.225052,3_rectify=0.012538,4_decide=0.671486,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=1.jpg
+2026-01-14 13:44:23 [INFO] [CASE] id=C_1_deg01 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=0.867662 (1_degrade=0.000000,2_doc=0.210122,3_rectify=0.010211,4_decide=0.647329,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=1.jpg
+2026-01-14 13:44:24 [INFO] [CASE] id=C_1_deg02 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=1.025472 (1_degrade=0.000000,2_doc=0.274761,3_rectify=0.015636,4_decide=0.735075,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=1.jpg
+2026-01-14 13:44:26 [INFO] [CASE] id=C_1_deg03 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=1.472339 (1_degrade=0.000000,2_doc=0.215193,3_rectify=0.012036,4_decide=1.245110,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=1.jpg
+2026-01-14 13:44:27 [INFO] [CASE] id=C_1_deg04 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=1.455396 (1_degrade=0.000000,2_doc=0.229071,3_rectify=0.012346,4_decide=1.213979,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=1.jpg
+2026-01-14 13:44:28 [WARNING] [CASE] id=C_2_deg00 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=0.456908 (1_degrade=0.000000,2_doc=0.456908,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=2.jpg
+2026-01-14 13:44:28 [WARNING] [CASE] id=C_2_deg01 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=0.312858 (1_degrade=0.000000,2_doc=0.312858,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=2.jpg
+2026-01-14 13:44:28 [WARNING] [CASE] id=C_2_deg02 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=0.279422 (1_degrade=0.000000,2_doc=0.279422,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=2.jpg
+2026-01-14 13:44:30 [INFO] [CASE] id=C_2_deg03 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=1.672908 (1_degrade=0.000000,2_doc=0.267191,3_rectify=0.018342,4_decide=1.387375,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=2.jpg
+2026-01-14 13:44:30 [WARNING] [CASE] id=C_2_deg04 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=0.284293 (1_degrade=0.000000,2_doc=0.284293,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=2.jpg
+2026-01-14 13:44:31 [INFO] [CASE] id=C_3_deg00 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=1.011250 (1_degrade=0.000000,2_doc=0.241385,3_rectify=0.013838,4_decide=0.756027,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=3.jpg
+2026-01-14 13:44:32 [INFO] [CASE] id=C_3_deg01 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=0.970186 (1_degrade=0.000000,2_doc=0.255633,3_rectify=0.020560,4_decide=0.693993,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=3.jpg
+2026-01-14 13:44:34 [INFO] [CASE] id=C_3_deg02 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=1.452803 (1_degrade=0.000000,2_doc=0.313416,3_rectify=0.016697,4_decide=1.122690,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=3.jpg
+2026-01-14 13:44:35 [INFO] [CASE] id=C_3_deg03 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=1.316120 (1_degrade=0.000000,2_doc=0.289201,3_rectify=0.010140,4_decide=1.016779,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=3.jpg
+2026-01-14 13:44:36 [INFO] [CASE] id=C_3_deg04 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=0.985304 (1_degrade=0.000000,2_doc=0.242446,3_rectify=0.011179,4_decide=0.731679,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=3.jpg
+2026-01-14 13:44:37 [INFO] [CASE] id=C_4_deg00 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=0.852407 (1_degrade=0.000000,2_doc=0.215891,3_rectify=0.012826,4_decide=0.623690,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=4.jpg
+2026-01-14 13:44:38 [INFO] [CASE] id=C_4_deg01 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=0.780238 (1_degrade=0.000000,2_doc=0.216992,3_rectify=0.011846,4_decide=0.551399,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=4.jpg
+2026-01-14 13:44:39 [INFO] [CASE] id=C_4_deg02 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=0.907684 (1_degrade=0.000000,2_doc=0.223004,3_rectify=0.011675,4_decide=0.673005,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=4.jpg
+2026-01-14 13:44:40 [INFO] [CASE] id=C_4_deg03 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=0.985308 (1_degrade=0.000000,2_doc=0.192387,3_rectify=0.013597,4_decide=0.779324,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=4.jpg
+2026-01-14 13:44:41 [INFO] [CASE] id=C_4_deg04 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=1.009250 (1_degrade=0.000000,2_doc=0.223928,3_rectify=0.013179,4_decide=0.772143,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=4.jpg
+2026-01-14 13:44:41 [WARNING] [CASE] id=C_5_deg00 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=0.226048 (1_degrade=0.000000,2_doc=0.226048,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=5.jpg
+2026-01-14 13:44:43 [INFO] [CASE] id=C_5_deg01 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=1.096067 (1_degrade=0.000000,2_doc=0.197185,3_rectify=0.010362,4_decide=0.888520,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=5.jpg
+2026-01-14 13:44:44 [INFO] [CASE] id=C_5_deg02 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=0.832799 (1_degrade=0.000000,2_doc=0.211165,3_rectify=0.014088,4_decide=0.607546,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=5.jpg
+2026-01-14 13:44:45 [INFO] [CASE] id=C_5_deg03 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=0.966418 (1_degrade=0.000000,2_doc=0.222686,3_rectify=0.010042,4_decide=0.733690,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=5.jpg
+2026-01-14 13:44:45 [INFO] [CASE] id=C_5_deg04 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=0.921040 (1_degrade=0.000000,2_doc=0.212012,3_rectify=0.012180,4_decide=0.696848,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=5.jpg
+2026-01-14 13:44:47 [INFO] [CASE] id=C_6_deg00 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=1.272748 (1_degrade=0.000000,2_doc=0.202029,3_rectify=0.010039,4_decide=1.060680,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=6.jpg
+2026-01-14 13:44:48 [INFO] [CASE] id=C_6_deg01 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=1.227672 (1_degrade=0.000000,2_doc=0.263844,3_rectify=0.014538,4_decide=0.949291,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=6.jpg
+2026-01-14 13:44:49 [INFO] [CASE] id=C_6_deg02 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=1.293560 (1_degrade=0.000000,2_doc=0.228180,3_rectify=0.011327,4_decide=1.054053,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=6.jpg
+2026-01-14 13:44:51 [INFO] [CASE] id=C_6_deg03 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=1.040655 (1_degrade=0.000000,2_doc=0.208626,3_rectify=0.009779,4_decide=0.822250,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=6.jpg
+2026-01-14 13:44:52 [INFO] [CASE] id=C_6_deg04 ok=TRUE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=1.016742 (1_degrade=0.000000,2_doc=0.198409,3_rectify=0.011203,4_decide=0.807130,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=6.jpg
+2026-01-14 13:44:55 [INFO] [CASE] id=test_A_3_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=209 inlier_ratio=0.5837988826815642 time_total_s=3.235969 (1_degrade=0.000000,2_doc=0.234868,3_rectify=0.010978,4_decide=0.478635,5_uvdoc=0.571115,6_bgdiv=0.248782,7_match=1.613975,8_warp=0.077617) src=A_3.png
+2026-01-14 13:44:59 [INFO] [CASE] id=test_A_3_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=219 inlier_ratio=0.6033057851239669 time_total_s=3.749634 (1_degrade=0.000000,2_doc=0.223889,3_rectify=0.011953,4_decide=0.891910,5_uvdoc=0.622240,6_bgdiv=0.228021,7_match=1.696440,8_warp=0.075182) src=A_3.png
+2026-01-14 13:45:03 [INFO] [CASE] id=test_A_3_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=220 inlier_ratio=0.6060606060606061 time_total_s=3.157143 (1_degrade=0.000000,2_doc=0.246334,3_rectify=0.011545,4_decide=0.784600,5_uvdoc=0.461155,6_bgdiv=0.211033,7_match=1.375415,8_warp=0.067062) src=A_3.png
+2026-01-14 13:45:06 [INFO] [CASE] id=test_A_3_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=219 inlier_ratio=0.6169014084507042 time_total_s=2.776099 (1_degrade=0.000000,2_doc=0.248959,3_rectify=0.013393,4_decide=0.368436,5_uvdoc=0.512139,6_bgdiv=0.224017,7_match=1.344616,8_warp=0.064538) src=A_3.png
+2026-01-14 13:45:09 [INFO] [CASE] id=test_A_3_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=3.jpg inliers=216 inlier_ratio=0.5966850828729282 time_total_s=3.194231 (1_degrade=0.000000,2_doc=0.204906,3_rectify=0.013772,4_decide=0.410108,5_uvdoc=0.587202,6_bgdiv=0.240139,7_match=1.659666,8_warp=0.078438) src=A_3.png
+2026-01-14 13:45:13 [INFO] [CASE] id=test_A_4_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=247 inlier_ratio=0.5771028037383178 time_total_s=3.526710 (1_degrade=0.000000,2_doc=0.235049,3_rectify=0.012811,4_decide=0.944298,5_uvdoc=0.610251,6_bgdiv=0.225427,7_match=1.421190,8_warp=0.077684) src=A_4.png
+2026-01-14 13:45:17 [INFO] [CASE] id=test_A_4_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=288 inlier_ratio=0.6457399103139013 time_total_s=3.231703 (1_degrade=0.000000,2_doc=0.254172,3_rectify=0.011875,4_decide=0.616869,5_uvdoc=0.562962,6_bgdiv=0.235675,7_match=1.464882,8_warp=0.085268) src=A_4.png
+2026-01-14 13:45:17 [WARNING] [CASE] id=test_A_4_deg02 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=0.235469 (1_degrade=0.000000,2_doc=0.235469,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_4.png
+2026-01-14 13:45:17 [WARNING] [CASE] id=test_A_4_deg03 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=0.246577 (1_degrade=0.000000,2_doc=0.246577,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_4.png
+2026-01-14 13:45:21 [INFO] [CASE] id=test_A_4_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=4.jpg inliers=242 inlier_ratio=0.5260869565217391 time_total_s=3.628919 (1_degrade=0.000000,2_doc=0.265571,3_rectify=0.014350,4_decide=0.977723,5_uvdoc=0.588325,6_bgdiv=0.236519,7_match=1.461179,8_warp=0.085251) src=A_4.png
+2026-01-14 13:45:25 [INFO] [CASE] id=test_A_5_deg00 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=132 inlier_ratio=0.30697674418604654 time_total_s=3.463866 (1_degrade=0.000000,2_doc=0.235498,3_rectify=0.012820,4_decide=0.907920,5_uvdoc=0.552759,6_bgdiv=0.239936,7_match=1.437046,8_warp=0.077886) src=A_5.png
+2026-01-14 13:45:28 [INFO] [CASE] id=test_A_5_deg01 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=131 inlier_ratio=0.27637130801687765 time_total_s=2.838321 (1_degrade=0.000000,2_doc=0.218509,3_rectify=0.011540,4_decide=0.367657,5_uvdoc=0.547334,6_bgdiv=0.212188,7_match=1.416118,8_warp=0.064974) src=A_5.png
+2026-01-14 13:45:32 [INFO] [CASE] id=test_A_5_deg02 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=148 inlier_ratio=0.3203463203463203 time_total_s=3.102264 (1_degrade=0.000000,2_doc=0.209474,3_rectify=0.011971,4_decide=0.382404,5_uvdoc=0.545552,6_bgdiv=0.224470,7_match=1.646446,8_warp=0.081948) src=A_5.png
+2026-01-14 13:45:35 [INFO] [CASE] id=test_A_5_deg03 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=157 inlier_ratio=0.33192389006342493 time_total_s=3.105857 (1_degrade=0.000000,2_doc=0.229977,3_rectify=0.012615,4_decide=0.416458,5_uvdoc=0.565326,6_bgdiv=0.250127,7_match=1.555897,8_warp=0.075456) src=A_5.png
+2026-01-14 13:45:39 [INFO] [CASE] id=test_A_5_deg04 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=5.jpg inliers=158 inlier_ratio=0.33978494623655914 time_total_s=4.018599 (1_degrade=0.000000,2_doc=0.263289,3_rectify=0.015742,4_decide=1.134739,5_uvdoc=0.587171,6_bgdiv=0.253437,7_match=1.683116,8_warp=0.081104) src=A_5.png
+2026-01-14 13:45:43 [WARNING] [CASE] id=test_A_6_deg00 ok=FALSE ok_warp=FALSE stage=homography_unstable unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=50 inlier_ratio=0.25510204081632654 time_total_s=3.503665 (1_degrade=0.000000,2_doc=0.247894,3_rectify=0.011006,4_decide=0.717009,5_uvdoc=0.640592,6_bgdiv=0.262216,7_match=1.624907,8_warp=0.000041) src=A_6.png
+2026-01-14 13:45:47 [WARNING] [CASE] id=test_A_6_deg01 ok=FALSE ok_warp=FALSE stage=homography_unstable unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=44 inlier_ratio=0.32592592592592595 time_total_s=3.872769 (1_degrade=0.000000,2_doc=0.303739,3_rectify=0.013754,4_decide=1.085395,5_uvdoc=0.589319,6_bgdiv=0.265174,7_match=1.615350,8_warp=0.000038) src=A_6.png
+2026-01-14 13:45:48 [WARNING] [CASE] id=test_A_6_deg02 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=0.263957 (1_degrade=0.000000,2_doc=0.263957,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_6.png
+2026-01-14 13:45:49 [WARNING] [CASE] id=test_A_6_deg03 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form=A pred_form= form_ok=FALSE template_ok=FALSE best_template= inliers= inlier_ratio= time_total_s=1.711443 (1_degrade=0.000000,2_doc=0.239662,3_rectify=0.010030,4_decide=1.461752,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_6.png
+2026-01-14 13:45:53 [WARNING] [CASE] id=test_A_6_deg04 ok=FALSE ok_warp=FALSE stage=homography_unstable unknown_reason= gt_form=A pred_form=A form_ok=TRUE template_ok=TRUE best_template=6.jpg inliers=53 inlier_ratio=0.2398190045248869 time_total_s=3.305575 (1_degrade=0.000000,2_doc=0.260500,3_rectify=0.012791,4_decide=0.482934,5_uvdoc=0.644513,6_bgdiv=0.247431,7_match=1.657370,8_warp=0.000034) src=A_6.png
+2026-01-14 13:45:53 [INFO] ======================================================================
+2026-01-14 13:45:53 [INFO] [SUMMARY] total=110 ok_expected=83 (75.5%) ok_warp=58 (52.7%)
+2026-01-14 13:45:53 [INFO] [SUMMARY] elapsed avg per case: 2.291s
+2026-01-14 13:45:53 [INFO] [SUMMARY] stage counts:
+2026-01-14 13:45:53 [INFO]   done                 : 58
+2026-01-14 13:45:53 [INFO]   form_unknown         : 31
+2026-01-14 13:45:53 [INFO]   docaligner_failed    : 18
+2026-01-14 13:45:53 [INFO]   homography_unstable  : 3
+2026-01-14 13:45:53 [INFO] [SUMMARY] stage time totals (s):
+2026-01-14 13:45:53 [INFO]   degrade_s    : 0.00
+2026-01-14 13:45:53 [INFO]   docaligner_s : 25.84
+2026-01-14 13:45:53 [INFO]   rectify_s    : 1.12
+2026-01-14 13:45:53 [INFO]   decide_s     : 72.82
+2026-01-14 13:45:53 [INFO]   uvdoc_s      : 30.94
+2026-01-14 13:45:53 [INFO]   bgdiv_s      : 14.56
+2026-01-14 13:45:53 [INFO]   match_s      : 80.05
+2026-01-14 13:45:53 [INFO]   warp_s       : 4.21
+2026-01-14 13:45:53 [INFO] ======================================================================
+2026-01-14 13:45:53 [INFO] [STATS] overall
+2026-01-14 13:45:53 [INFO]   total_cases                       : 110
+2026-01-14 13:45:53 [INFO]   ok_warp(done_aligned_generated)    : 58 (52.7%)
+2026-01-14 13:45:53 [INFO]   ok_expected_behavior(user_KPI)     : 83 (75.5%)
+2026-01-14 13:45:53 [INFO]   run_elapsed_total_seconds          : 252.009
+2026-01-14 13:45:53 [INFO]   avg_elapsed_per_case_seconds       : 2.291
+2026-01-14 13:45:53 [INFO] [STATS] A form
+2026-01-14 13:45:53 [INFO]   cases                             : 50
+2026-01-14 13:45:53 [INFO]   form_accuracy                      : 37 (74.0%)
+2026-01-14 13:45:53 [INFO]   template_accuracy                  : 37 (74.0%)
+2026-01-14 13:45:53 [INFO] [STATS] B form
+2026-01-14 13:45:53 [INFO]   cases                             : 30
+2026-01-14 13:45:53 [INFO]   form_accuracy                      : 24 (80.0%)
+2026-01-14 13:45:53 [INFO]   template_accuracy                  : 24 (80.0%)
+2026-01-14 13:45:53 [INFO] [STATS] C form (should be rejected)
+2026-01-14 13:45:53 [INFO]   cases                             : 30
+2026-01-14 13:45:53 [INFO]   reject_success(stage=form_unknown) : 25 (83.3%)
+2026-01-14 13:45:53 [INFO]   false_positive_as_A                : 0 (0.0%)
+2026-01-14 13:45:53 [INFO]   false_positive_as_B                : 0 (0.0%)
+2026-01-14 13:45:53 [INFO] [STATS] test dataset (image/test)
+2026-01-14 13:45:53 [INFO]   total                             : 20
+2026-01-14 13:45:53 [INFO]   A cases                            : 20
+2026-01-14 13:45:53 [INFO]   A template_accuracy                 : 16 (80.0%)
+2026-01-14 13:45:53 [INFO]   B cases                            : 0
+2026-01-14 13:45:53 [INFO]   B template_accuracy                 : 0 (nan%)
+2026-01-14 13:45:53 [INFO]   C cases                            : 0
+2026-01-14 13:45:53 [INFO]   C reject_success(stage=form_unknown): 0 (nan%)
+2026-01-14 13:45:53 [INFO] [STATS] stage time totals (s) (same as SUMMARY)
+2026-01-14 13:45:53 [INFO]   degrade_s    : 0.00
+2026-01-14 13:45:53 [INFO]   docaligner_s : 25.84
+2026-01-14 13:45:53 [INFO]   rectify_s    : 1.12
+2026-01-14 13:45:53 [INFO]   decide_s     : 72.82
+2026-01-14 13:45:53 [INFO]   uvdoc_s      : 30.94
+2026-01-14 13:45:53 [INFO]   bgdiv_s      : 14.56
+2026-01-14 13:45:53 [INFO]   match_s      : 80.05
+2026-01-14 13:45:53 [INFO]   warp_s       : 4.21
+2026-01-14 13:45:53 [INFO] [STATS] stage time mean per case (s)
+2026-01-14 13:45:53 [INFO]   degrade_s    : 0.000
+2026-01-14 13:45:53 [INFO]   docaligner_s : 0.235
+2026-01-14 13:45:53 [INFO]   rectify_s    : 0.010
+2026-01-14 13:45:53 [INFO]   decide_s     : 0.662
+2026-01-14 13:45:53 [INFO]   uvdoc_s      : 0.281
+2026-01-14 13:45:53 [INFO]   bgdiv_s      : 0.132
+2026-01-14 13:45:53 [INFO]   match_s      : 0.728
+2026-01-14 13:45:53 [INFO]   warp_s       : 0.038
+2026-01-14 13:45:53 [INFO] [STATS] per-case total time (s)
+2026-01-14 13:45:53 [INFO]   mean  : 2.087
+2026-01-14 13:45:53 [INFO]   median: 2.581
+2026-01-14 13:45:53 [INFO] [DONE] outputs: C:\Users\takumi\develop\APA\output_pipeline\run_20260114_133812
+2026-01-14 13:45:53 [INFO] [DONE] elapsed: 252.0s
+
+```
