@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""paper_pipeline_v12.py
+"""paper_pipeline_v13.py
 
 [windows]
-C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v12.py
+C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v13.py
 
 [mac]
 # リポジトリルートから実行する想定（`APA/` 配下のスクリプトを直接指定）
-.venv/bin/python paper_pipeline_v12.py
+.venv/bin/python paper_pipeline_v13.py
 
 目的
 ----
@@ -31,11 +31,11 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v12.py
 
 処理フロー（1 case = 1 枚の入力から生成した 1 枚の改悪画像）:
 
-※ v12.7: 改悪生成（degrade）は **最初に全ケース分をまとめて生成**し、以降の本処理へ投入する。
+※ v13.7: 改悪生成（degrade）は **最初に全ケース分をまとめて生成**し、以降の本処理へ投入する。
    改悪生成の所要時間は計測対象外。
 
 1) 改悪生成（`APA/test_recovery_paper.py` の実装を流用）
-   - v12.5: 紙のしなり（非線形ワープ）と、撮影時の影（照明ムラ）を追加
+   - v13.5: 紙のしなり（非線形ワープ）と、撮影時の影（照明ムラ）を追加
 2) DocAligner により紙領域 polygon（4点）を推定
    - 失敗したら `stage=docaligner_failed` で終了
 3) polygon を（紙サイズ比の margin で）外側に拡張 → 透視補正（rectify）
@@ -46,14 +46,14 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v12.py
      - 0 と 180 を比較し、最上位角度を確定に使う
      - 0/180 で何も見つからない場合は Unknown（no_detection）とする（救済処置は行わない）
    - フォームA: 3点マーク（TL/TR/BL）が検出できる（`--marker-preproc` で前処理オプション）
-     - v12 では **フォームAスコアが十分高い場合**、速度のため **フォームB判定をスキップ**する
+     - v13 では **フォームAスコアが十分高い場合**、速度のため **フォームB判定をスキップ**する
        - 既定の閾値は `PIPELINE_DEFAULTS["formA_strong"]["score_threshold"]`（現状 4.0）
-     - v12.6: A が検出できても **Unknown閾値未満** の場合は、その時点で Unknown 確定せず
+     - v13.6: A が検出できても **Unknown閾値未満** の場合は、その時点で Unknown 確定せず
        **フォームB探索へフォールバック**する（B の取りこぼし回避）
    - フォームB: QRコードが検出できる
      - **WeChat QR エンジンのみ** を使用（OpenCV 標準 `QRCodeDetector` は使わない）
      - `--wechat-model-dir` にモデルが必要（opencv-contrib 必須）
-     - v12 では WeChat-only でも v7 と同様に **fast → robust の2段階**で評価する
+     - v13 では WeChat-only でも v7 と同様に **fast → robust の2段階**で評価する
        - scan中は fast（軽量）で角度候補を評価
        - B が勝った場合のみ、同一角度で robust を **最大1回** 実行して確定
    - 判定不能/曖昧なら `stage=form_unknown`（Unknown）で終了
@@ -80,7 +80,7 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v12.py
 - `summary.json` / `summary.csv`
 - `run.log`           : 実行ログ（logging）
 
-※v12 ではデバッグ画像の保存量を `--save-images {all,fail,none}` で制御できる。
+※v13 ではデバッグ画像の保存量を `--save-images {all,fail,none}` で制御できる。
 
 - `all` : 従来通り、常に保存
 - `fail`: `stage!=done` のケースだけ保存（成功ケースは保存しない）
@@ -88,7 +88,7 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v12.py
 
 ディレクトリ自体は作られるが、`fail/none` の場合は中身が空になることがある。
 
-※ v12.7: `--save-images` の設定に関わらず、`7_aligned/` は成果物として必ず保存される。
+※ v13.7: `--save-images` の設定に関わらず、`7_aligned/` は成果物として必ず保存される。
 
 注意
 ----
@@ -105,7 +105,7 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v12.py
 改善点メモ
 ----
 
-v12.7（本タスク）
+v13.7（本タスク）
 ----------------
 - 改悪生成（degrade）は **最初に全ケース分をまとめて生成**し、その所要時間は計測対象外とする。
   - 生成した改悪画像を 1 枚ずつパイプライン本体へ投入する。
@@ -310,7 +310,7 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
         "max_attempts": 50,  # 改悪生成の最大試行回数
         "seed": 45,  # 乱数シード（再現性）
 
-        # v12.5: 紙がしなっているような歪み（非線形ワープ）
+        # v13.5: 紙がしなっているような歪み（非線形ワープ）
         # 目的:
         #   - 撮影で起きる「紙のたわみ」により、単純な射影変換だけでは表現できない歪みを追加する。
         #   - ただし難しすぎると全滅するため、弱め〜中程度をデフォルトとする。
@@ -323,7 +323,7 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
             "freq_choices": [1, 2],  # 波の周期数
         },
 
-        # v12.5: 撮影時の影（照明ムラ）の混入
+        # v13.5: 撮影時の影（照明ムラ）の混入
         # 目的:
         #   - 斜め方向の影/周辺減光を軽く入れて、現実の撮影に近づける。
         "shadow": {
@@ -348,7 +348,7 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
 
         # NOTE:
         # `warp_template_to_random_view()` 側でも軽い blur/noise を入れている。
-        # v12.5 では「紙のしなり」「影」を主目的として追加し、
+        # v13.5 では「紙のしなり」「影」を主目的として追加し、
         # post の追加劣化は行わない（過度な難化・二重劣化を避ける）。
     },
 
@@ -377,7 +377,7 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
     # フォーム判定（回転スキャン）
     "rotation_scan": {
         "max_workers": 8,  # 回転スキャンの並列数（スレッド）
-        # v12.2 改善: rectify 後は enforce_landscape で横長に統一されているため、
+        # v13.2 改善: rectify 後は enforce_landscape で横長に統一されているため、
         # 追加で見るべきは「上下反転（180度）」のみ。
         "scan_angles_2_deg": [0.0, 180.0],
     },
@@ -438,7 +438,7 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
             # NOTE:
             # 2026/01/09: A 正解なのに `marker_surrounding_not_blank` で弾かれるケースが発生したため、
             # 誤検出抑制は維持しつつ「A の取りこぼし」を減らす方向で閾値を少し緩める。
-            # v12.5 で shadow(照明ムラ) を入れると、
+            # v13.5 で shadow(照明ムラ) を入れると、
             # 正しいフォームAでも右上マーカー周辺が 180前後まで暗くなるケースがある。
             # C->A 誤判定抑制を維持しつつ取りこぼしを減らすため、少し緩める。
             "surround_min_mean_gray": 175.0,  # 周辺領域の平均輝度がこの値未満なら「汚れている」とみなす
@@ -454,19 +454,19 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
     "qr": {
         "min_test_side_px": 120,  # QR検出で試す画像サイズの最小辺(px)
         "wechat": {
-            # v12.2 改善:
+            # v13.2 改善:
             # v7並みの精度を確保するため、前処理バリエーションを増やす。
             # fast→robust の2段階で評価する。
             "fast": {
                 # fast: 角度候補の絞り込み用
-                # v12.2: 前処理を増やして精度向上
+                # v13.2: 前処理を増やして精度向上
                 # 高精度優先: 角度選択で取りこぼすと復帰できないため、fast 側も少し厚めにする。
                 "variants": ["bgr", "gray"],
                 "scales": [1.0],
             },
             "robust": {
                 # robust: 最終確定用（多少重くてもよいが、呼ぶのは最大1回）
-                # v12.2: v7並みの前処理バリエーションに拡張
+                # v13.2: v7並みの前処理バリエーションに拡張
                 # 注意:
                 # 以前の実装では variants に "adaptive_threshold" を書いていたが、
                 # 実装側が未対応で無視されるケースがあった。
@@ -617,7 +617,7 @@ def write_image(
 
 
 # ------------------------------------------------------------
-# 追加の改悪（v12.5）: 紙のしなり / 影（照明ムラ）
+# 追加の改悪（v13.5）: 紙のしなり / 影（照明ムラ）
 # ------------------------------------------------------------
 
 
@@ -993,7 +993,7 @@ class WeChatQRDetector:
 
         # NOTE:
         # OpenCV の wechat_qrcode_WeChatQRCode はスレッドセーフが保証されない。
-        # v12 改善: 呼び出し側で「detector をスレッド数分用意」し、ここでは Lock を使わない。
+        # v13 改善: 呼び出し側で「detector をスレッド数分用意」し、ここでは Lock を使わない。
         return self._decode_from_detector(self.detector, image_bgr)
 
 
@@ -1049,7 +1049,7 @@ def init_wechat_qr_detector(
 
     global _WECHAT_QR
     try:
-        # v12 改善: detector をスレッド数ぶん用意し、Lock による直列化を避ける。
+        # v13 改善: detector をスレッド数ぶん用意し、Lock による直列化を避ける。
         _WECHAT_QR = WeChatQRDetectorPool(model_dir=model_dir, pool_size=int(pool_size))
         if logger:
             logger.info("[OK] WeChat QR detector initialized: %s (pool_size=%d)", model_dir, int(pool_size))
@@ -1062,7 +1062,7 @@ def init_wechat_qr_detector(
 
 
 # --- 既存実装の流用 ---
-# 注意: このスクリプトは `python APA/paper_pipeline_v12.py ...` の形で実行される想定。
+# 注意: このスクリプトは `python APA/paper_pipeline_v13.py ...` の形で実行される想定。
 # その場合 sys.path[0] は `.../APA` になるため、同ディレクトリのモジュールは
 # `from test_recovery_paper import ...` の形で import する（`import APA.xxx` は失敗しやすい）。
 from test_recovery_paper import (
@@ -1676,7 +1676,7 @@ def detect_qr_codes_wechat(
 def _preprocess_variants_for_qr(image_bgr: np.ndarray, variant_names: list[str]) -> list[tuple[str, np.ndarray]]:
     """QR検出のための前処理バリエーションを作る。
 
-    v12.2 改善:
+    v13.2 改善:
       v7並みの精度を確保するため、clahe / adaptive_morph をサポート。
       これにより照明ムラや低コントラストのQRコードも検出しやすくなる。
 
@@ -1812,7 +1812,7 @@ def detect_qr_codes_wechat_multiscale(
 ) -> list[dict[str, Any]]:
     """WeChatエンジンによるQR検出（前処理 + マルチスケール）。
 
-    v12 改善（ユーザー要望）:
+    v13 改善（ユーザー要望）:
       - B判定を fast→robust の2段階にする
       - robust は必要時のみ 1 回
 
@@ -1901,7 +1901,7 @@ def detect_qr_codes_wechat_multiscale(
 def score_formB_fast(image_bgr: np.ndarray) -> tuple[bool, float, dict[str, Any]]:
     """回転スキャン中の高速B判定。
 
-    v7の設計（fast→必要ならrobust）を v12(WeChat-only) にも導入するためのもの。
+    v7の設計（fast→必要ならrobust）を v13(WeChat-only) にも導入するためのもの。
     - fast は見つけたら即返す
     - scale/variant は PIPELINE_DEFAULTS["qr"]["wechat"]["fast"] に従う
     """
@@ -1931,7 +1931,7 @@ def score_best_qr_candidate(
       - 右上に近いほど高得点（主）
       - QR面積が大きいほど高得点（副：安定性向上）
 
-    v12.1 改善:
+    v13.1 改善:
       フォームBのQRコードは必ず「右上」にあるべき。
       横長画像において、QRコードが右上象限にあるか左下象限にあるかを
       明確に区別し、右上にある場合に大きなボーナスを与える。
@@ -1955,7 +1955,7 @@ def score_best_qr_candidate(
             nx = cx / float(max(1, w))
             ny = cy / float(max(1, h))
 
-            # v12.1 改善:
+            # v13.1 改善:
             # 横長画像において、QRコードが「右上」にあるか「左下」にあるかを
             # 明確に判定する。フォームBでは正しい向きなら必ず右上にQRがある。
             #
@@ -2085,7 +2085,7 @@ def extract_form_unknown_reason(decision: Any) -> tuple[str, dict[str, Any]]:
             for r in scan:
                 try:
                     max_a = max(max_a, float(((r.get("A") or {}).get("score") or 0.0)))
-                    # v12では scan に B_fast が入る
+                    # v13では scan に B_fast が入る
                     max_b = max(max_b, float(((r.get("B_fast") or r.get("B") or {}).get("score") or 0.0)))
                 except Exception:
                     continue
@@ -2407,7 +2407,7 @@ def decide_form_by_rotations(
 ) -> FormDecision:
     """回転スキャンで、最良の判定（A/B/Unknown）を返す。
 
-    v12.3 改善（ユーザー要望）:
+    v13.3 改善（ユーザー要望）:
       フォールバック構造に変更:
         1. A探索（見つかればA確定）
         2. Aが見つからない → Bのfast探索
@@ -2463,7 +2463,7 @@ def decide_form_by_rotations(
 
     # Aが見つかった場合は即座にA確定
     if bestA is not None:
-        # v12.6 修正:
+        # v13.6 修正:
         # Aが検出できてもスコアが閾値未満なら、ここで Unknown に確定せず、
         # B探索へフォールバックする（BのQRが見えるケースを取りこぼさない）。
         if thr > 0 and bestA.score < thr:
@@ -2471,7 +2471,7 @@ def decide_form_by_rotations(
         else:
             return bestA
 
-    # v12.4 追加:
+    # v13.4 追加:
     # test データや強い改悪条件では marker_preproc=basic で取りこぼすことがあるため、
     # A が全滅した場合のみ「morph」を追加で試す（2角度なのでオーバーヘッドは小さい）。
     if str(marker_preproc) != "morph":
@@ -2672,7 +2672,7 @@ def decide_form_by_rotations(
 
 """（template-topn / グローバル特徴による事前絞り込み）
 
-v12 ではユーザー要望により「フォーム確定後は全テンプレを XFeat で照合」します。
+v13 ではユーザー要望により「フォーム確定後は全テンプレを XFeat で照合」します。
 そのため、旧版にあったグローバル特徴によるテンプレ候補絞り込み機能は削除しました。
 （CSVにも template-topn は出さず空欄にしています）
 """
@@ -2824,7 +2824,7 @@ def select_top_templates(
     templates: list[CachedRef],
     top_n: int,
 ) -> list[CachedRef]:
-    # v12 では prefilter を使わないため、互換用に「そのまま返す」だけにする。
+    # v13 では prefilter を使わないため、互換用に「そのまま返す」だけにする。
     # （この関数自体は本ファイル内では呼ばれない）
     _ = (target_desc, top_n)
     return templates
@@ -2979,7 +2979,7 @@ def _case_truth(src_form: str, src_path: Path) -> dict[str, Any]:
 def _truth_from_item(item: dict[str, Any]) -> dict[str, Any]:
     """item 内の ground truth を優先して返す。
 
-    v12.4:
+    v13.4:
       - image/test の評価では、入力画像名とテンプレ番号が一致しないため、
         item 側で ground truth を明示して上書きできるようにする。
     """
@@ -3182,7 +3182,7 @@ def build_csv_row(
 
         # ---- 実行設定（主要なものだけ抜粋） ----
         "run_config_rotation_step_deg": str(getattr(args, "rotation_step", "")),
-        # v12 では template-topn は廃止（常に全テンプレ照合）
+        # v13 では template-topn は廃止（常に全テンプレ照合）
         "run_config_template_topn": "",
         "run_config_xfeat_top_k": str(getattr(args, "top_k", "")),
         "run_config_xfeat_match_max_side_px": str(getattr(args, "match_max_side", "")),
@@ -3508,7 +3508,7 @@ def print_explain() -> None:
         f"  --device              XFeatの実行デバイス (auto/cpu/cuda) [default: {defaults.device}]",
         f"  --top-k               特徴点数（大きいほど高精度だが遅い） [default: {defaults.top_k}]",
         f"  --match-max-side      マッチング前にリサイズする最大辺(px)（大きいほど高精度だが遅い） [default: {defaults.match_max_side}]",
-        "  (注) v12 ではテンプレ候補絞り込み（template-topn）は廃止し、常に全テンプレ照合します。",
+        "  (注) v13 ではテンプレ候補絞り込み（template-topn）は廃止し、常に全テンプレ照合します。",
         "",
         "【ログ】",
         f"  --log-level           ログレベル (DEBUG/INFO/WARNING/ERROR) [default: {defaults.log_level}]",
@@ -3519,7 +3519,7 @@ def print_explain() -> None:
         f"  --out                 出力ディレクトリ（run_... が作成される） [default: {defaults.out}]",
         "",
         "最小コマンド例（おすすめデフォルト使用）:",
-        r"  C:\Users\takumi\develop\miniconda3\python.exe APA\paper_pipeline_v12.py --limit 1",
+        r"  C:\Users\takumi\develop\miniconda3\python.exe APA\paper_pipeline_v13.py --limit 1",
         "",
     ]
     print("\n".join(lines))
@@ -3775,7 +3775,7 @@ class StageTimes:
 
 @dataclass
 class DegradedCaseInput:
-    """改悪生成済みの入力（v12.7）。
+    """改悪生成済みの入力（v13.7）。
 
     - 改悪生成は main 冒頭でまとめて実行し、ここに格納して process_one_case へ渡す。
     - degrade 生成時間は計測しない（times.degrade_s は常に 0）
@@ -3798,7 +3798,7 @@ class DegradedCaseInput:
     ground_truth_template_number: str = ""
 
 
-def _apply_extra_degrade_v12_5(
+def _apply_extra_degrade_v13_5(
     *,
     src_bgr: np.ndarray,
     degraded_bgr: np.ndarray,
@@ -3806,10 +3806,10 @@ def _apply_extra_degrade_v12_5(
     degrade_meta: dict[str, Any],
     rng: random.Random,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """v12.5 の追加改悪（bend/shadow）を適用する。
+    """v13.5 の追加改悪（bend/shadow）を適用する。
 
     NOTE:
-      v12.7 では「改悪生成フェーズ」を最初に全件実行するため、
+      v13.7 では「改悪生成フェーズ」を最初に全件実行するため、
       追加改悪もここでまとめて適用する。
     """
 
@@ -3862,7 +3862,7 @@ def _apply_extra_degrade_v12_5(
 
     degrade_meta["bend"] = bend_meta
     degrade_meta["shadow"] = shadow_meta
-    degrade_meta["extra_degrade_v12_5"] = True
+    degrade_meta["extra_degrade_v13_5"] = True
     return degraded_bgr3, degrade_meta
 
 
@@ -3879,7 +3879,7 @@ def process_one_case(
     degraded_input: DegradedCaseInput,
     out_dirs: dict[str, Path],
 ) -> tuple[dict[str, Any], StageTimes]:
-    """改悪生成済み画像（degraded_input）を処理する（v12.7）。
+    """改悪生成済み画像（degraded_input）を処理する（v13.7）。
 
     重要:
       - 改悪生成（degrade）は main で全件生成済みであり、ここでは行わない。
@@ -3924,7 +3924,7 @@ def process_one_case(
         item["ground_truth_template_number"] = str(di.ground_truth_template_number)
 
     times = StageTimes()
-    # v12.7: 改悪生成は最初に全件作成し、計測対象外
+    # v13.7: 改悪生成は最初に全件作成し、計測対象外
     times.degrade_s = 0.0
 
     # ------------------------------------------------------------
@@ -4378,7 +4378,7 @@ def process_one_observed_case(
     - DocAligner → rectify → decide → XFeat → warp の通常処理を適用
     """
 
-    # v12.7 方針: 改悪生成以外でも「画像保存等の周辺処理」は時間計測に含めない。
+    # v13.7 方針: 改悪生成以外でも「画像保存等の周辺処理」は時間計測に含めない。
     # この関数は現状 main() からは呼ばれていないが、今後使われても整合するよう
     # case_total_s は stage time の合計で計算する。
     case_id = f"test_{src_path.stem}"
@@ -4698,7 +4698,7 @@ def process_one_observed_case(
 
     warped_final = cv2.warpPerspective(chosen_for_match, H_img_to_tpl, (tpl_bgr.shape[1], tpl_bgr.shape[0]))
     out_aligned = out_dirs["aligned"] / f"{case_id}_aligned.jpg"
-    # v12.7: aligned は成果物なので save-images に関係なく必ず保存し、保存時間も計測に含める。
+    # v13.7: aligned は成果物なので save-images に関係なく必ず保存し、保存時間も計測に含める。
     write_image(out_aligned, warped_final, jpeg_quality=jpeg_quality)
     item["output_aligned_image_path"] = str(out_aligned)
     times.warp_s = time.perf_counter() - t0
@@ -4725,7 +4725,7 @@ def main(argv=None) -> int:
     logger = setup_logging(out_root, level=str(args.log_level), console_level=str(args.console_log_level))
 
     logger.info("=" * 70)
-    logger.info("paper_pipeline_v12")
+    logger.info("paper_pipeline_v13")
     logger.info("=" * 70)
     logger.info("OpenCV: %s", cv2.__version__)
     logger.info("torch : %s", torch.__version__)
@@ -4763,7 +4763,7 @@ def main(argv=None) -> int:
         return 1
 
     # WeChat QR detector を初期化（フォームBは WeChat のみ）
-    # v12 改善: 回転スキャンでの直列化を避けるため、ThreadPool の worker 数だけ detector を確保する。
+    # v13 改善: 回転スキャンでの直列化を避けるため、ThreadPool の worker 数だけ detector を確保する。
     wechat_pool_size = int(getattr(args, "rotation_max_workers", 1))
     wechat = init_wechat_qr_detector(str(getattr(args, "wechat_model_dir", "")), logger=logger, pool_size=wechat_pool_size)
     # 引数経由でスレッドに流すと取り回しが悪いので、score_formB に属性としてぶら下げる
@@ -4873,9 +4873,9 @@ def main(argv=None) -> int:
             max_attempts=int(args.max_attempts),
         )
 
-        # v12.5 extra degrade (bend/shadow)
+        # v13.5 extra degrade (bend/shadow)
         try:
-            degraded_bgr, degrade_meta = _apply_extra_degrade_v12_5(
+            degraded_bgr, degrade_meta = _apply_extra_degrade_v13_5(
                 src_bgr=src_bgr,
                 degraded_bgr=degraded_bgr,
                 H_src_to_deg=H_src_to_deg,
@@ -4884,7 +4884,7 @@ def main(argv=None) -> int:
             )
         except Exception as e:
             if isinstance(degrade_meta, dict):
-                degrade_meta.setdefault("extra_degrade_v12_5", False)
+                degrade_meta.setdefault("extra_degrade_v13_5", False)
                 degrade_meta["extra_degrade_error"] = str(e)
 
         # 改悪画像の保存（計測対象外）
