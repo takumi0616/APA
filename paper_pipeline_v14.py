@@ -137,6 +137,13 @@ v14.9（本タスク）
   - `L_corr = cv2.divide(L, bg, scale=255)` で照明ムラ/影を軽減
   - 目的: 書類の白地ができるだけ均一な白に近づくよう補正し、後段の特徴点マッチングを安定化
 
+v14.10（本タスク）
+-----------------
+- 改善1: `APA/image/target/` 配下の画像は **改悪生成せず（そのまま）** パイプラインへ投入する。
+  - `target` は GT を持たないため、評価上は **warp まで到達したら成功** とみなす。
+- 改善2: `APA/image/test/` の命名規則を拡張し、`A_3_1.png` のような形式を解釈できるようにする。
+  - 先頭2要素（フォーム・テンプレ番号）のみを GT として利用し、末尾の識別子は無視する。
+
 """
 
 from __future__ import annotations
@@ -3139,7 +3146,14 @@ def build_csv_row(
     source_dataset = str(item.get("source_dataset") or "synthetic")
 
     expected_behavior_label = ""
-    if src_form == "C":
+    # NOTE:
+    # - synthetic(A/B): フォーム/テンプレ/warp が正しいこと
+    # - synthetic(C): form_unknown で棄却されること
+    # - test: 既存と同様（ファイル名から GT を解釈）
+    # - target: 改悪なしで投入し、warp まで到達すること（GT は未定義）
+    if source_dataset == "target":
+        expected_behavior_label = "target_should_be_processed_without_degrade_and_reach_warp"
+    elif src_form == "C":
         expected_behavior_label = "C_should_be_rejected_as_form_unknown"
     elif src_form in ("A", "B"):
         expected_behavior_label = "A_or_B_should_be_correct_form_and_template_and_warp"
@@ -3346,20 +3360,45 @@ def list_test_images() -> list[Path]:
     return sorted(paths)
 
 
+def list_target_images() -> list[Path]:
+    """image/target 配下の画像を列挙する。
+
+    改善1（本タスク）:
+      - image/target の画像は「改悪生成をせず、そのままパイプラインへ投入」する。
+      - 命名規則は固定しない（現場で増えうるため）。拡張子だけで列挙する。
+    """
+
+    base = Path(__file__).resolve().parent / "image" / "target"
+    if not base.exists():
+        return []
+
+    exts = {".png", ".jpg", ".jpeg"}
+    paths = [p for p in base.iterdir() if p.is_file() and p.suffix.lower() in exts]
+    return sorted(paths)
+
+
 def parse_test_filename(p: Path) -> Optional[tuple[str, str]]:
     """test 画像ファイル名から (form, template_number) を推定する。
 
-    規則: {A|B|C}_{number}.(png|jpg)
-      例: A_3.png -> ("A", "3")
+    改善2（本タスク）:
+      image/test の命名規則を変更する。
+
+      - 旧: {A|B|C}_{template}.png         例: A_3.png
+      - 新: {A|B|C}_{template}_{id}.png    例: A_3_1.png
+        - 最初の2つ（A と 3）が GT（フォーム・テンプレ番号）
+        - 最後の 1 つは識別番号（同じテンプレでも中身が違うことを表す）
+
+    実装方針:
+      - stem を '_' で split し、先頭2要素を (form, template_number) として解釈する
+      - 3要素目以降（識別番号など）は case_id には残るが、GT 判定には使用しない
     """
 
     try:
-        stem = p.stem
-        if "_" not in stem:
+        parts = [s.strip() for s in str(p.stem).split("_") if s.strip()]
+        if len(parts) < 2:
             return None
-        head, num = stem.split("_", 1)
-        head = head.strip().upper()
-        num = num.strip()
+        head = parts[0].upper()
+        num = parts[1]
         if head not in ("A", "B", "C"):
             return None
         if not num.isdigit():
@@ -4054,6 +4093,14 @@ def process_one_case(
         do_save = str(stage) != "done"
         if not do_save:
             return
+        # fail では "1_degraded" も失敗ケースに保存しておく（デバッグの起点として重要）。
+        try:
+            out_deg = Path(str(di.output_degraded_image_path))
+            write_image(out_deg, degraded_bgr, jpeg_quality=jpeg_quality)
+            item["output_degraded_image_path"] = str(out_deg)
+        except Exception:
+            pass
+
         for field_name, path, img in pending_images:
             write_image(path, img, jpeg_quality=jpeg_quality)
             item[field_name] = str(path)
@@ -4180,6 +4227,7 @@ def process_one_case(
         # 期待動作:
         # - C: form_unknown になるべき（紙は検出できたが A/B ではない）
         # - A/B: form_unknown になってはいけない
+        # target は「warp まで到達できれば成功」としたいので、ここでは失敗扱い。
         item["ok"] = bool(str(src_form) == "C")
         item["ok_warp"] = False
         _finalize_images_for_stage(item["stage"])
@@ -4477,7 +4525,10 @@ def process_one_case(
     # 期待動作としての成功条件:
     # - A/B: フォーム正解 AND テンプレ正解 AND warp 完了
     # - C  : "done" に到達したら誤検出（本来は棄却されるべき）
-    if src_form in ("A", "B"):
+    if str(di.source_dataset) == "target":
+        # target は GT を持たないため、warp 完了を成功とみなす
+        item["ok"] = True
+    elif src_form in ("A", "B"):
         item["ok"] = bool(item.get("is_predicted_form_correct")) and bool(item.get("is_predicted_best_template_correct"))
     else:
         item["ok"] = False
@@ -5170,6 +5221,50 @@ def main(argv=None) -> int:
             )
             if di is not None:
                 degraded_inputs.append(di)
+
+    # target dataset は「改悪なし」で投入する（本タスク改善1）
+    target_paths = list_target_images()
+    if target_paths:
+        logger.info("[TARGET] target dataset (image/target): %d images", len(target_paths))
+
+    for i, tp in enumerate(target_paths):
+        src_bgr = cv2.imread(str(tp))
+        if src_bgr is None:
+            logger.warning("failed to read target image: %s", tp)
+            continue
+
+        try:
+            h0, w0 = src_bgr.shape[:2]
+        except Exception:
+            continue
+
+        # 命名規則は固定しない（現場で増えうる）。重複回避のため index を付与。
+        case_id = f"target_{tp.stem}_{i:03d}" if tp.stem else f"target_{i:03d}"
+        out_degraded = out_dirs["degraded"] / f"{case_id}.jpg"
+
+        # save-images=all の場合のみ、ここで保存しておく（改悪フェーズ扱いで計測対象外）
+        if str(getattr(args, "save_images", "all")) == "all":
+            write_image(
+                out_degraded,
+                src_bgr,
+                jpeg_quality=int((PIPELINE_DEFAULTS.get("save_images") or {}).get("jpeg_quality") or 95),
+            )
+
+        degraded_inputs.append(
+            DegradedCaseInput(
+                source_dataset="target",
+                source_form="target",
+                source_path=Path(tp),
+                source_w=int(w0),
+                source_h=int(h0),
+                degraded_variant_index=0,
+                case_id=case_id,
+                degraded_bgr=src_bgr,
+                H_src_to_degraded=np.eye(3, dtype=np.float64),
+                degrade_meta={"mode": "target_skip_degrade"},
+                output_degraded_image_path=Path(out_degraded),
+            )
+        )
 
     logger.info("[OK] Pre-generated degraded inputs: %d", len(degraded_inputs))
 
