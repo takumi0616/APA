@@ -144,6 +144,14 @@ v15.10（本タスク）
 - 改善2: `APA/image/test/` の命名規則を拡張し、`A_3_1.png` のような形式を解釈できるようにする。
   - 先頭2要素（フォーム・テンプレ番号）のみを GT として利用し、末尾の識別子は無視する。
 
+v15.11（本タスク）
+-----------------
+- 改善3: 出力9（デモ画像）を追加。
+  - `9_demo/{case_id}_demo9.jpg`
+  - 左: 1_degraded（ズーム無し） + DocAligner polygon（緑） + フォーム判定根拠（A=赤bbox / B=青枠）
+  - 右: 8_aligned（最終）
+  - 生成は計測対象外（case_total_s / stage_time には含めない）
+
 """
 
 from __future__ import annotations
@@ -328,13 +336,23 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
         "out_size_wh": [2400, 1800],  # 改悪画像の出力サイズ（幅, 高さ）
         # ユーザー要望: 過度な改悪（極端な傾き/奥行き/縮小）が出ないよう、デフォルトを「常識的」にする。
         # 必要なら CLI 引数で上げられる。
-        "max_rot_deg": 25.0,  # 改悪生成の回転強度（度）
+        # 改悪（回転）を強める（ユーザーFB）
+        # - `warp_template_to_random_view()` は max_rot>=180 のとき 0〜360 一様回転モードになる。
+        # - ただし紙がフレーム内に残る制約を満たす必要があるため、
+        #   生成関数側で「回転時の紙サイズ」を short side 基準に調整している（test_recovery_paper 側の実装）。
+        "max_rot_deg": 180.0,  # 改悪生成の回転強度（>=180で0..360一様回転モード）
         "min_abs_rot_deg": 0.0,  # 最小回転量（0なら小さな回転も許可）
         "rotation_mode": "uniform",  # 回転角の出し方（"uniform" または "snap"）
         "snap_step_deg": 90.0,  # rotation_mode="snap" の場合の角度刻み
         # 歪みが強すぎるとのフィードバックがあったため弱めに調整
         "perspective_jitter": 0.03,  # 射影ゆがみ量（大きいほど難しい）
-        "min_visible_area_ratio": 0.55,  # 生成画像でテンプレが見えている最小比率（小さすぎ防止）
+        # NOTE:
+        # 0〜360度回転（max_rot>=180）を有効にすると、斜め回転では
+        # 「紙がフレーム内に収まる」制約のために紙サイズが短辺基準に落ちる。
+        # その結果、out_w*out_h に対する紙の占有率（visible_area_ratio）は
+        # 0.55 のような大きい値だと物理的に満たせず、生成が遅くなる/0度に偏る。
+        # ここは「紙が写っていること」を保証する目的に留め、下げる。
+        "min_visible_area_ratio": 0.25,  # 生成画像でテンプレが見えている最小比率（小さすぎ防止）
         "max_attempts": 50,  # 改悪生成の最大試行回数
         "seed": 45,  # 乱数シード（再現性）
 
@@ -1397,6 +1415,170 @@ def rotate_image_bound(image_bgr: np.ndarray, angle_deg: float) -> np.ndarray:
     M[0, 2] += (new_w / 2.0) - center[0]
     M[1, 2] += (new_h / 2.0) - center[1]
     return cv2.warpAffine(image_bgr, M, (new_w, new_h))
+
+
+def rotate_image_bound_with_matrix(image_bgr: np.ndarray, angle_deg: float) -> tuple[np.ndarray, np.ndarray]:
+    """rotate_image_bound と同等の回転を行い、同時に座標変換行列も返す。
+
+    戻り値:
+      (rotated_bgr, M_3x3)
+
+    M_3x3 は「元画像座標 -> 回転後画像座標」への変換。
+
+    NOTE:
+      - demo 画像（出力 9）で、フォーム判定結果（マーカー/QR）を
+        degraded 元画像座標へ逆投影するために使用する。
+      - 0/180 は rotate_image_bound と同様の最適化経路を踏み、
+        matrix もそれに合わせて返す。
+    """
+
+    a = float(angle_deg) % 360.0
+    h, w = image_bgr.shape[:2]
+
+    if abs(a - 0.0) < 1e-6:
+        return image_bgr, np.eye(3, dtype=np.float64)
+
+    if abs(a - 180.0) < 1e-6:
+        # cv2.rotate(img, ROTATE_180) 相当
+        # src(x,y) -> dst(x',y') = (w-1-x, h-1-y)
+        M = np.array([[-1.0, 0.0, float(w - 1)], [0.0, -1.0, float(h - 1)], [0.0, 0.0, 1.0]], dtype=np.float64)
+        return cv2.rotate(image_bgr, cv2.ROTATE_180), M
+
+    center = (w / 2.0, h / 2.0)
+    M2 = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    cos = abs(M2[0, 0])
+    sin = abs(M2[0, 1])
+    new_w = int(round((h * sin) + (w * cos)))
+    new_h = int(round((h * cos) + (w * sin)))
+    M2[0, 2] += (new_w / 2.0) - center[0]
+    M2[1, 2] += (new_h / 2.0) - center[1]
+    rotated = cv2.warpAffine(image_bgr, M2, (new_w, new_h))
+    M3 = np.array([[float(M2[0, 0]), float(M2[0, 1]), float(M2[0, 2])], [float(M2[1, 0]), float(M2[1, 1]), float(M2[1, 2])], [0.0, 0.0, 1.0]], dtype=np.float64)
+    return rotated, M3
+
+
+def _landscape_rotation_matrix_if_applied(*, w: int, h: int, rotated_90cw: bool) -> np.ndarray:
+    """enforce_landscape の 90度CW回転を、座標変換行列として表現する。
+
+    rotated_90cw=True の場合、src(x,y)->dst(x',y') は以下:
+      x' = h-1-y
+      y' = x
+
+    つまり M = [[0,-1,h-1],[1,0,0],[0,0,1]]
+    """
+
+    if not rotated_90cw:
+        return np.eye(3, dtype=np.float64)
+    return np.array([[0.0, -1.0, float(h - 1)], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+
+def _perspective_transform_points(points_xy: np.ndarray, H_3x3: np.ndarray) -> np.ndarray:
+    pts = np.asarray(points_xy, dtype=np.float32).reshape(-1, 1, 2)
+    H = np.asarray(H_3x3, dtype=np.float64)
+    out = cv2.perspectiveTransform(pts, H)
+    return out.reshape(-1, 2)
+
+
+def _hstack_with_padding(left_bgr: np.ndarray, right_bgr: np.ndarray, *, pad_color_bgr: tuple[int, int, int] = (0, 0, 0)) -> np.ndarray:
+    """左右を横並びにする（切り取り/拡大縮小なし）。高さが違う場合は下方向に padding する。"""
+
+    left = left_bgr
+    right = right_bgr
+    lh, lw = left.shape[:2]
+    rh, rw = right.shape[:2]
+    out_h = max(lh, rh)
+
+    def _pad(img: np.ndarray, out_h: int) -> np.ndarray:
+        h, w = img.shape[:2]
+        if h == out_h:
+            return img
+        pad = out_h - h
+        return cv2.copyMakeBorder(img, 0, pad, 0, 0, borderType=cv2.BORDER_CONSTANT, value=pad_color_bgr)
+
+    left2 = _pad(left, out_h)
+    right2 = _pad(right, out_h)
+    return np.hstack([left2, right2])
+
+
+def _draw_polygon_outline(image_bgr: np.ndarray, poly_xy: np.ndarray, color_bgr: tuple[int, int, int], thickness: int) -> np.ndarray:
+    out = image_bgr.copy()
+    pts = np.asarray(poly_xy, dtype=np.int32).reshape(-1, 1, 2)
+    cv2.polylines(out, [pts], True, color_bgr, int(thickness))
+    return out
+
+
+def _generate_demo9_image(
+    *,
+    degraded_bgr: np.ndarray,
+    polygon_xy: np.ndarray,
+    polygon_margin_px: float,
+    H_degraded_to_rectified_landscape: np.ndarray,
+    rectified_landscape_size_wh: tuple[int, int],
+    decided_form: str,
+    decided_angle_deg: float,
+    decision_markers: Optional[list[dict[str, Any]]],
+    decision_qrs: Optional[list[dict[str, Any]]],
+    aligned_bgr: np.ndarray,
+) -> np.ndarray:
+    """出力9（デモ用）の画像を作る。
+
+    左:
+      - degraded 元画像（切り取り/ズーム無し）
+      - DocAligner polygon（緑）
+      - フォーム判定結果（A=赤bbox / B=青ポリゴン）を *元画像座標* へ逆投影して重畳
+
+    右:
+      - 8_aligned（最終整形済み）
+    """
+
+    # 左: DocAligner polygon
+    poly_exp = expand_polygon(
+        np.asarray(polygon_xy, dtype=np.float32),
+        margin_px=float(polygon_margin_px),
+        img_w=int(degraded_bgr.shape[1]),
+        img_h=int(degraded_bgr.shape[0]),
+    )
+    left = draw_polygon_overlay(degraded_bgr, poly_exp)
+
+    # degraded -> rectified_landscape -> chosen(rot)
+    rect_w, rect_h = int(rectified_landscape_size_wh[0]), int(rectified_landscape_size_wh[1])
+    dummy_rect = np.zeros((max(1, rect_h), max(1, rect_w), 3), dtype=np.uint8)
+    _dummy_rot, M_rect_to_chosen = rotate_image_bound_with_matrix(dummy_rect, float(decided_angle_deg))
+
+    H_deg_to_rect = np.asarray(H_degraded_to_rectified_landscape, dtype=np.float64)
+    H_deg_to_chosen = np.asarray(M_rect_to_chosen, dtype=np.float64) @ H_deg_to_rect
+    try:
+        H_chosen_to_deg = np.linalg.inv(H_deg_to_chosen)
+    except Exception:
+        H_chosen_to_deg = None
+
+    if H_chosen_to_deg is not None:
+        # フォームA: マーカー bbox（chosen座標） -> degraded座標へ
+        if decided_form == "A" and decision_markers:
+            for m in decision_markers:
+                try:
+                    x, y, bw, bh = m.get("bbox", [0, 0, 0, 0])
+                    box = np.array(
+                        [[x, y], [x + bw, y], [x + bw, y + bh], [x, y + bh]],
+                        dtype=np.float32,
+                    )
+                    box_deg = _perspective_transform_points(box, H_chosen_to_deg)
+                    left = _draw_polygon_outline(left, box_deg, (0, 0, 255), thickness=6)
+                except Exception:
+                    continue
+
+        # フォームB: QR points（chosen座標） -> degraded座標へ
+        if decided_form == "B" and decision_qrs:
+            try:
+                pts = np.asarray(decision_qrs[0].get("points"), dtype=np.float32).reshape(-1, 2)
+                pts_deg = _perspective_transform_points(pts, H_chosen_to_deg)
+                left = _draw_polygon_outline(left, pts_deg, (255, 0, 0), thickness=6)
+            except Exception:
+                pass
+
+    # 右: aligned（最終）
+    right = aligned_bgr
+    return _hstack_with_padding(left, right)
 
 
 def enforce_landscape(image_bgr: np.ndarray) -> tuple[np.ndarray, bool]:
@@ -4171,7 +4353,11 @@ def process_one_case(
         poly_exp,
         out_max_side=int(args.docaligner_max_side),
     )
-    rectified, _ = enforce_landscape(rectified)
+    # enforce_landscape の回転（90度CW）を考慮した homography も保持しておく（出力9で使用）
+    rect0_h, rect0_w = rectified.shape[:2]
+    rectified, rect_rotated_90cw = enforce_landscape(rectified)
+    M_rect_to_land = _landscape_rotation_matrix_if_applied(w=int(rect0_w), h=int(rect0_h), rotated_90cw=bool(rect_rotated_90cw))
+    H_deg_to_rect_land = np.asarray(M_rect_to_land, dtype=np.float64) @ np.asarray(H_deg_to_rect, dtype=np.float64)
     times.rectify_s = time.perf_counter() - t0
     out_rect = out_dirs["rect"] / f"{case_id}_rect.jpg"
     _schedule_image("output_rectified_image_path", out_rect, rectified)
@@ -4183,6 +4369,8 @@ def process_one_case(
         pass
     item["stage"] = "rectified"
     item["H_degraded_to_rectified"] = H_deg_to_rect.astype(float).tolist()
+    item["H_degraded_to_rectified_landscape"] = H_deg_to_rect_land.astype(float).tolist()
+    item["rectified_landscape_rotated_90cw"] = bool(rect_rotated_90cw)
 
     # 4) decide form by rotations（計測対象：判定ロジックのみ。画像保存は計測外）
     t0 = time.perf_counter()
@@ -4506,6 +4694,44 @@ def process_one_case(
     except Exception:
         pass
     times.warp_s = time.perf_counter() - t0
+
+    # ------------------------------------------------------------
+    # 出力9: デモ画像（時間計測対象外）
+    # ------------------------------------------------------------
+    try:
+        # decide の根拠（chosen座標系）
+        decision_markers: Optional[list[dict[str, Any]]] = None
+        decision_qrs: Optional[list[dict[str, Any]]] = None
+        if str(decision.form) == "A":
+            decision_markers = ((decision.detail or {}).get("A") or {}).get("markers") or None
+        elif str(decision.form) == "B":
+            # phase により B / B_fast どちらかに入る
+            dB = (decision.detail or {}).get("B")
+            dBf = (decision.detail or {}).get("B_fast")
+            decision_qrs = (dB or {}).get("qrs") or (dBf or {}).get("qrs") or None
+
+        demo9 = _generate_demo9_image(
+            degraded_bgr=degraded_bgr,
+            polygon_xy=poly,
+            polygon_margin_px=float(margin_px),
+            H_degraded_to_rectified_landscape=np.asarray(H_deg_to_rect_land, dtype=np.float64),
+            rectified_landscape_size_wh=(int(rectified.shape[1]), int(rectified.shape[0])),
+            decided_form=str(decision.form),
+            decided_angle_deg=float(decision.angle_deg),
+            decision_markers=decision_markers,
+            decision_qrs=decision_qrs,
+            aligned_bgr=warped_final,
+        )
+
+        out_demo = out_dirs.get("demo")
+        if out_demo is not None:
+            out_demo9 = Path(out_demo) / f"{case_id}_demo9.jpg"
+            write_image(out_demo9, demo9, jpeg_quality=jpeg_quality)
+            item["output_demo9_image_path"] = str(out_demo9)
+        else:
+            item["output_demo9_image_path"] = ""
+    except Exception:
+        item["output_demo9_image_path"] = ""
 
     # 6_debug_matches（best template のマッチ可視化）
     # ユーザー要望: 本番ではない処理のため、時間計測から除外する。
@@ -4991,6 +5217,7 @@ def main(argv=None) -> int:
         "bgdiv": mkdir(out_root / "6_bgdiv"),
         "debug_matches": mkdir(out_root / "7_debug_matches"),
         "aligned": mkdir(out_root / "8_aligned"),
+        "demo": mkdir(out_root / "9_demo"),
     }
 
     # 重いモデルをロード

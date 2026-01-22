@@ -169,13 +169,26 @@ def warp_template_to_random_view(
     # ------------------------------------------------------------
 
     margin = int(min(out_w, out_h) * 0.06)
-    # 紙サイズは「常識的に大きめ」を基本とする（画面の 75%〜92% 程度）
-    base_w_min = int(out_w * 0.75)
-    base_w_max = int(out_w * 0.92)
+
+    # 紙サイズは「常識的に大きめ」を基本とする。
+    # ただし 0〜360 度回転（max_rotation_deg>=180）を有効にすると、
+    # out_w 基準の大きい矩形（例: 2400x1800 で base_w を out_w=2400 の 75%〜92%）は
+    # 斜め回転（例: 30〜60度）で画面内に収めるために大きく縮小されやすく、
+    # 結果として「0/90/180/270 付近しか成立しない」問題が起きる。
+    #
+    # そこで full-rotation の場合は、短辺（min(out_w,out_h)）基準で base_w を決め、
+    # 斜め回転でも破綻しないサイズレンジを確保する。
+    side_ref = int(min(out_w, out_h)) if float(max_rotation_deg) >= 180.0 else int(out_w)
+    base_w_min = int(side_ref * 0.75)
+    base_w_max = int(side_ref * 0.92)
+    # visible area は out_w*out_h に対する比率で評価している。
+    # full-rotation の場合、紙サイズが短辺基準になりやすいので、
+    # ここを高くしすぎると「物理的に満たせない」→ max_attempts を使い切る→ 生成が遅い/0度に偏る。
     min_visible_area_px = int(out_w * out_h * float(min_visible_area_ratio))
 
     # fit-to-frame の縮小が大きい（紙が小さくなる）場合は棄却
-    min_fit_scale = 0.78
+    # full-rotation では斜め回転時に多少の縮小が必須になるため、少し緩める
+    min_fit_scale = 0.70 if float(max_rotation_deg) >= 180.0 else 0.78
 
     # 透視が強すぎる（上下/左右の辺長比が極端）場合は棄却
     max_perspective_edge_ratio = 1.55  # 例: bottom/top が 1.55 を超えると「奥行きが強すぎる」
