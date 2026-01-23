@@ -2,12 +2,18 @@
 # -*- coding: utf-8 -*-
 """paper_pipeline_v15.py
 
-[windows]
-C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v15.py
+実行方法
+--------
 
-[mac]
-# リポジトリルートから実行する想定（`APA/` 配下のスクリプトを直接指定）
-.venv/bin/python paper_pipeline_v15.py
+[Windows]
+リポジトリルート（`.../develop`）から:
+
+    C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v15.py
+
+[macOS/Linux]
+リポジトリルートから（`APA/` 配下のスクリプトを直接指定）:
+
+    .venv/bin/python paper_pipeline_v15.py
 
 目的
 ----
@@ -24,17 +30,33 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v15.py
 
 パイプライン概要
 ----------------
-入力:
+入力（データセット）:
 
-- 改悪元画像: `APA/image/{A,B,C}/` 配下（デフォルト実装では `1.jpg`〜`6.jpg` を対象）
-  - 対象フォームは `--src-forms` で指定
+本スクリプトは **複数の入力ソース**をまとめて処理します。
+
+1) synthetic（改悪あり）: `APA/image/{A,B,C}/`
+   - デフォルトは `1.jpg`〜`6.jpg` を対象（`PIPELINE_DEFAULTS["template_numbers"]`）
+   - 対象フォームは `--src-forms` で指定
+   - `--degrade-n` 枚ぶんの改悪画像を生成してから本処理へ投入します
+
+2) test（改悪あり）: `APA/image/test/`
+   - `.png/.jpg/.jpeg` を列挙
+   - **ファイル名から GT（正解）を推定**します
+     - 推奨: `{A|B|C}_{template番号}_{id}.png` 例: `A_3_1.png`
+       - 先頭2要素（A と 3）が GT（フォーム・テンプレ番号）
+       - 3要素目以降は識別子で、GT 判定には使いません
+   - `--degrade-n` 枚ぶんの改悪画像を生成してから本処理へ投入します
+
+3) target（改悪なし）: `APA/image/target/`
+   - `.png/.jpg/.jpeg` を列挙
+   - **改悪生成を行わず**、そのまま本処理へ投入します（現場画像の想定）
 
 処理フロー（1 case = 1 枚の入力から生成した 1 枚の改悪画像）:
 
 ※ v15.7: 改悪生成（degrade）は **最初に全ケース分をまとめて生成**し、以降の本処理へ投入する。
    改悪生成の所要時間は計測対象外。
 
-1) 改悪生成（`APA/test_recovery_paper.py` の実装を流用）
+1) 改悪生成（本ファイル内に統合済みの実装を使用）
    - v15.5: 紙のしなり（非線形ワープ）と、撮影時の影（照明ムラ）を追加
 2) DocAligner により紙領域 polygon（4点）を推定
    - 失敗したら `stage=docaligner_failed` で終了
@@ -44,12 +66,10 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v15.py
 4) フォーム判定（回転探索）
    - rectify 後は `enforce_landscape` で横長に統一しているため、回転探索は **2方向（0度/180度）** のみ
      - 0 と 180 を比較し、最上位角度を確定に使う
-     - 0/180 で何も見つからない場合は Unknown（no_detection）とする（救済処置は行わない）
+     - 0/180 で何も見つからない場合は Unknown（no_detection）とする（追加の角度探索などの救済は行わない）
    - フォームA: 3点マーク（TL/TR/BL）が検出できる（`--marker-preproc` で前処理オプション）
-     - v15 では **フォームAスコアが十分高い場合**、速度のため **フォームB判定をスキップ**する
-       - 既定の閾値は `PIPELINE_DEFAULTS["formA_strong"]["score_threshold"]`（現状 4.0）
-     - v15.6: A が検出できても **Unknown閾値未満** の場合は、その時点で Unknown 確定せず
-       **フォームB探索へフォールバック**する（B の取りこぼし回避）
+     - v15.6: A が検出できても **Unknown閾値（`--unknown-score-threshold`）未満** の場合は、その時点で Unknown 確定せず
+       **フォームB探索へフォールバック**します（B の取りこぼし回避）
    - フォームB: QRコードが検出できる
      - **WeChat QR エンジンのみ** を使用（OpenCV 標準 `QRCodeDetector` は使わない）
      - `--wechat-model-dir` にモデルが必要（opencv-contrib 必須）
@@ -81,6 +101,7 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v15.py
 - `6_bgdiv/`          : 背景除算法（Background Division）後の画像
 - `7_debug_matches/`  : best template のマッチ可視化
 - `8_aligned/`        : best template にワープした結果
+- `9_demo/`           : デモ用の並列可視化（左=degraded+逆投影、右=aligned）
 - `summary.json` / `summary.csv`
 - `run.log`           : 実行ログ（logging）
 
@@ -91,6 +112,11 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v15.py
 - `none`: 一切保存しない（速度計測向け）
 
 ディレクトリ自体は作られるが、`fail/none` の場合は中身が空になることがある。
+ただし、以下は **save-images 設定に関わらず保存されます**（成果物/解析用のため）。
+
+- `8_aligned/`（最終成果物）
+- `7_debug_matches/`（マッチ可視化）
+- `9_demo/`（デモ可視化）
 
 ※ v15.7: `--save-images` の設定に関わらず、`7_aligned/` は成果物として必ず保存される（※v15.8 で `8_aligned/` に移動）。
 ※ v15.8: 背景除算法（stage6）を追加したため、成果物は `8_aligned/` に移動。
@@ -98,6 +124,7 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v15.py
 
 注意
 ----
+- `--explain` を付けると、主要パラメータの意味（日本語）を表示して終了します。
 - torch.hub 経由の XFeat 読み込みで git が必要になることがあるため、
   portable git を PATH に追加する処理を `test_recovery_paper` から流用する。
 - QR 検出は WeChat QR エンジン（`cv2.wechat_qrcode_WeChatQRCode`）のみ利用する。
@@ -107,50 +134,6 @@ C:/Users/takumi/develop/miniconda3/python.exe APA/paper_pipeline_v15.py
 - JPEG 保存は可能なら python-turbojpeg（libjpeg-turbo）を優先する（失敗時は `cv2.imwrite` にフォールバック）
 - 日本語ラベル描画は Pillow を使用（OpenCV putText は日本語非対応のため）。
   - `APA_FONT_PATH` を設定すると任意フォントを優先可能
-
-改善点メモ
-----
-
-v15.8（本タスク）
-----------------
-- 改悪生成（degrade）は **最初に全ケース分をまとめて生成**し、その所要時間は計測対象外とする。
-  - 生成した改悪画像を 1 枚ずつパイプライン本体へ投入する。
-- 時間計測（case_total / stage_time / run_elapsed）は「本処理」のみを対象とし、
-  以下は **計測対象外** とする。
-  - 途中画像保存（1_degraded/〜7_debug_matches/）
-  - `7_debug_matches/` のマッチ可視化生成
-  - `summary.json` / `summary.csv` の書き出し
-- 計測に含める画像保存は **`8_aligned/` の保存だけ** とする。
-v15.8.1
-------
-- v15.8 の stage6（背景除算法）を **test dataset（image/test）側の処理にも適用**する。
-
-- stage6 の出力解像度（bgdiv_w/bgdiv_h）も item に保存して CSV に反映する。
- 
-- 追加: UVDoc の後に **背景除算法（Background Division Method）** を stage6 として挿入する。
-
-v15.9（本タスク）
-----------------
-- stage6（背景除算法）を、指定どおり **OpenCV Background Division（cv2.divide）** の実装に統一。
-  - LAB 色空間へ変換し、L（明度）のみを補正（a/b は保持）
-  - `bg = GaussianBlur(L)` で背景（低周波）推定
-  - `L_corr = cv2.divide(L, bg, scale=255)` で照明ムラ/影を軽減
-  - 目的: 書類の白地ができるだけ均一な白に近づくよう補正し、後段の特徴点マッチングを安定化
-
-v15.10（本タスク）
------------------
-- 改善1: `APA/image/target/` 配下の画像は **改悪生成せず（そのまま）** パイプラインへ投入する。
-  - `target` は GT を持たないため、評価上は **warp まで到達したら成功** とみなす。
-- 改善2: `APA/image/test/` の命名規則を拡張し、`A_3_1.png` のような形式を解釈できるようにする。
-  - 先頭2要素（フォーム・テンプレ番号）のみを GT として利用し、末尾の識別子は無視する。
-
-v15.11（本タスク）
------------------
-- 改善3: 出力9（デモ画像）を追加。
-  - `9_demo/{case_id}_demo9.jpg`
-  - 左: 1_degraded（ズーム無し） + DocAligner polygon（緑） + フォーム判定根拠（A=赤bbox / B=青枠）
-  - 右: 8_aligned（最終）
-  - 生成は計測対象外（case_total_s / stage_time には含めない）
 
 """
 
@@ -190,6 +173,593 @@ except Exception:
     _TURBOJPEG_IMPORT_OK = False
 
 from PIL import Image, ImageDraw, ImageFont
+
+
+# ------------------------------------------------------------
+# 自己完結化のためのユーティリティ群
+# ------------------------------------------------------------
+#
+# 元々 `test_recovery_paper.py` に置いていた以下の機能は、
+# paper_pipeline_v15.py 単体で動作できるよう、本ファイル内へ移植した。
+#
+# - ensure_portable_git_on_path / now_run_id
+# - 改悪生成（warp_template_to_random_view）
+# - フォームA マーカー検出（detect_formA_marker_boxes のベース実装）
+# - XFeatMatcher（torch.hub 経由）
+# - Homography の least-squares refine / 可視化（draw_inlier_matches）
+
+
+def ensure_portable_git_on_path() -> None:
+    """torch.hub が内部で git を呼ぶ場合に備え、portable git を PATH に追加する。"""
+
+    portable_git_bin = r"C:\Users\takumi\develop\git\bin"
+    if os.path.exists(portable_git_bin):
+        os.environ["PATH"] = portable_git_bin + os.pathsep + os.environ.get("PATH", "")
+
+
+def now_run_id() -> str:
+    from datetime import datetime
+
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def to_uint8(img: np.ndarray) -> np.ndarray:
+    if img is None:
+        return img
+    if img.dtype == np.uint8:
+        return img
+    img = np.clip(img, 0, 255)
+    return img.astype(np.uint8)
+
+
+def random_background(h: int, w: int, rng: random.Random) -> np.ndarray:
+    """簡易なランダム背景（グラデ＋ノイズ＋線）。"""
+
+    bg = np.zeros((h, w, 3), dtype=np.uint8)
+    base = np.array([rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255)], dtype=np.uint8)
+    bg[:, :] = base
+
+    gx = np.linspace(0, 1, w, dtype=np.float32)
+    gy = np.linspace(0, 1, h, dtype=np.float32)
+    g = (np.outer(gy, gx) * 255.0).astype(np.float32)
+    g3 = np.stack([g, g, g], axis=-1)
+    bg = to_uint8(0.6 * bg.astype(np.float32) + 0.4 * g3)
+
+    n = np.zeros((h, w, 3), dtype=np.float32)
+    n[:, :, 0] = np.random.normal(0, 8, size=(h, w))
+    n[:, :, 1] = np.random.normal(0, 8, size=(h, w))
+    n[:, :, 2] = np.random.normal(0, 8, size=(h, w))
+    bg = to_uint8(bg.astype(np.float32) + n)
+
+    for _ in range(rng.randint(3, 10)):
+        x1, y1 = rng.randint(0, w - 1), rng.randint(0, h - 1)
+        x2, y2 = rng.randint(0, w - 1), rng.randint(0, h - 1)
+        color = (rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255))
+        cv2.line(bg, (x1, y1), (x2, y2), color, rng.randint(1, 2), lineType=cv2.LINE_AA)
+
+    return bg
+
+
+def warp_template_to_random_view(
+    template_bgr: np.ndarray,
+    out_size: tuple[int, int],
+    rng: random.Random,
+    max_rotation_deg: float = 12.0,
+    min_abs_rotation_deg: float = 0.0,
+    rotation_mode: str = "uniform",
+    snap_step_deg: float = 90.0,
+    perspective_jitter: float = 0.08,
+    min_visible_area_ratio: float = 0.25,
+    max_attempts: int = 50,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """テンプレをランダム四角形へ射影して背景に合成し、改悪画像を作る。
+
+    NOTE:
+      この実装は元々 `test_recovery_paper.py` にあったものを移植。
+      「紙がフレーム内に収まる」「極端な潰れ/透視を避ける」制約を含む。
+    """
+
+    h, w = template_bgr.shape[:2]
+    out_w, out_h = out_size
+
+    margin = int(min(out_w, out_h) * 0.06)
+
+    side_ref = int(min(out_w, out_h)) if float(max_rotation_deg) >= 180.0 else int(out_w)
+    base_w_min = int(side_ref * 0.75)
+    base_w_max = int(side_ref * 0.92)
+    min_visible_area_px = int(out_w * out_h * float(min_visible_area_ratio))
+
+    min_fit_scale = 0.70 if float(max_rotation_deg) >= 180.0 else 0.78
+    max_perspective_edge_ratio = 1.55
+    min_edge_len_ratio = 0.58
+
+    dst_quad = None
+    base_w = 0
+    base_h = 0
+    angle = 0.0
+    fit_scale_used: float = 1.0
+    visible_area_ratio_used: float = 0.0
+    quad_area_ratio_used: float = 0.0
+    edge_ratio_top_bottom: float = 1.0
+    edge_ratio_left_right: float = 1.0
+    edge_len_min: float = 0.0
+    edge_len_max: float = 0.0
+
+    for _attempt in range(int(max_attempts)):
+        base_w = rng.randint(int(base_w_min), int(base_w_max))
+        base_h = int(base_w * (h / w))
+        base_h = max(120, min(base_h, int(out_h * 0.85)))
+
+        cx_lo = int(base_w // 2 + margin)
+        cx_hi = int(out_w - 1 - base_w // 2 - margin)
+        cy_lo = int(base_h // 2 + margin)
+        cy_hi = int(out_h - 1 - base_h // 2 - margin)
+        if cx_lo >= cx_hi or cy_lo >= cy_hi:
+            continue
+
+        cx = rng.randint(cx_lo, cx_hi)
+        cy = rng.randint(cy_lo, cy_hi)
+
+        x1, y1 = cx - base_w // 2, cy - base_h // 2
+        x2, y2 = cx + base_w // 2, cy + base_h // 2
+        rect = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+
+        # rotation
+        if float(max_rotation_deg) >= 180:
+            if str(rotation_mode) == "snap":
+                step = float(max(1.0, float(snap_step_deg)))
+                candidates = [i * step for i in range(int(round(360.0 / step)))]
+                rng.shuffle(candidates)
+                angle = 0.0
+                for cand in candidates:
+                    dist0 = min(cand % 360.0, 360.0 - (cand % 360.0))
+                    if dist0 >= float(min_abs_rotation_deg):
+                        angle = float(cand % 360.0)
+                        break
+            else:
+                for _ in range(100):
+                    angle = rng.uniform(0.0, 360.0)
+                    dist0 = min(angle, 360.0 - angle)
+                    if dist0 >= float(min_abs_rotation_deg):
+                        break
+                else:
+                    angle = rng.uniform(0.0, 360.0)
+        else:
+            angle = rng.uniform(-float(max_rotation_deg), float(max_rotation_deg))
+
+        M = cv2.getRotationMatrix2D((cx, cy), float(angle), 1.0)
+        rect_rot = cv2.transform(rect.reshape(-1, 1, 2), M).reshape(4, 2)
+
+        # perspective jitter
+        jitter = float(perspective_jitter) * float(min(base_w, base_h))
+        rect_rot += np.array(
+            [[rng.uniform(-jitter, jitter), rng.uniform(-jitter, jitter)] for _ in range(4)],
+            dtype=np.float32,
+        )
+
+        # keep quad inside by scaling towards center (not clipping)
+        inset = 2.0
+        dx = rect_rot[:, 0] - cx
+        dy = rect_rot[:, 1] - cy
+        max_dx = float(np.max(np.abs(dx))) if len(dx) else 0.0
+        max_dy = float(np.max(np.abs(dy))) if len(dy) else 0.0
+        allow_x = float(min(cx, (out_w - 1) - cx)) - inset
+        allow_y = float(min(cy, (out_h - 1) - cy)) - inset
+        if allow_x <= 1 or allow_y <= 1:
+            continue
+        sx = allow_x / max_dx if max_dx > 1e-6 else 1.0
+        sy = allow_y / max_dy if max_dy > 1e-6 else 1.0
+        s = float(min(1.0, sx, sy))
+        if s < 1.0:
+            rect_rot = np.stack([cx + dx * s, cy + dy * s], axis=1).astype(np.float32)
+        if s < float(min_fit_scale):
+            continue
+
+        # all corners inside
+        if (
+            (rect_rot[:, 0].min() >= 0)
+            and (rect_rot[:, 1].min() >= 0)
+            and (rect_rot[:, 0].max() <= out_w - 1)
+            and (rect_rot[:, 1].max() <= out_h - 1)
+        ):
+            cand = rect_rot.astype(np.float32)
+            try:
+                top = float(np.linalg.norm(cand[1] - cand[0]))
+                right = float(np.linalg.norm(cand[2] - cand[1]))
+                bottom = float(np.linalg.norm(cand[2] - cand[3]))
+                left = float(np.linalg.norm(cand[3] - cand[0]))
+
+                edges = [top, right, bottom, left]
+                e_min = float(min(edges))
+                e_max = float(max(edges))
+                if e_max <= 1e-6:
+                    continue
+
+                tb = max(top, bottom) / max(1e-6, min(top, bottom))
+                lr = max(left, right) / max(1e-6, min(left, right))
+                if tb > float(max_perspective_edge_ratio) or lr > float(max_perspective_edge_ratio):
+                    continue
+
+                if (e_min / e_max) < float(min_edge_len_ratio):
+                    continue
+
+                area = float(abs(cv2.contourArea(cand.reshape(-1, 1, 2))))
+                base_area = float(base_w * base_h)
+                if base_area <= 1:
+                    continue
+                area_ratio = area / base_area
+                if area_ratio < 0.60:
+                    continue
+            except Exception:
+                continue
+
+            tmp_mask = cv2.warpPerspective(
+                np.ones((h, w), dtype=np.uint8) * 255,
+                cv2.getPerspectiveTransform(
+                    np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32),
+                    cand,
+                ),
+                (out_w, out_h),
+            )
+            visible_px = int(cv2.countNonZero(tmp_mask))
+            if visible_px >= int(min_visible_area_px):
+                dst_quad = cand
+                fit_scale_used = float(s)
+                visible_area_ratio_used = float(visible_px) / float(max(1, out_w * out_h))
+                quad_area_ratio_used = float(area_ratio)
+                edge_ratio_top_bottom = float(max(top, bottom) / max(1e-6, min(top, bottom)))
+                edge_ratio_left_right = float(max(left, right) / max(1e-6, min(left, right)))
+                edge_len_min = float(e_min)
+                edge_len_max = float(e_max)
+                break
+
+    if dst_quad is None:
+        # fallback: safe fronto-parallel rectangle
+        base_w = int(out_w * 0.85)
+        base_h = int(base_w * (h / w))
+        base_h = max(120, min(base_h, int(out_h * 0.85)))
+        cx = int(out_w // 2)
+        cy = int(out_h // 2)
+        x1, y1 = cx - base_w // 2, cy - base_h // 2
+        x2, y2 = cx + base_w // 2, cy + base_h // 2
+        dst_quad = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+        angle = 0.0
+        fit_scale_used = 1.0
+        visible_area_ratio_used = float(base_w * base_h) / float(max(1, out_w * out_h))
+        quad_area_ratio_used = 1.0
+        edge_ratio_top_bottom = 1.0
+        edge_ratio_left_right = 1.0
+        edge_len_min = float(min(base_w, base_h))
+        edge_len_max = float(max(base_w, base_h))
+
+    src_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
+    H = cv2.getPerspectiveTransform(src_quad, dst_quad)
+
+    bg = random_background(out_h, out_w, rng)
+    warped = cv2.warpPerspective(template_bgr, H, (out_w, out_h))
+
+    mask = cv2.warpPerspective(np.ones((h, w), dtype=np.uint8) * 255, H, (out_w, out_h))
+    mask3 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    degraded = np.where(mask3 > 0, warped, bg)
+
+    # mild blur/noise
+    if rng.random() < 0.35:
+        degraded = cv2.GaussianBlur(degraded, (3, 3), rng.uniform(0.4, 0.8))
+    if rng.random() < 0.35:
+        degraded = to_uint8(degraded.astype(np.float32) + np.random.normal(0, 4, size=degraded.shape))
+
+    meta = {
+        "angle_deg": float(angle),
+        "rotation_mode": str(rotation_mode),
+        "snap_step_deg": float(snap_step_deg),
+        "base_w": int(base_w),
+        "base_h": int(base_h),
+        "out_w": int(out_w),
+        "out_h": int(out_h),
+        "perspective_jitter": float(perspective_jitter),
+        "min_visible_area_ratio": float(min_visible_area_ratio),
+        "visible_area_ratio": float(visible_area_ratio_used),
+        "fit_scale": float(fit_scale_used),
+        "quad_area_ratio_to_base": float(quad_area_ratio_used),
+        "edge_ratio_top_bottom": float(edge_ratio_top_bottom),
+        "edge_ratio_left_right": float(edge_ratio_left_right),
+        "edge_len_min": float(edge_len_min),
+        "edge_len_max": float(edge_len_max),
+        "safety": {
+            "min_fit_scale": float(min_fit_scale),
+            "max_perspective_edge_ratio": float(max_perspective_edge_ratio),
+            "min_edge_len_ratio": float(min_edge_len_ratio),
+        },
+        "max_attempts": int(max_attempts),
+    }
+    return degraded, H, meta
+
+
+def resize_keep_aspect(img: np.ndarray, max_side: int) -> tuple[np.ndarray, float]:
+    """max(H,W) が max_side を超える場合のみリサイズし、(resized, scale) を返す。"""
+
+    h, w = img.shape[:2]
+    m = max(h, w)
+    if m <= int(max_side):
+        return img, 1.0
+    s = float(max_side) / float(m)
+    new_w = max(1, int(round(w * s)))
+    new_h = max(1, int(round(h * s)))
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return resized, float(s)
+
+
+def scale_matrix(s: float) -> np.ndarray:
+    return np.array([[s, 0, 0], [0, s, 0], [0, 0, 1]], dtype=np.float64)
+
+
+def compute_reproj_rms(H: np.ndarray, src_pts: np.ndarray, dst_pts: np.ndarray) -> float:
+    src = src_pts.reshape(-1, 1, 2).astype(np.float32)
+    dst = dst_pts.reshape(-1, 1, 2).astype(np.float32)
+    proj = cv2.perspectiveTransform(src, np.asarray(H, dtype=np.float64))
+    err = np.linalg.norm(proj - dst, axis=2).reshape(-1)
+    return float(np.sqrt(np.mean(err**2))) if len(err) else float("nan")
+
+
+def refine_homography_least_squares(
+    H_init: np.ndarray,
+    mkpts0: np.ndarray,
+    mkpts1: np.ndarray,
+    inlier_mask: np.ndarray,
+) -> tuple[np.ndarray, Optional[float]]:
+    H0 = np.asarray(H_init, dtype=np.float64)
+    mask = np.asarray(inlier_mask, dtype=bool).reshape(-1)
+    if mask.size != len(mkpts0) or mask.size != len(mkpts1):
+        return H0, None
+    if int(mask.sum()) < 4:
+        return H0, None
+    p0 = np.asarray(mkpts0, dtype=np.float32)[mask]
+    p1 = np.asarray(mkpts1, dtype=np.float32)[mask]
+    H_ls, _ = cv2.findHomography(p0, p1, 0)
+    if H_ls is None:
+        return H0, None
+    try:
+        rms = compute_reproj_rms(np.asarray(H_ls, dtype=np.float64), p0, p1)
+    except Exception:
+        rms = None
+    return np.asarray(H_ls, dtype=np.float64), rms
+
+
+def draw_inlier_matches(
+    ref_bgr: np.ndarray,
+    tgt_bgr: np.ndarray,
+    mkpts0: np.ndarray,
+    mkpts1: np.ndarray,
+    match_max_side: int,
+) -> np.ndarray:
+    """inlier matches 可視化（XFeatのmatching座標系に合わせて描画）。"""
+
+    ref_vis, _ = resize_keep_aspect(ref_bgr, int(match_max_side))
+    tgt_vis, _ = resize_keep_aspect(tgt_bgr, int(match_max_side))
+
+    Hm, mask = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 3.5)
+    if Hm is None or mask is None:
+        return tgt_vis
+    mask = mask.reshape(-1).astype(bool)
+
+    h, w = ref_vis.shape[:2]
+    corners = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32).reshape(-1, 1, 2)
+    warped = cv2.perspectiveTransform(corners, Hm)
+
+    tgt2 = tgt_vis.copy()
+    for i in range(len(warped)):
+        p1 = tuple(warped[i - 1][0].astype(int))
+        p2 = tuple(warped[i][0].astype(int))
+        cv2.line(tgt2, p1, p2, (0, 255, 0), 4)
+
+    k0 = [cv2.KeyPoint(float(p[0]), float(p[1]), 5) for p in mkpts0]
+    k1 = [cv2.KeyPoint(float(p[0]), float(p[1]), 5) for p in mkpts1]
+    matches = [cv2.DMatch(i, i, 0) for i, m in enumerate(mask) if m]
+    canvas = cv2.drawMatches(ref_vis, k0, tgt2, k1, matches, None, matchColor=(0, 255, 0), flags=2)
+    return canvas
+
+
+def detect_formA_marker_boxes_base(image_bgr: np.ndarray) -> list[dict[str, Any]]:
+    """フォームA想定: 3点マーカー（TL/TR/BL）の bbox を検出（ベース実装）。
+
+    - `paper_pipeline_v15.py` 側では、前処理バリアントを試すためのラッパー
+      `detect_formA_marker_boxes()` を別途持つ。
+    """
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = image_bgr.shape[:2]
+
+    corner_margin_x = int(w * 0.20)
+    corner_margin_y = int(h * 0.20)
+    corners = {
+        "top_left": (0, 0, corner_margin_x, corner_margin_y),
+        "top_right": (w - corner_margin_x, 0, w, corner_margin_y),
+        "bottom_left": (0, h - corner_margin_y, corner_margin_x, h),
+        "bottom_right": (w - corner_margin_x, h - corner_margin_y, w, h),
+    }
+
+    min_size = min(w, h) * 0.005
+    max_size = min(w, h) * 0.08
+    min_area = min_size**2
+    max_area = max_size**2
+
+    bin_list: list[tuple[str, np.ndarray]] = []
+    for th in (50, 80, 120):
+        _, b = cv2.threshold(gray, th, 255, cv2.THRESH_BINARY_INV)
+        bin_list.append((f"th_{th}", b))
+    _, b_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    bin_list.append(("otsu", b_otsu))
+
+    found: dict[str, dict[str, Any]] = {}
+    kernel = np.ones((3, 3), np.uint8)
+
+    for method, binary in bin_list:
+        binary_clean = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        binary_clean = cv2.morphologyEx(binary_clean, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(binary_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            x, y, ww, hh = cv2.boundingRect(contour)
+            area_rect = ww * hh
+            area_contour = float(cv2.contourArea(contour))
+            if not (min_area < area_contour < max_area):
+                continue
+            ar = float(ww) / float(hh) if hh else 0.0
+            if not (0.4 < ar < 2.5):
+                continue
+
+            cx, cy = x + ww // 2, y + hh // 2
+            corner_name = None
+            for name, (x1, y1, x2, y2) in corners.items():
+                if x1 <= cx <= x2 and y1 <= cy <= y2:
+                    corner_name = name
+                    break
+            if corner_name not in ("top_left", "top_right", "bottom_left"):
+                continue
+
+            fill_ratio = area_contour / float(area_rect) if area_rect else 0.0
+            if fill_ratio <= 0.4:
+                continue
+
+            mask = np.zeros(gray.shape, dtype=np.uint8)
+            cv2.drawContours(mask, [contour], 0, 255, -1)
+            mean_val = float(cv2.mean(gray, mask=mask)[0])
+            if mean_val >= 180:
+                continue
+
+            eps = 0.05 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, eps, True)
+
+            aspect_score = 1.0 - abs(ar - 1.0) * 0.5
+            intensity_score = (180.0 - mean_val) / 180.0
+            score = aspect_score * 0.25 + fill_ratio * 0.35 + intensity_score * 0.4
+
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                pts = approx.reshape(4, 2).astype(np.float32)
+                pts = order_quad_tl_tr_br_bl(pts)
+            else:
+                pts = np.array(
+                    [[x, y], [x + ww - 1, y], [x + ww - 1, y + hh - 1], [x, y + hh - 1]],
+                    dtype=np.float32,
+                )
+
+            info = {
+                "corner": corner_name,
+                "bbox": [int(x), int(y), int(ww), int(hh)],
+                "points": pts.tolist(),
+                "score": float(score),
+                "method": method,
+            }
+
+            if corner_name not in found or score > float(found[corner_name]["score"]):
+                found[corner_name] = info
+
+    return [found[k] for k in ("top_left", "top_right", "bottom_left") if k in found]
+
+
+@dataclass
+class XFeatHomographyResult:
+    ok: bool
+    ref_kpts: int
+    tgt_kpts: int
+    matches: int
+    inliers: int
+    inlier_ratio: float
+    reproj_rms: Optional[float]
+    H_ref_to_tgt: Optional[list[list[float]]]
+
+
+class XFeatMatcher:
+    def __init__(self, top_k: int = 4096, device: str = "cpu", match_max_side: int = 1200):
+        ensure_portable_git_on_path()
+        self.device = str(device)
+        self.top_k = int(top_k)
+        self.match_max_side = int(match_max_side)
+        self.xfeat = (
+            torch.hub.load(
+                "verlab/accelerated_features",
+                "XFeat",
+                pretrained=True,
+                top_k=self.top_k,
+            )
+            .to(self.device)
+            .eval()
+        )
+
+    def match_and_estimate_h(
+        self, ref_bgr: np.ndarray, tgt_bgr: np.ndarray
+    ) -> tuple[XFeatHomographyResult, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        """(result, H_full, mkpts0, mkpts1) を返す。"""
+
+        ref_small, s_ref = resize_keep_aspect(ref_bgr, self.match_max_side)
+        tgt_small, s_tgt = resize_keep_aspect(tgt_bgr, self.match_max_side)
+
+        out0 = self.xfeat.detectAndCompute(ref_small, top_k=self.top_k)[0]
+        out1 = self.xfeat.detectAndCompute(tgt_small, top_k=self.top_k)[0]
+        out0.update({"image_size": (ref_small.shape[1], ref_small.shape[0])})
+        out1.update({"image_size": (tgt_small.shape[1], tgt_small.shape[0])})
+
+        matches = self.xfeat.match_lighterglue(out0, out1)
+        if isinstance(matches, (list, tuple)) and len(matches) >= 2:
+            mkpts0, mkpts1 = matches[0], matches[1]
+        elif isinstance(matches, dict) and "mkpts0" in matches and "mkpts1" in matches:
+            mkpts0, mkpts1 = matches["mkpts0"], matches["mkpts1"]
+        else:
+            return (XFeatHomographyResult(False, 0, 0, 0, 0, 0.0, None, None), None, None, None)
+
+        mkpts0 = np.asarray(mkpts0, dtype=np.float32)
+        mkpts1 = np.asarray(mkpts1, dtype=np.float32)
+
+        ref_kpts = int(len(out0.get("keypoints", [])) or 0)
+        tgt_kpts = int(len(out1.get("keypoints", [])) or 0)
+        if len(mkpts0) < 4:
+            return (XFeatHomographyResult(False, ref_kpts, tgt_kpts, int(len(mkpts0)), 0, 0.0, None, None), None, mkpts0, mkpts1)
+
+        H_small, mask = cv2.findHomography(
+            mkpts0,
+            mkpts1,
+            cv2.USAC_MAGSAC,
+            float(PIPELINE_DEFAULTS["homography"]["find"]["ransac_reproj_threshold_px"]),
+            maxIters=int(PIPELINE_DEFAULTS["homography"]["find"]["max_iters"]),
+            confidence=float(PIPELINE_DEFAULTS["homography"]["find"]["confidence"]),
+        )
+        if H_small is None or mask is None:
+            return (XFeatHomographyResult(False, ref_kpts, tgt_kpts, int(len(mkpts0)), 0, 0.0, None, None), None, mkpts0, mkpts1)
+
+        mask = mask.reshape(-1).astype(bool)
+        inliers = int(mask.sum())
+        matches_n = int(len(mask))
+        inlier_ratio = float(inliers) / float(matches_n) if matches_n else 0.0
+
+        reproj = None
+        if inliers >= 4:
+            try:
+                H_refined, rms = refine_homography_least_squares(H_small, mkpts0, mkpts1, mask)
+                if H_refined is not None:
+                    H_small = H_refined
+                reproj = rms
+            except Exception:
+                reproj = None
+
+        S_ref = scale_matrix(float(s_ref))
+        S_tgt = scale_matrix(float(s_tgt))
+        H_full = np.linalg.inv(S_tgt) @ H_small @ S_ref
+
+        return (
+            XFeatHomographyResult(
+                ok=True,
+                ref_kpts=ref_kpts,
+                tgt_kpts=tgt_kpts,
+                matches=matches_n,
+                inliers=inliers,
+                inlier_ratio=float(inlier_ratio),
+                reproj_rms=reproj,
+                H_ref_to_tgt=H_full.astype(float).tolist(),
+            ),
+            H_full,
+            mkpts0,
+            mkpts1,
+        )
 
 
 # ------------------------------------------------------------
@@ -1177,21 +1747,11 @@ def init_wechat_qr_detector(
         return None
 
 
-# --- 既存実装の流用 ---
-# 注意: このスクリプトは `python APA/paper_pipeline_v15.py ...` の形で実行される想定。
-# その場合 sys.path[0] は `.../APA` になるため、同ディレクトリのモジュールは
-# `from test_recovery_paper import ...` の形で import する（`import APA.xxx` は失敗しやすい）。
-from test_recovery_paper import (
-    XFeatMatcher,
-    detect_formA_marker_boxes as _detect_formA_marker_boxes_base,
-    draw_inlier_matches,
-    ensure_portable_git_on_path,
-    now_run_id,
-    refine_homography_least_squares,
-    resize_keep_aspect,
-    scale_matrix,
-    warp_template_to_random_view,
-)
+"""（移植に伴う注意）
+
+v15 以前は `test_recovery_paper.py` から多数の関数/クラスを import していましたが、
+本バージョンでは paper_pipeline_v15.py 単体で動くように、必要な実装を全て本ファイルへ統合しました。
+"""
 
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
@@ -1921,7 +2481,8 @@ def detect_formA_marker_boxes(image_bgr: np.ndarray, preproc_mode: str = "none")
     best: list[dict[str, Any]] = []
     best_score = -1.0
     for name, var in _preprocess_variants_for_markers(image_bgr, preproc_mode):
-        markers = _detect_formA_marker_boxes_base(var)
+        # v15.9: 自己完結化に伴い、ベース実装も本ファイル内の関数を参照する
+        markers = detect_formA_marker_boxes_base(var)
         # 3点揃ったケースを強く優先
         ok = len(markers) == 3
         score = float(sum(m.get("score", 0.0) for m in markers))

@@ -162,24 +162,68 @@ def warp_template_to_random_view(
     #
     # ここでは「紙が必ず画面内に十分写る」まで再生成する。
 
-    margin = int(min(out_w, out_h) * 0.08)
-    base_w_min = int(out_w * 0.70)
-    base_w_max = int(out_w * 0.92)
+    # ------------------------------------------------------------
+    # Safety constraints (ユーザー要望):
+    #   - 紙が極端に小さくならない
+    #   - 奥行き(透視)が強すぎて「長辺/短辺が入れ替わる」ような不自然な台形にならない
+    # ------------------------------------------------------------
+
+    margin = int(min(out_w, out_h) * 0.06)
+
+    # 紙サイズは「常識的に大きめ」を基本とする。
+    # ただし 0〜360 度回転（max_rotation_deg>=180）を有効にすると、
+    # out_w 基準の大きい矩形（例: 2400x1800 で base_w を out_w=2400 の 75%〜92%）は
+    # 斜め回転（例: 30〜60度）で画面内に収めるために大きく縮小されやすく、
+    # 結果として「0/90/180/270 付近しか成立しない」問題が起きる。
+    #
+    # そこで full-rotation の場合は、短辺（min(out_w,out_h)）基準で base_w を決め、
+    # 斜め回転でも破綻しないサイズレンジを確保する。
+    side_ref = int(min(out_w, out_h)) if float(max_rotation_deg) >= 180.0 else int(out_w)
+    base_w_min = int(side_ref * 0.75)
+    base_w_max = int(side_ref * 0.92)
+    # visible area は out_w*out_h に対する比率で評価している。
+    # full-rotation の場合、紙サイズが短辺基準になりやすいので、
+    # ここを高くしすぎると「物理的に満たせない」→ max_attempts を使い切る→ 生成が遅い/0度に偏る。
     min_visible_area_px = int(out_w * out_h * float(min_visible_area_ratio))
+
+    # fit-to-frame の縮小が大きい（紙が小さくなる）場合は棄却
+    # full-rotation では斜め回転時に多少の縮小が必須になるため、少し緩める
+    min_fit_scale = 0.70 if float(max_rotation_deg) >= 180.0 else 0.78
+
+    # 透視が強すぎる（上下/左右の辺長比が極端）場合は棄却
+    max_perspective_edge_ratio = 1.55  # 例: bottom/top が 1.55 を超えると「奥行きが強すぎる」
+
+    # 最短辺が最長辺に比べて短すぎる場合は棄却（細長い/潰れた形状の排除）
+    min_edge_len_ratio = 0.58
 
     dst_quad = None
     base_w = 0
     base_h = 0
     angle = 0.0
+    fit_scale_used: float = 1.0
+    visible_area_ratio_used: float = 0.0
+    quad_area_ratio_used: float = 0.0
+    edge_ratio_top_bottom: float = 1.0
+    edge_ratio_left_right: float = 1.0
+    edge_len_min: float = 0.0
+    edge_len_max: float = 0.0
     for _attempt in range(max_attempts):
-        # destination quad center
-        cx = rng.randint(margin, out_w - margin)
-        cy = rng.randint(margin, out_h - margin)
-
         # Make the paper occupy larger area so that it keeps enough resolution.
         base_w = rng.randint(base_w_min, base_w_max)
         base_h = int(base_w * (h / w))
         base_h = max(120, min(base_h, int(out_h * 0.85)))
+
+        # destination quad center
+        # 紙が画面外に逃げて縮小されないよう、中心座標は「紙サイズから逆算」して安全域でサンプルする。
+        cx_lo = int(base_w // 2 + margin)
+        cx_hi = int(out_w - 1 - base_w // 2 - margin)
+        cy_lo = int(base_h // 2 + margin)
+        cy_hi = int(out_h - 1 - base_h // 2 - margin)
+        if cx_lo >= cx_hi or cy_lo >= cy_hi:
+            continue
+
+        cx = rng.randint(cx_lo, cx_hi)
+        cy = rng.randint(cy_lo, cy_hi)
 
         # start from axis-aligned rectangle
         x1, y1 = cx - base_w // 2, cy - base_h // 2
@@ -242,6 +286,10 @@ def warp_template_to_random_view(
         if s < 1.0:
             rect_rot = np.stack([cx + dx * s, cy + dy * s], axis=1).astype(np.float32)
 
+        # 縮小が大きすぎる（紙が小さくなる）場合は棄却して作り直す
+        if float(s) < float(min_fit_scale):
+            continue
+
         # Accept only if all corners are inside
         if (
             (rect_rot[:, 0].min() >= 0)
@@ -257,6 +305,42 @@ def warp_template_to_random_view(
             # 角の対応が崩れて意図した回転（例：QRが下側）が壊れる。
             cand = rect_rot.astype(np.float32)
 
+            # 形状の安全チェック（過度な透視/潰れを防止）
+            try:
+                # TL/TR/BR/BL の対応関係を前提に辺長を評価する
+                top = float(np.linalg.norm(cand[1] - cand[0]))
+                right = float(np.linalg.norm(cand[2] - cand[1]))
+                bottom = float(np.linalg.norm(cand[2] - cand[3]))
+                left = float(np.linalg.norm(cand[3] - cand[0]))
+
+                edges = [top, right, bottom, left]
+                e_min = float(min(edges))
+                e_max = float(max(edges))
+                if e_max <= 1e-6:
+                    continue
+
+                # 透視が強いと top と bottom（または left と right）が極端に離れる
+                tb = max(top, bottom) / max(1e-6, min(top, bottom))
+                lr = max(left, right) / max(1e-6, min(left, right))
+                if tb > float(max_perspective_edge_ratio) or lr > float(max_perspective_edge_ratio):
+                    continue
+
+                # 潰れすぎ（細長すぎ）を排除
+                if (e_min / e_max) < float(min_edge_len_ratio):
+                    continue
+
+                # 面積が小さすぎる（見た目の縮小/潰れ）を排除
+                area = float(abs(cv2.contourArea(cand.reshape(-1, 1, 2))))
+                base_area = float(base_w * base_h)
+                if base_area <= 1:
+                    continue
+                area_ratio = area / base_area
+                # 透視変形しても、基準矩形の 60% 未満は不自然になりやすい
+                if area_ratio < 0.60:
+                    continue
+            except Exception:
+                continue
+
             # quick visible-area check by warping a ones mask
             tmp_mask = cv2.warpPerspective(
                 np.ones((h, w), dtype=np.uint8) * 255,
@@ -266,15 +350,38 @@ def warp_template_to_random_view(
                 ),
                 (out_w, out_h),
             )
-            if int(cv2.countNonZero(tmp_mask)) >= min_visible_area_px:
+            visible_px = int(cv2.countNonZero(tmp_mask))
+            if visible_px >= min_visible_area_px:
                 dst_quad = cand
+                fit_scale_used = float(s)
+                visible_area_ratio_used = float(visible_px) / float(max(1, out_w * out_h))
+                quad_area_ratio_used = float(area_ratio)
+                edge_ratio_top_bottom = float(max(top, bottom) / max(1e-6, min(top, bottom)))
+                edge_ratio_left_right = float(max(left, right) / max(1e-6, min(left, right)))
+                edge_len_min = float(e_min)
+                edge_len_max = float(e_max)
                 break
 
     if dst_quad is None:
-        # 最後の手段: クリップして必ず返す（ただしログ的には不自然になる）
-        rect_rot[:, 0] = np.clip(rect_rot[:, 0], 0, out_w - 1)
-        rect_rot[:, 1] = np.clip(rect_rot[:, 1], 0, out_h - 1)
-        dst_quad = order_quad_tl_tr_br_bl(rect_rot)
+        # 最後の手段:
+        # これ以上リトライしても失敗する場合、極端な改悪を出すより
+        # 「安全な矩形（ほぼ正面）」を返す。
+        base_w = int(out_w * 0.85)
+        base_h = int(base_w * (h / w))
+        base_h = max(120, min(base_h, int(out_h * 0.85)))
+        cx = int(out_w // 2)
+        cy = int(out_h // 2)
+        x1, y1 = cx - base_w // 2, cy - base_h // 2
+        x2, y2 = cx + base_w // 2, cy + base_h // 2
+        dst_quad = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+        angle = 0.0
+        fit_scale_used = 1.0
+        visible_area_ratio_used = float(base_w * base_h) / float(max(1, out_w * out_h))
+        quad_area_ratio_used = 1.0
+        edge_ratio_top_bottom = 1.0
+        edge_ratio_left_right = 1.0
+        edge_len_min = float(min(base_w, base_h))
+        edge_len_max = float(max(base_w, base_h))
 
     src_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
     H = cv2.getPerspectiveTransform(src_quad, dst_quad)
@@ -317,6 +424,18 @@ def warp_template_to_random_view(
         "out_h": int(out_h),
         "perspective_jitter": float(perspective_jitter),
         "min_visible_area_ratio": float(min_visible_area_ratio),
+        "visible_area_ratio": float(visible_area_ratio_used),
+        "fit_scale": float(fit_scale_used),
+        "quad_area_ratio_to_base": float(quad_area_ratio_used),
+        "edge_ratio_top_bottom": float(edge_ratio_top_bottom),
+        "edge_ratio_left_right": float(edge_ratio_left_right),
+        "edge_len_min": float(edge_len_min),
+        "edge_len_max": float(edge_len_max),
+        "safety": {
+            "min_fit_scale": float(min_fit_scale),
+            "max_perspective_edge_ratio": float(max_perspective_edge_ratio),
+            "min_edge_len_ratio": float(min_edge_len_ratio),
+        },
         "max_attempts": int(max_attempts),
     }
     return degraded, H, meta
@@ -378,9 +497,13 @@ def detect_formA_marker_boxes(image_bgr: np.ndarray) -> list[dict[str, Any]]:
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     h, w = image_bgr.shape[:2]
 
-    # corner regions (15%)
-    corner_margin_x = int(w * 0.15)
-    corner_margin_y = int(h * 0.15)
+    # corner regions
+    # NOTE:
+    # paper_pipeline 側では DocAligner の polygon margin / rectify により、
+    # マーカーが画像の“角から少し内側”に入ることがある。
+    # 15% だと取りこぼすことがあったため、少し広げる。
+    corner_margin_x = int(w * 0.20)
+    corner_margin_y = int(h * 0.20)
     corners = {
         "top_left": (0, 0, corner_margin_x, corner_margin_y),
         "top_right": (w - corner_margin_x, 0, w, corner_margin_y),
@@ -616,13 +739,14 @@ class XFeatMatcher:
                 mkpts1,
             )
 
+        # 高精度優先（時間は増えるが収束率/安定性を上げる）
         H, mask = cv2.findHomography(
             mkpts0,
             mkpts1,
             cv2.USAC_MAGSAC,
-            3.5,
-            maxIters=1_000,
-            confidence=0.999,
+            3.0,
+            maxIters=5_000,
+            confidence=0.9999,
         )
 
         if H is None or mask is None:
