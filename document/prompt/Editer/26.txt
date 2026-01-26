@@ -12,7 +12,6 @@
 # プロンプト
 
 @/APA/paper_pipeline_v16.py
-@/APA/test_recovery_paper.py
 上記のプログラムに以下の改善を行ってほしいです
 
 改善1
