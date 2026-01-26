@@ -141,6 +141,21 @@ v17.12+ のデフォルトは「現場画像想定の target のみ」を処理�
 更新履歴（抜粋）
 ----------------
 
+- v17.16（2026-01-26）
+  - target（現場撮影）の no_detection（フォームA取りこぼし）対策:
+    - A-geometry を追加で緩める（recall優先）
+      - surround_max_ink_ratio: 0.05 -> 0.08（机模様/枠線の写り込み救済）
+      - min_marker_area_page_ratio: 5e-5 -> 3.5e-5（マーカーが僅かに小さいケース救済）
+  - 高精度フォールバック（advanced_fallback）の診断性改善:
+    - no_detection 時に polygon を再推定するフォールバックで、各 margin 試行の decision を attempts に記録
+
+- v17.15（2026-01-26）
+  - target（現場撮影）でのフォームA取りこぼし対策:
+    - マーカー検出の探索範囲を「corner付近」に絞り、枠線/文字の誤検出を減らす
+    - マーカー想定サイズ（min/max）を調整し、rectify後の解像度差に追従
+    - cornerへの近さ（pos_score）をスコアに加え、端にある正しいマーカーを優先
+  - target の A-geometry（surround_min_mean_gray）を緩め、影で corner が暗い場合の救済を追加
+
 - v17.10〜v17.11（2026-01-25）
   - DocAligner の安定性改善:
     - pad_px を画像サイズ比から自動推定（端ギリギリ撮影の救済）
@@ -584,8 +599,16 @@ def detect_formA_marker_boxes_base(image_bgr: np.ndarray) -> list[dict[str, Any]
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     h, w = image_bgr.shape[:2]
 
-    corner_margin_x = int(w * 0.20)
-    corner_margin_y = int(h * 0.20)
+    # v17.15 (target改善):
+    # rectified 後の書類では、マーカーは「かなり端」にある。
+    # corner探索範囲が広すぎると、枠線/文字/手書きなどを誤検出しやすい。
+    # そのため、探索範囲・想定サイズを設定化し、既定値も少し厳しめにする。
+    marker_cfg = PIPELINE_DEFAULTS.get("marker", {}) if isinstance(PIPELINE_DEFAULTS.get("marker", {}), dict) else {}
+    corner_margin_ratio = float(marker_cfg.get("corner_margin_ratio", 0.12) or 0.12)
+    corner_margin_ratio = float(max(0.05, min(0.30, corner_margin_ratio)))
+
+    corner_margin_x = int(w * corner_margin_ratio)
+    corner_margin_y = int(h * corner_margin_ratio)
     corners = {
         "top_left": (0, 0, corner_margin_x, corner_margin_y),
         "top_right": (w - corner_margin_x, 0, w, corner_margin_y),
@@ -593,8 +616,10 @@ def detect_formA_marker_boxes_base(image_bgr: np.ndarray) -> list[dict[str, Any]
         "bottom_right": (w - corner_margin_x, h - corner_margin_y, w, h),
     }
 
-    min_size = min(w, h) * 0.005
-    max_size = min(w, h) * 0.08
+    min_size_ratio = float(marker_cfg.get("marker_min_size_ratio", 0.008) or 0.008)
+    max_size_ratio = float(marker_cfg.get("marker_max_size_ratio", 0.07) or 0.07)
+    min_size = min(w, h) * float(min_size_ratio)
+    max_size = min(w, h) * float(max_size_ratio)
     min_area = min_size**2
     max_area = max_size**2
 
@@ -633,7 +658,7 @@ def detect_formA_marker_boxes_base(image_bgr: np.ndarray) -> list[dict[str, Any]
                 continue
 
             fill_ratio = area_contour / float(area_rect) if area_rect else 0.0
-            if fill_ratio <= 0.4:
+            if fill_ratio <= 0.45:
                 continue
 
             mask = np.zeros(gray.shape, dtype=np.uint8)
@@ -645,9 +670,20 @@ def detect_formA_marker_boxes_base(image_bgr: np.ndarray) -> list[dict[str, Any]
             eps = 0.05 * cv2.arcLength(contour, True)
             approx = cv2.approxPolyDP(contour, eps, True)
 
+            # 位置prior: corner の“より端”に近いものを優先
+            corner_xy = {
+                "top_left": (0.0, 0.0),
+                "top_right": (float(w - 1), 0.0),
+                "bottom_left": (0.0, float(h - 1)),
+            }.get(corner_name, (0.0, 0.0))
+            dist = float(np.hypot(float(cx) - float(corner_xy[0]), float(cy) - float(corner_xy[1])))
+            # max_dist は探索矩形の対角線
+            max_dist = float(np.hypot(float(corner_margin_x), float(corner_margin_y)))
+            pos_score = max(0.0, 1.0 - (dist / max(1e-6, max_dist)))
+
             aspect_score = 1.0 - abs(ar - 1.0) * 0.5
             intensity_score = (180.0 - mean_val) / 180.0
-            score = aspect_score * 0.25 + fill_ratio * 0.35 + intensity_score * 0.4
+            score = aspect_score * 0.22 + fill_ratio * 0.33 + intensity_score * 0.35 + pos_score * 0.10
 
             if len(approx) == 4 and cv2.isContourConvex(approx):
                 pts = approx.reshape(4, 2).astype(np.float32)
@@ -663,6 +699,7 @@ def detect_formA_marker_boxes_base(image_bgr: np.ndarray) -> list[dict[str, Any]
                 "bbox": [int(x), int(y), int(ww), int(hh)],
                 "points": pts.tolist(),
                 "score": float(score),
+                "pos_score": float(pos_score),
                 "method": method,
             }
 
@@ -1062,52 +1099,57 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
     "docaligner": {
         "model": "fastvit_sa24",  # DocAlignerのモデル名
         "type": "heatmap",  # 推論タイプ（"point" / "heatmap"）
-        # 透視補正後の紙画像が小さすぎると、マーカー/QRの判定や UVDoc の精度が落ちる。
-        # 実行が重すぎる問題への緩和:
-        # - rectify 解像度は高いほど後段に有利だが、全体負荷も増える。
-        # - デフォルトは「高精度寄りだが極端に重くしない」水準へ戻す。
-        "rectified_max_side_px": 2560,
-        # v17.10 (DocAligner改善):
-        # target 画像では「紙がフレーム端ギリギリ」になりやすく、pad=100 固定だと角が欠けて
-        # 三角形/線のような polygon が出て後段が全滅するケースがあった。
-        # そのため pad の既定を増やし、さらに画像サイズ比で自動算出した値も候補に入れる。
-        # 実行が重すぎる問題への緩和:
-        # pad を増やすほど救済は効くが入力が大きくなり推論が重くなるため、やや抑える。
-        "pad_px": 220,  # DocAligner入力前に周囲へ足すパディング(px)
-        "pad_px_auto_ratio": 0.08,  # pad_px_auto = int(min(h,w) * ratio)
+
+        # NOTE(v17.17+):
+        # target では margin を大きく取りたい（端ギリギリ撮影救済）ため、
+        # rectify の最大辺も引き上げて角の解像度を落としにくくする。
+        "rectified_max_side_px": 3200,
+
+        # DocAligner入力前に周囲へ足すパディング(px)
+        "pad_px": 320,
+        # auto pad も精度優先でやや厚めにする
+        "pad_px_auto_ratio": 0.10,
         "pad_px_auto_min": 120,
         "pad_px_auto_max": 800,
+
         # DocAlignerを1発勝負にしない（複数候補→後段で選ぶ）
-        # - 推論コストが大きいので、全組合せ探索ではなく「優先度順に最大N回だけ」試す。
-        # - 候補ごとに rectify→フォーム判定スコアで最良を採用。
         "multi": {
             "enable": True,
             # 追加で試すモデル/タイプ。args の指定（--docaligner-model/type）が最優先。
-            # ここに書いたものを“足す”形で候補生成する。
-            # 実行が重すぎる問題への緩和:
-            # - モデル/タイプ探索を広げると精度は上がるが、推論回数が増えて極端に遅くなる。
-            # - ここでは「ベース(model/type) + 追加1モデル」程度に絞る。
-            "extra_models": ["fastvit_t8"],
-            "extra_types": ["heatmap"],
-            # pad は「auto + 複数固定値」を候補にする
-            # pad 探索も絞る（auto + 少数候補）
-            "pad_px_candidates": [200, 400, 600],
+            "extra_models": ["fastvit_t8", "lcnet100"],
+            "extra_types": ["heatmap", "point"],
+            # pad は「auto + 複数固定値」を候補にする（端ギリギリ撮影の救済）
+            "pad_px_candidates": [240, 400, 650, 900],
             # 入力リサイズ（polygonはスケールで戻す）
-            # スケール探索を絞る。
-            # 特に 1.25/1.4 は入力を大きくして推論が急激に重くなるため、デフォルトでは使わない。
-            "input_scales": [1.0, 0.75, 0.6],
-            # 何回まで DocAligner 推論を実行するか（推論が最重いので上限を設ける）
-            # 1ケースでの DocAligner 推論回数の上限（ここが重さの主因）
-            "max_infer_runs": 4,
+            "input_scales": [0.75, 0.6, 1.15],
+            # 1ケースでの DocAligner 推論回数の上限
+            "max_infer_runs": 8,
             # 後段で評価する raw polygon 候補の上限
             "max_polygon_candidates": 4,
         },
+
+        # polygon を外側に広げる margin
         "polygon_margin": {
-            # 高精度優先: 余白を多めに取り、紙端が欠けているケースを救済
-            "ratio": 0.12,  # polygonを外側に広げる比率（紙の長辺に対する割合）
-            "min_px": 10.0,  # ratio計算の下限(px)
-            "max_px": 200.0,  # ratio計算の上限(px)（0以下なら無制限）
-            "fixed_px": 0.0,  # 固定pxマージン（>0の場合 ratio を上書き）
+            # NOTE(v17.17+):
+            # target では 0.12 だと max_px=200 に頭打ちしやすく、
+            # 実際に必要な margin が確保できずマーカー/QRが欠けて no_detection になりやすい。
+            "ratio": 0.18,
+            "min_px": 10.0,
+            "max_px": 800.0,
+            "fixed_px": 0.0,
+        },
+
+        # v17.17+: rectify 直前に画像を pad して「margin を取りたいのに clip で潰れる」を避ける。
+        "rectify_padding": {
+            "enable": True,
+            "pad_px": 800,
+            "border_value": [0, 0, 0],
+        },
+
+        # no_detection の場合の高精度フォールバック
+        "advanced_fallback": {
+            "enable": True,
+            "trigger_on_form_unknown_no_detection": True,
         },
     },
 
@@ -2134,6 +2176,110 @@ def polygon_to_rectified(
     return rectified, H
 
 
+def _get_rectify_padding_cfg() -> dict[str, Any]:
+    """rectify 前に入力を padding する設定を取得する。"""
+
+    cfg_doc = PIPELINE_DEFAULTS.get("docaligner") or {}
+    cfg = (cfg_doc.get("rectify_padding") or {}) if isinstance(cfg_doc, dict) else {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    return cfg
+
+
+def _apply_rectify_padding(
+    image_bgr: np.ndarray,
+    *,
+    required_margin_px: float,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """rectify 前に画像を padding し、座標変換行列も返す。
+
+    目的:
+      polygon を外側へ expand したいのに、入力画像境界で clip されて
+      rectify 結果が欠ける問題（特に target の端ギリギリ撮影）を避ける。
+
+    戻り値:
+      (padded_image, T_deg_to_padded, meta)
+    """
+
+    if image_bgr is None:
+        return image_bgr, np.eye(3, dtype=np.float64), {"applied": False, "reason": "image_is_none"}
+
+    cfg = _get_rectify_padding_cfg()
+    enable = bool(cfg.get("enable", False))
+    if not enable:
+        return image_bgr, np.eye(3, dtype=np.float64), {"applied": False, "reason": "disabled"}
+
+    pad_cfg = int(cfg.get("pad_px", 0) or 0)
+    # margin を確保するため、必要なら pad を上積みする（過剰な巨大化は避ける）
+    pad_need = int(max(0.0, float(required_margin_px)))
+    pad_px = int(max(pad_cfg, pad_need + 12))
+    pad_px = int(max(0, min(2000, pad_px)))
+
+    if pad_px <= 0:
+        return image_bgr, np.eye(3, dtype=np.float64), {"applied": False, "reason": "pad_px<=0"}
+
+    border_value = cfg.get("border_value", [0, 0, 0])
+    try:
+        bgr = tuple(int(x) for x in border_value)
+        if len(bgr) != 3:
+            bgr = (0, 0, 0)
+    except Exception:
+        bgr = (0, 0, 0)
+
+    padded = cv2.copyMakeBorder(
+        image_bgr,
+        pad_px,
+        pad_px,
+        pad_px,
+        pad_px,
+        borderType=cv2.BORDER_CONSTANT,
+        value=bgr,
+    )
+    # degraded(x,y)->padded(x+pad,y+pad)
+    T = np.array([[1.0, 0.0, float(pad_px)], [0.0, 1.0, float(pad_px)], [0.0, 0.0, 1.0]], dtype=np.float64)
+    return padded, T, {"applied": True, "pad_px": int(pad_px), "border_value": list(bgr)}
+
+
+def rectify_with_margin_and_optional_padding(
+    image_bgr: np.ndarray,
+    *,
+    polygon_xy: np.ndarray,
+    margin_px: float,
+    out_max_side: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """polygon + margin で rectify を行い、必要なら入力 padding も適用する。
+
+    戻り値:
+      (rectified, H_degraded_to_rectified, poly_exp_for_overlay(degraded), meta)
+    """
+
+    if image_bgr is None:
+        raise ValueError("image_bgr is None")
+
+    h, w = image_bgr.shape[:2]
+    poly = order_quad_tl_tr_br_bl(np.asarray(polygon_xy, dtype=np.float32).reshape(4, 2))
+
+    # まず overlay 用（従来通り degraded 画像内で clamp）
+    poly_exp_overlay = expand_polygon(poly, float(margin_px), img_w=int(w), img_h=int(h))
+
+    # rectify 用は padding したキャンバス上で expand する
+    padded, T_deg_to_pad, pad_meta = _apply_rectify_padding(image_bgr, required_margin_px=float(margin_px))
+    Hp, Wp = padded.shape[:2]
+    poly_pad = (poly + np.array([[float(T_deg_to_pad[0, 2]), float(T_deg_to_pad[1, 2])]], dtype=np.float32)).astype(np.float32)
+    poly_exp_pad = expand_polygon(poly_pad, float(margin_px), img_w=int(Wp), img_h=int(Hp))
+    rectified, H_pad_to_rect = polygon_to_rectified(padded, poly_exp_pad, out_max_side=int(out_max_side))
+
+    # degraded -> rectified の変換へ落とし込む
+    H_deg_to_rect = np.asarray(H_pad_to_rect, dtype=np.float64) @ np.asarray(T_deg_to_pad, dtype=np.float64)
+
+    meta = {
+        "rectify_padding": pad_meta,
+        "poly_exp_overlay": poly_exp_overlay.astype(float).tolist(),
+        "poly_exp_padded": poly_exp_pad.astype(float).tolist(),
+    }
+    return rectified, H_deg_to_rect, poly_exp_overlay, meta
+
+
 def rotate_image_bound(image_bgr: np.ndarray, angle_deg: float) -> np.ndarray:
     """切り取りが起きないようにキャンバスを拡張して回転する（imutils.rotate_bound 相当）。"""
 
@@ -2618,12 +2764,678 @@ def _run_docaligner_once(
     if poly is None:
         return None
     poly = np.asarray(poly, dtype=np.float32)
-    if poly.shape[0] < 4:
+    poly = poly.reshape(-1, 2)
+    if poly.shape[0] < 3:
         return None
-    poly = poly[:4] - float(pad_px)
+
+    # v17.18 (改善: 重複コーナー/三角形化の修復):
+    # DocAligner が返す polygon には以下が混ざり得る。
+    # - 4点だが2点がほぼ同一点（=三角形のようになる）
+    # - 点順が不定/点数が3点や多点
+    # ここで「必ず4つの角（重複なし）」を得るため、
+    # 画像コンテキスト（エッジ）を使った修復を含む正規化を行う。
+    poly, _norm_meta = normalize_polygon_to_quad_with_meta(poly, image_bgr=padded)
+    if poly is None:
+        return None
+
+    # v17.18: 修復が走ったかを DocAligner multi の診断へ残したいが、
+    # _run_docaligner_once は signature 互換のため return 値には含めない。
+    # （必要なら上位の detect_polygon_docaligner_multi で再計算/推定する）
+
+    # unpad
+    poly = poly - float(pad_px)
     if abs(s - 1.0) > 1e-9:
         poly = poly / float(s)
     return poly.astype(np.float32)
+
+
+def _min_pairwise_distance_xy(pts_xy: np.ndarray) -> float:
+    pts = np.asarray(pts_xy, dtype=np.float32).reshape(-1, 2)
+    if pts.shape[0] < 2:
+        return 0.0
+    dmin = float("inf")
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            d = float(np.linalg.norm(pts[i] - pts[j]))
+            dmin = min(dmin, d)
+    return float(dmin) if math.isfinite(dmin) else 0.0
+
+
+def _default_duplicate_threshold_px(*, pts_xy: np.ndarray, image_bgr: Optional[np.ndarray] = None) -> float:
+    """重複点（ほぼ同一点）とみなす距離しきい値(px)を決める。
+
+    - 画像がある場合: min(H,W) の比率で決める
+    - 無い場合: pts の bounding box から概算
+    """
+
+    try:
+        if image_bgr is not None:
+            h, w = image_bgr.shape[:2]
+            s = float(min(h, w))
+        else:
+            pts = np.asarray(pts_xy, dtype=np.float32).reshape(-1, 2)
+            xs = pts[:, 0]
+            ys = pts[:, 1]
+            s = float(max(1.0, min(float(xs.max() - xs.min()), float(ys.max() - ys.min()))))
+        # 端末/解像度差に強いように比率で決める
+        # 例: 短辺2000px -> 0.012*2000=24px
+        return float(max(6.0, min(80.0, s * 0.012)))
+    except Exception:
+        return 12.0
+
+
+def _is_degenerate_quad_by_geometry(
+    quad_xy: np.ndarray,
+    *,
+    img_w: Optional[int] = None,
+    img_h: Optional[int] = None,
+    dup_thresh_px: float,
+) -> tuple[bool, dict[str, Any]]:
+    quad = order_quad_tl_tr_br_bl(np.asarray(quad_xy, dtype=np.float32).reshape(4, 2))
+    area = float(abs(cv2.contourArea(quad.reshape(-1, 1, 2).astype(np.float32))))
+    edges = [
+        float(np.linalg.norm(quad[1] - quad[0])),
+        float(np.linalg.norm(quad[2] - quad[1])),
+        float(np.linalg.norm(quad[3] - quad[2])),
+        float(np.linalg.norm(quad[0] - quad[3])),
+    ]
+    e_min = float(min(edges)) if edges else 0.0
+    min_pair = _min_pairwise_distance_xy(quad)
+
+    reasons: list[str] = []
+    if min_pair < float(dup_thresh_px):
+        reasons.append("duplicate_points")
+    if area <= 1.0:
+        reasons.append("area_too_small")
+    if e_min <= 1.0:
+        reasons.append("edge_min_too_small")
+    # 画像サイズがあるなら「極小quad」を弾く（ただし厳しすぎると救済候補が消えるため軽め）
+    if img_w is not None and img_h is not None:
+        min_side = float(min(img_w, img_h))
+        if e_min < (min_side * 0.01):
+            reasons.append("edge_min_too_small_relative")
+
+    return (len(reasons) > 0), {"area": area, "edge_min": e_min, "min_pair_dist": min_pair, "reasons": reasons}
+
+
+def _recover_quad_from_edges(
+    image_bgr: np.ndarray,
+) -> tuple[Optional[np.ndarray], dict[str, Any]]:
+    """画像のエッジ/輪郭から4隅を再推定する（DocAligner出力が退化した時の修復）。
+
+    方針（高精度優先・時間は気にしない）:
+      1) エッジ→輪郭→凸包→approxPolyDP(ε掃引) で「4点凸四角形」を直接探す
+      2) 見つからない場合は HoughLinesP で2方向×2本の外接線を推定し、交点を角とする
+      3) 最後に Shi-Tomasi で角を微調整
+
+    返り値:
+      (quad or None, meta)
+    """
+
+    meta: dict[str, Any] = {"ok": False, "method": "", "detail": {}}
+    if image_bgr is None:
+        meta["detail"]["reason"] = "image_is_none"
+        return None, meta
+
+    h, w = image_bgr.shape[:2]
+    if h < 80 or w < 80:
+        meta["detail"]["reason"] = "too_small"
+        return None, meta
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0.0)
+
+    # エッジ抽出（やや強め）
+    e = cv2.Canny(gray, 40, 140)
+    e = cv2.dilate(e, np.ones((3, 3), np.uint8), iterations=1)
+    e = cv2.morphologyEx(e, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=1)
+
+    best_quad: Optional[np.ndarray] = None
+    best_score = float("-inf")
+
+    # --- (1) 輪郭近似で4点を直接探す ---
+    try:
+        contours, _ = cv2.findContours(e, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    except Exception:
+        contours = []
+
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:40] if contours else []
+    for cnt in contours:
+        area = float(cv2.contourArea(cnt))
+        if area < float(h * w) * 0.02:
+            continue
+
+        hull = cv2.convexHull(cnt)
+        peri = float(cv2.arcLength(hull, True))
+        if peri <= 1:
+            continue
+
+        for eps_ratio in [0.004, 0.006, 0.008, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05]:
+            approx = cv2.approxPolyDP(hull, eps_ratio * peri, True)
+            pts = approx.reshape(-1, 2).astype(np.float32)
+            if pts.shape[0] != 4 or (not cv2.isContourConvex(approx)):
+                continue
+            quad = order_quad_tl_tr_br_bl(pts)
+            dup_thr = _default_duplicate_threshold_px(pts_xy=quad, image_bgr=image_bgr)
+            deg, deg_meta = _is_degenerate_quad_by_geometry(quad, img_w=int(w), img_h=int(h), dup_thresh_px=float(dup_thr))
+            if deg:
+                continue
+            ok, q = _is_valid_quad(quad, img_w=int(w), img_h=int(h))
+            if not ok:
+                continue
+
+            support = _score_quad_by_edge_support(quad_xy=quad, edge_u8=e)
+            score = float(q.get("area_ratio", 0.0)) * 10.0 + float(support) * 8.0
+            if score > best_score:
+                best_score = score
+                best_quad = quad
+                meta["detail"]["contour"] = {"eps_ratio": float(eps_ratio), "score": float(score), "support": float(support), "q": q}
+
+    if best_quad is not None:
+        try:
+            best_quad = _refine_quad_corners_by_shi_tomasi(image_gray=gray, quad_xy=best_quad)
+        except Exception:
+            pass
+        meta.update({"ok": True, "method": "contour_approx"})
+        return best_quad, meta
+
+    # --- (2) HoughLinesP で4辺を推定して交点から角を作る ---
+    try:
+        lines = cv2.HoughLinesP(e, 1, np.pi / 180.0, threshold=120, minLineLength=int(min(h, w) * 0.18), maxLineGap=18)
+    except Exception:
+        lines = None
+
+    if lines is not None and len(lines) >= 6:
+        segs = np.asarray(lines, dtype=np.float32).reshape(-1, 4)
+
+        # 方向角（0..pi）
+        dx = segs[:, 2] - segs[:, 0]
+        dy = segs[:, 3] - segs[:, 1]
+        ang = np.mod(np.arctan2(dy, dx), np.pi)  # 0..pi
+
+        # 2方向に分ける（直交っぽい2群）
+        # まず主方向をヒストグラムで取る
+        bins = 36
+        hist, edges = np.histogram(ang, bins=bins, range=(0.0, float(np.pi)))
+        i0 = int(np.argmax(hist))
+        a0 = float((edges[i0] + edges[i0 + 1]) * 0.5)
+        # 直交方向（±90deg）近傍を探す
+        target = float((a0 + (np.pi / 2.0)) % np.pi)
+        # target に近いbinを選ぶ
+        centers = (edges[:-1] + edges[1:]) * 0.5
+        i1 = int(np.argmin(np.abs(centers - target)))
+        a1 = float(centers[i1])
+
+        def _select_group(center_angle: float, tol: float = float(np.pi / 18.0)) -> np.ndarray:
+            da = np.abs(((ang - center_angle + np.pi) % np.pi) - np.pi / 2.0)
+            # 上式は微妙なので、単純に circular distance を使う
+            da = np.abs(((ang - center_angle + np.pi) % np.pi) - np.pi)
+            da = np.minimum(da, np.pi - da)
+            return segs[da < tol]
+
+        g0 = _select_group(a0)
+        g1 = _select_group(a1)
+
+        def _fit_two_parallel_lines(segs_xyxy: np.ndarray) -> Optional[list[tuple[np.ndarray, float]]]:
+            if segs_xyxy is None or len(segs_xyxy) < 2:
+                return None
+            # 各線分の法線 n とオフセット rho を作る
+            ps = segs_xyxy.reshape(-1, 4)
+            x1, y1, x2, y2 = ps[:, 0], ps[:, 1], ps[:, 2], ps[:, 3]
+            vx = x2 - x1
+            vy = y2 - y1
+            norm = np.sqrt(vx * vx + vy * vy) + 1e-6
+            vx /= norm
+            vy /= norm
+            # 法線（右法線）
+            nx = vy
+            ny = -vx
+            # 各線分の中点
+            mx = (x1 + x2) * 0.5
+            my = (y1 + y2) * 0.5
+            rho = nx * mx + ny * my
+
+            # 法線方向は符号が反転し得るので揃える（rhoが正になるように）
+            sign = np.where(rho >= 0, 1.0, -1.0)
+            nx *= sign
+            ny *= sign
+            rho *= sign
+
+            # 1D k-means(2) 相当: rho の 2 クラスタを中央値で分ける
+            r_sorted = np.sort(rho)
+            cut = float(r_sorted[len(r_sorted) // 2])
+            idx0 = rho <= cut
+            idx1 = rho > cut
+            if idx0.sum() < 1 or idx1.sum() < 1:
+                # 端2本
+                idx0 = rho <= float(r_sorted[0])
+                idx1 = rho >= float(r_sorted[-1])
+
+            def _avg_line(mask: np.ndarray) -> tuple[np.ndarray, float]:
+                n = np.array([float(np.mean(nx[mask])), float(np.mean(ny[mask]))], dtype=np.float32)
+                nn = float(np.linalg.norm(n))
+                if nn <= 1e-6:
+                    n = np.array([1.0, 0.0], dtype=np.float32)
+                    nn = 1.0
+                n = n / nn
+                r = float(np.mean(rho[mask]))
+                return n, r
+
+            line0 = _avg_line(idx0)
+            line1 = _avg_line(idx1)
+            return [line0, line1]
+
+        lines0 = _fit_two_parallel_lines(g0)
+        lines1 = _fit_two_parallel_lines(g1)
+
+        if lines0 is not None and lines1 is not None:
+            # 直線 (n, rho): n・x = rho を2本ずつ
+            def _inter(n1: np.ndarray, r1: float, n2: np.ndarray, r2: float) -> Optional[np.ndarray]:
+                A = np.array([[float(n1[0]), float(n1[1])], [float(n2[0]), float(n2[1])]], dtype=np.float64)
+                b = np.array([float(r1), float(r2)], dtype=np.float64)
+                det = float(np.linalg.det(A))
+                if abs(det) < 1e-9:
+                    return None
+                x = np.linalg.solve(A, b)
+                if not (math.isfinite(float(x[0])) and math.isfinite(float(x[1]))):
+                    return None
+                return x.astype(np.float32)
+
+            nA1, rA1 = lines0[0]
+            nA2, rA2 = lines0[1]
+            nB1, rB1 = lines1[0]
+            nB2, rB2 = lines1[1]
+
+            pts = []
+            for (na, ra) in [(nA1, rA1), (nA2, rA2)]:
+                for (nb, rb) in [(nB1, rB1), (nB2, rB2)]:
+                    p = _inter(na, ra, nb, rb)
+                    if p is not None:
+                        pts.append(p)
+
+            if len(pts) == 4:
+                quad = order_quad_tl_tr_br_bl(np.stack(pts, axis=0).astype(np.float32))
+                quad = _clamp_poly_to_image(quad, img_w=int(w), img_h=int(h))
+                dup_thr = _default_duplicate_threshold_px(pts_xy=quad, image_bgr=image_bgr)
+                deg, deg_meta = _is_degenerate_quad_by_geometry(quad, img_w=int(w), img_h=int(h), dup_thresh_px=float(dup_thr))
+                if not deg:
+                    ok, q = _is_valid_quad(quad, img_w=int(w), img_h=int(h))
+                    if ok:
+                        try:
+                            quad = _refine_quad_corners_by_shi_tomasi(image_gray=gray, quad_xy=quad)
+                        except Exception:
+                            pass
+                        meta.update({"ok": True, "method": "hough_lines", "detail": {"q": q, "deg": deg_meta}})
+                        return quad, meta
+
+    meta["detail"]["reason"] = "edge_recover_failed"
+    return None, meta
+
+
+def normalize_polygon_to_quad_with_meta(
+    poly_xy: np.ndarray,
+    *,
+    image_bgr: Optional[np.ndarray] = None,
+) -> tuple[Optional[np.ndarray], dict[str, Any]]:
+    """DocAligner 等が返した polygon を「必ず4点（重複なし）」へ正規化する。
+
+    特にユーザー要望（重要）:
+      - 4点のうち2点が同じ場所（重複）になるケースを検出し、論理処理で必ず修復を試みる。
+
+    返り値:
+      (quad or None, meta)
+    """
+
+    meta: dict[str, Any] = {"ok": False, "method": "", "issue": "", "detail": {}}
+    if poly_xy is None:
+        meta["issue"] = "poly_is_none"
+        return None, meta
+
+    pts = np.asarray(poly_xy, dtype=np.float32).reshape(-1, 2)
+    if pts.shape[0] < 3:
+        meta["issue"] = "pts_lt_3"
+        return None, meta
+
+    # dup 判定閾値
+    dup_thr = _default_duplicate_threshold_px(pts_xy=pts, image_bgr=image_bgr)
+
+    # (A) 4点が来た場合は、まず order→重複/退化チェック
+    if pts.shape[0] == 4:
+        try:
+            quad0 = order_quad_tl_tr_br_bl(pts)
+            deg, deg_meta = _is_degenerate_quad_by_geometry(
+                quad0,
+                img_w=int(image_bgr.shape[1]) if image_bgr is not None else None,
+                img_h=int(image_bgr.shape[0]) if image_bgr is not None else None,
+                dup_thresh_px=float(dup_thr),
+            )
+            meta["detail"]["direct_quad_check"] = deg_meta
+            if not deg:
+                meta.update({"ok": True, "method": "direct_order"})
+                return quad0, meta
+            meta["issue"] = "duplicate_or_degenerate_quad"
+        except Exception as e:
+            meta["issue"] = f"direct_order_failed:{e}"
+
+        # ここに来る = 4点だが重複/退化
+        if image_bgr is not None:
+            quad_r, rec_meta = _recover_quad_from_edges(image_bgr)
+            meta["detail"]["edge_recover"] = rec_meta
+            if quad_r is not None:
+                meta.update({"ok": True, "method": f"repair:{rec_meta.get('method', '')}"})
+                return quad_r, meta
+
+        # 画像が無い/復旧失敗 -> hull→minAreaRect（最低限四角形にはする）
+        try:
+            hull = cv2.convexHull(pts.astype(np.float32)).reshape(-1, 2).astype(np.float32)
+            if hull.shape[0] >= 3:
+                rect = cv2.minAreaRect(hull.reshape(-1, 1, 2))
+                box = cv2.boxPoints(rect).astype(np.float32)
+                quad = order_quad_tl_tr_br_bl(box)
+                meta.update({"ok": True, "method": "fallback_minAreaRect_from_hull"})
+                return quad, meta
+        except Exception as e:
+            meta["detail"]["minAreaRect_error"] = str(e)
+
+        return None, meta
+
+    # (B) N>=3（多点/三角形など）: 画像があればエッジ復旧を優先
+    if image_bgr is not None:
+        quad_r, rec_meta = _recover_quad_from_edges(image_bgr)
+        meta["detail"]["edge_recover"] = rec_meta
+        if quad_r is not None:
+            meta.update({"ok": True, "method": f"repair:{rec_meta.get('method', '')}"})
+            return quad_r, meta
+
+    # (C) 最後の手段: hull→minAreaRect
+    try:
+        hull = cv2.convexHull(pts.astype(np.float32))
+        hull2 = hull.reshape(-1, 2).astype(np.float32)
+        if hull2.shape[0] < 3:
+            meta["issue"] = "hull_lt_3"
+            return None, meta
+        rect = cv2.minAreaRect(hull2.reshape(-1, 1, 2))
+        box = cv2.boxPoints(rect).astype(np.float32)
+        if box.shape != (4, 2):
+            meta["issue"] = "minAreaRect_box_not_4"
+            return None, meta
+        quad = order_quad_tl_tr_br_bl(box)
+        meta.update({"ok": True, "method": "minAreaRect"})
+        return quad, meta
+    except Exception as e:
+        meta["issue"] = f"minAreaRect_failed:{e}"
+        return None, meta
+
+
+def normalize_polygon_to_quad(poly_xy: np.ndarray) -> Optional[np.ndarray]:
+    """後方互換API: quadのみ返す。"""
+
+    quad, _meta = normalize_polygon_to_quad_with_meta(poly_xy, image_bgr=None)
+    return quad
+
+
+def detect_polygon_fallback_opencv(image_bgr: np.ndarray) -> Optional[np.ndarray]:
+    """DocAligner が全滅した場合のフォールバック（OpenCV 輪郭ベース）。
+
+    目的:
+      - AI検出が「角欠け」「三角形/線」になりやすいケースで、
+        古典手法でも拾える可能性があるため。
+
+    方針:
+      - Canny → 輪郭抽出 → 面積最大を選ぶ
+      - approx で4点が得られればそれを採用
+      - 4点が得られない場合は minAreaRect で四角形化
+    """
+
+    if image_bgr is None:
+        return None
+
+    try:
+        h, w = image_bgr.shape[:2]
+        if h < 64 or w < 64:
+            return None
+
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0.0)
+
+        # エッジ強調
+        edges = cv2.Canny(gray, 50, 150)
+        edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        # 面積最大（紙領域を想定）
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)
+        for cnt in contours[:10]:
+            area = float(cv2.contourArea(cnt))
+            if area < float(h * w) * 0.05:
+                continue
+
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+            pts = approx.reshape(-1, 2).astype(np.float32)
+
+            quad = None
+            if pts.shape[0] == 4 and cv2.isContourConvex(approx):
+                quad = order_quad_tl_tr_br_bl(pts)
+            else:
+                quad = normalize_polygon_to_quad(cnt.reshape(-1, 2).astype(np.float32))
+
+            if quad is None:
+                continue
+
+            return quad
+    except Exception:
+        return None
+
+    return None
+
+
+def _score_quad_by_edge_support(
+    *,
+    quad_xy: np.ndarray,
+    edge_u8: np.ndarray,
+) -> float:
+    """quad が画像中のエッジにどれだけ一致しているかを簡易スコア化する。"""
+
+    quad = order_quad_tl_tr_br_bl(np.asarray(quad_xy, dtype=np.float32).reshape(4, 2))
+    h, w = edge_u8.shape[:2]
+    edge = edge_u8
+    if edge.ndim == 3:
+        edge = cv2.cvtColor(edge, cv2.COLOR_BGR2GRAY)
+
+    # サンプリング点の周囲 r ピクセルにエッジがあればヒット扱い
+    r = 3
+    hits = 0
+    total = 0
+
+    for i in range(4):
+        p0 = quad[i]
+        p1 = quad[(i + 1) % 4]
+        seg_len = float(np.linalg.norm(p1 - p0))
+        n = int(max(30, min(180, seg_len / 8.0)))
+        for t in np.linspace(0.0, 1.0, n, dtype=np.float32):
+            x = int(round(float(p0[0] * (1.0 - t) + p1[0] * t)))
+            y = int(round(float(p0[1] * (1.0 - t) + p1[1] * t)))
+            if x < 0 or y < 0 or x >= w or y >= h:
+                continue
+            total += 1
+            x0 = max(0, x - r)
+            x1 = min(w, x + r + 1)
+            y0 = max(0, y - r)
+            y1 = min(h, y + r + 1)
+            if int(np.max(edge[y0:y1, x0:x1])) > 0:
+                hits += 1
+
+    if total <= 0:
+        return 0.0
+    return float(hits) / float(total)
+
+
+def _refine_quad_corners_by_shi_tomasi(
+    *,
+    image_gray: np.ndarray,
+    quad_xy: np.ndarray,
+) -> np.ndarray:
+    """推定quadの各コーナーを、周辺の強いコーナー（Shi-Tomasi）へスナップする。"""
+
+    quad = order_quad_tl_tr_br_bl(np.asarray(quad_xy, dtype=np.float32).reshape(4, 2))
+    h, w = image_gray.shape[:2]
+    out = quad.copy()
+
+    # 角周りの探索窓（画像スケールに応じて）
+    win = int(max(25, min(140, min(h, w) * 0.06)))
+
+    for i in range(4):
+        cx, cy = float(quad[i][0]), float(quad[i][1])
+        x0 = int(max(0, round(cx - win)))
+        y0 = int(max(0, round(cy - win)))
+        x1 = int(min(w, round(cx + win)))
+        y1 = int(min(h, round(cy + win)))
+        roi = image_gray[y0:y1, x0:x1]
+        if roi.size < 40:
+            continue
+
+        try:
+            pts = cv2.goodFeaturesToTrack(
+                roi,
+                maxCorners=50,
+                qualityLevel=0.01,
+                minDistance=max(5, int(win * 0.08)),
+                blockSize=7,
+            )
+        except Exception:
+            pts = None
+        if pts is None:
+            continue
+
+        pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+        if pts.size == 0:
+            continue
+
+        # ROI座標 -> 画像座標
+        pts[:, 0] += float(x0)
+        pts[:, 1] += float(y0)
+        d = np.linalg.norm(pts - np.array([[cx, cy]], dtype=np.float32), axis=1)
+        j = int(np.argmin(d))
+        if float(d[j]) <= float(win) * 0.75:
+            out[i] = pts[j]
+
+    return order_quad_tl_tr_br_bl(out)
+
+
+def detect_polygon_fallback_advanced(image_bgr: np.ndarray) -> Optional[np.ndarray]:
+    """DocAligner が 2点/3点等で失敗した場合の、より高精度なフォールバック。
+
+    方針（処理時間は無視・精度優先）:
+      - 複数の前処理を作る
+      - 輪郭→凸包→approxPolyDP(ε掃引) で 4点を直接探索
+      - 4点化できない場合は minAreaRect
+      - エッジ支持率（quad辺上にエッジがある割合）でスコアリング
+      - 最良quadを Shi-Tomasi でコーナー微調整
+    """
+
+    if image_bgr is None:
+        return None
+
+    h, w = image_bgr.shape[:2]
+    if h < 80 or w < 80:
+        return None
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    gray_blur = cv2.GaussianBlur(gray, (5, 5), 0.0)
+
+    variants: list[tuple[str, np.ndarray]] = [("gray", gray_blur)]
+    # CLAHE
+    try:
+        clahe_cfg = (PIPELINE_DEFAULTS.get("marker") or {}).get("clahe") or {"clipLimit": 3.0, "tileGridSize": [8, 8]}
+        clahe = cv2.createCLAHE(clipLimit=float(clahe_cfg.get("clipLimit", 3.0)), tileGridSize=tuple(int(x) for x in clahe_cfg.get("tileGridSize", [8, 8])))
+        variants.append(("clahe", clahe.apply(gray)))
+    except Exception:
+        pass
+
+    # adaptive threshold (inv)
+    try:
+        at_cfg = (PIPELINE_DEFAULTS.get("qr") or {}).get("adaptive_threshold") or {"block_size": 61, "C": 3}
+        blk = int(at_cfg.get("block_size", 61))
+        if blk % 2 == 0:
+            blk += 1
+        bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, blk, int(at_cfg.get("C", 3)))
+        variants.append(("adaptive_inv", bw))
+    except Exception:
+        pass
+
+    best_quad: Optional[np.ndarray] = None
+    best_score = float("-inf")
+
+    def _try_contours(src_u8: np.ndarray) -> None:
+        nonlocal best_quad, best_score
+
+        # edges
+        if src_u8.ndim == 2:
+            e = cv2.Canny(src_u8, 40, 140)
+        else:
+            e = cv2.Canny(cv2.cvtColor(src_u8, cv2.COLOR_BGR2GRAY), 40, 140)
+        e = cv2.dilate(e, np.ones((3, 3), np.uint8), iterations=1)
+        e = cv2.morphologyEx(e, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+
+        contours, _ = cv2.findContours(e, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return
+
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:30]
+        for cnt in contours:
+            area = float(cv2.contourArea(cnt))
+            if area < float(h * w) * 0.03:
+                continue
+
+            hull = cv2.convexHull(cnt)
+            peri = float(cv2.arcLength(hull, True))
+            if peri <= 1:
+                continue
+
+            quad = None
+            # ε掃引で4点近似を探す
+            for eps_ratio in [0.005, 0.008, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05]:
+                approx = cv2.approxPolyDP(hull, eps_ratio * peri, True)
+                pts = approx.reshape(-1, 2).astype(np.float32)
+                if pts.shape[0] == 4 and cv2.isContourConvex(approx):
+                    quad = order_quad_tl_tr_br_bl(pts)
+                    break
+
+            if quad is None:
+                # 4点近似が取れない場合は四角形化
+                quad = normalize_polygon_to_quad(hull.reshape(-1, 2).astype(np.float32))
+
+            if quad is None:
+                continue
+
+            quad = _clamp_poly_to_image(quad, img_w=int(w), img_h=int(h))
+            ok, q = _is_valid_quad(quad, img_w=int(w), img_h=int(h))
+            if not ok:
+                continue
+
+            support = _score_quad_by_edge_support(quad_xy=quad, edge_u8=e)
+            # 面積比 + エッジ支持率を重視
+            score = float(q.get("area_ratio", 0.0)) * 10.0 + float(support) * 6.0 - float(q.get("edge_ratio", 0.0)) * 0.01
+
+            if score > best_score:
+                best_score = score
+                best_quad = quad
+
+    for _name, src in variants:
+        _try_contours(src)
+
+    if best_quad is None:
+        return None
+
+    try:
+        refined = _refine_quad_corners_by_shi_tomasi(image_gray=gray, quad_xy=best_quad)
+        return refined
+    except Exception:
+        return best_quad
 
 
 def _quad_quality(poly_xy: np.ndarray, img_w: int, img_h: int) -> dict[str, Any]:
@@ -2662,10 +3474,15 @@ def _is_valid_quad(poly_xy: np.ndarray, img_w: int, img_h: int) -> tuple[bool, d
     # - ここで弾くことで、後段の rectify/フォーム判定を無駄に回さない
     ok = True
     reasons: list[str] = []
-    if q["area_ratio"] < 0.02:
+    # v17.14:
+    # target 画像では「紙がフレーム端ギリギリ」「一部欠け」などで、
+    # DocAligner の候補がやや小さくなることがある。
+    # ここを厳しくしすぎると救済候補まで全滅しやすいので、
+    # 最低限の“紙らしさ”を保ちつつ、閾値を少し緩める。
+    if q["area_ratio"] < 0.01:
         ok = False
         reasons.append("area_ratio_too_small")
-    if q["edge_min"] < (min_side * 0.04):
+    if q["edge_min"] < (min_side * 0.025):
         ok = False
         reasons.append("edge_min_too_small")
     if q["edge_ratio"] > 18.0:
@@ -2707,10 +3524,19 @@ def _iter_docaligner_settings(
     types = [type0] + [str(x) for x in (cfg_multi.get("extra_types") or [])]
 
     # pad candidates: base + auto + configured list
+    # 改善1（DocAligner）:
+    # 端ギリギリ撮影の救済には pad が効くが、
+    # v17.13〜の target-only 運用では「max_infer_runs が小さい」ため、
+    # *scale を先に総当たりして pad が試せない* という順序が精度を下げやすい。
+    # そのため、ここでは「pad（候補）→ scale」の順でまず試し、
+    # 最低限の回数で大きめ pad まで到達できるように優先度順を設計する。
     pad_base = int(cfg_doc.get("pad_px") or 200)
     pad_auto = _compute_pad_px_auto(image_bgr)
-    pad_candidates = [pad_base, pad_auto] + [int(x) for x in (cfg_multi.get("pad_px_candidates") or [])]
+    pad0 = int(max(pad_base, pad_auto))
+
+    pad_candidates = [pad0] + [int(x) for x in (cfg_multi.get("pad_px_candidates") or [])] + [pad_base, pad_auto]
     pad_candidates = [int(x) for x in pad_candidates if int(x) >= 0]
+
     # 重複除去（順序維持）
     seen_pad: set[int] = set()
     pad_list: list[int] = []
@@ -2718,15 +3544,16 @@ def _iter_docaligner_settings(
         if p in seen_pad:
             continue
         seen_pad.add(p)
-        pad_list.append(p)
+        pad_list.append(int(p))
 
-    scales = [float(x) for x in (cfg_multi.get("input_scales") or [1.0])]
-    if 1.0 not in scales:
-        scales = [1.0] + scales
+    scales_raw = [float(x) for x in (cfg_multi.get("input_scales") or [])]
+    # 1.0 は常に最優先で試す（角欠け対策で pad を増やす場合、低解像度化だけ先に回すと成功率が下がりやすい）
+    scales = [1.0] + [float(s) for s in scales_raw if abs(float(s) - 1.0) > 1e-9]
 
     # 優先度:
-    # - 重さ対策のため「軽い設定（小scale/小pad）」を先に試す。
-    # - 以前は pad を大きい順にしていたが、これだと最初の1発が極端に重くなりやすかった。
+    # - まず *scale=1.0* で pad 候補を順番に試す（pad が効くケースを取りこぼさない）
+    # - それでもダメなら、pad0 のまま scale バリエーションを試す
+    # - モデル/タイプは「ユーザー指定（args）」を最優先し、次に extra を試す
     def _uniq_str(xs: list[str]) -> list[str]:
         out: list[str] = []
         seen: set[str] = set()
@@ -2740,16 +3567,51 @@ def _iter_docaligner_settings(
 
     models_u = _uniq_str(models)
     types_u = _uniq_str(types)
-    pads_u = sorted(pad_list)  # small pad first
-    scales_u = sorted(set([float(s) for s in scales]))  # small scale first
+
+    # 優先度:
+    # - まず *scale=1.0* で pad 候補を順番に試す（pad が効くケースを最短で拾う）
+    # - それでもダメなら、pad0 のまま scale バリエーション（縮小/拡大）
+    # - モデル/タイプは「ユーザー指定（args）」を最優先し、次に extra を試す
+
+    # model/type の順序:
+    # - args で指定された (model0/type0) を **最優先**
+    # - それ以外は安定化のため、軽量→高精度の順（ただし model0 は先頭固定）
+    model_pri = {"lcnet050": 0, "lcnet100": 1, "fastvit_t8": 2, "fastvit_sa24": 3}
+    rest_models = [m for m in _uniq_str(models_u) if str(m) != str(model0)]
+    rest_models = sorted(rest_models, key=lambda m: model_pri.get(str(m), 99))
+    models_u = [str(model0)] + rest_models
+
+    # type は args 指定を最優先し、残りを後ろへ
+    rest_types = [t for t in _uniq_str(types_u) if str(t) != str(type0)]
+    # 安定化: heatmap→point の順
+    rest_types = [t for t in ["heatmap", "point"] if t in rest_types]
+    types_u = [str(type0)] + rest_types
+
+    pads_u = pad_list  # 既に優先度順に構成済み
+    scales_u = scales  # [1.0, ...]
+
+    def _uniq_settings(xs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[tuple[str, str, int, float]] = set()
+        out: list[dict[str, Any]] = []
+        for d in xs:
+            key = (str(d["model"]), str(d["type"]), int(d["pad_px"]), float(d["input_scale"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(d)
+        return out
 
     settings: list[dict[str, Any]] = []
     for m in models_u:
         for t in types_u:
             for p in pads_u:
-                for s in scales_u:
-                    settings.append({"model": m, "type": t, "pad_px": int(p), "input_scale": float(s)})
-    return settings
+                settings.append({"model": m, "type": t, "pad_px": int(p), "input_scale": 1.0})
+            for s in scales_u:
+                if abs(float(s) - 1.0) < 1e-9:
+                    continue
+                settings.append({"model": m, "type": t, "pad_px": int(pad0), "input_scale": float(s)})
+
+    return _uniq_settings(settings)
 
 
 def _margin_px_candidates_for_eval(*, args: argparse.Namespace, poly_xy: np.ndarray) -> list[float]:
@@ -2858,11 +3720,64 @@ def _quick_eval_form_scores_for_candidate(
     return decision, float(decision.score)
 
 
+def make_formA_geom_cfg_for_case(*, source_dataset: str, source_form: str) -> Optional[MarkerGeometryConfig]:
+    """dataset に応じてフォームAの幾何制約（誤検出抑制）を調整した cfg を返す。
+
+    NOTE:
+      - test: 正例取りこぼし回避を優先し、周辺白地制約を無効化
+      - target: 実撮影（影/机模様）での取りこぼし回避を優先し、閾値を緩める
+      - synthetic: デフォルト（PIPELINE_DEFAULTS の設定）
+    """
+
+    base_cfg_for_A: Optional[MarkerGeometryConfig] = None
+    try:
+        base_cfg_dict = (PIPELINE_DEFAULTS.get("formA") or {}).get("geometry") or {}
+        allowed = set(getattr(MarkerGeometryConfig, "__dataclass_fields__", {}).keys())
+        base_cfg_for_A = MarkerGeometryConfig(**{k: v for k, v in base_cfg_dict.items() if k in allowed})
+    except Exception:
+        base_cfg_for_A = None
+
+    ds = str(source_dataset or "")
+    sf = str(source_form or "")
+
+    # test: 周辺白地チェックが改悪/撮影条件で誤rejectしやすいので無効化
+    if ds == "test" and sf in ("A", "B"):
+        try:
+            base_cfg = base_cfg_for_A or MarkerGeometryConfig()
+            return MarkerGeometryConfig(
+                **{
+                    **asdict(base_cfg),
+                    "surround_min_mean_gray": 0.0,
+                    "surround_max_ink_ratio": 1.0,
+                }
+            )
+        except Exception:
+            return None
+
+    # target: 影・机模様・枠線の写り込みで取りこぼしやすいので recall 優先で緩める
+    if ds == "target":
+        try:
+            base_cfg = base_cfg_for_A or MarkerGeometryConfig()
+            return MarkerGeometryConfig(
+                **{
+                    **asdict(base_cfg),
+                    "surround_min_mean_gray": 150.0,
+                    "surround_max_ink_ratio": 0.08,
+                    "min_marker_area_page_ratio": 3.5e-5,
+                }
+            )
+        except Exception:
+            return None
+
+    return None
+
+
 def detect_polygon_docaligner_multi(
     *,
     logger: logging.Logger,
     args: argparse.Namespace,
     degraded_bgr: np.ndarray,
+    formA_geom_cfg: Optional[MarkerGeometryConfig] = None,
 ) -> tuple[Optional[np.ndarray], dict[str, Any]]:
     """DocAligner を“1発勝負”にせず複数条件で実行し、最良polygonを返す。
 
@@ -2943,12 +3858,22 @@ def detect_polygon_docaligner_multi(
 
         poly = _clamp_poly_to_image(poly, img_w=int(w), img_h=int(h))
 
+        # v17.18: 「重複点/三角形化」修復の診断を meta に残す
+        # _run_docaligner_once で既に正規化済みだが、
+        # ここでは returned quad が "直接order" で成立していたか/修復経路だったかを推定するため、
+        # もう一度 meta付きチェックを回す（計算コストは軽微・精度優先）。
+        try:
+            _q_tmp, _norm_meta = normalize_polygon_to_quad_with_meta(poly, image_bgr=degraded_bgr)
+        except Exception:
+            _norm_meta = {"ok": False, "method": "", "issue": "norm_meta_failed"}
+
         ok, q = _is_valid_quad(poly, img_w=int(w), img_h=int(h))
         all_polys.append(
             {
                 "poly": order_quad_tl_tr_br_bl(poly).astype(np.float32),
                 "quality": q,
                 "setting": {"model": model_name, "type": model_type, "pad_px": int(pad_px), "input_scale": float(input_scale)},
+                "norm": _norm_meta,
                 "strict_ok": bool(ok),
             }
         )
@@ -2965,39 +3890,87 @@ def detect_polygon_docaligner_multi(
                 "poly": order_quad_tl_tr_br_bl(poly).astype(np.float32),
                 "quality": q,
                 "setting": {"model": model_name, "type": model_type, "pad_px": int(pad_px), "input_scale": float(input_scale)},
+                "norm": _norm_meta,
             }
         )
         if len(candidates) >= max_poly_candidates:
             break
 
     if not candidates:
-        # strict で全滅した場合は、面積が大きいものを救済候補として評価に回す。
-        # 「線/三角形っぽい」polygon でも、複数条件の中で相対的にマシなものが残る可能性がある。
+        # strict で全滅した場合は、救済候補を *増やす*。
+        # v17.16 までは「面積最大」を優先していたが、target では
+        # 面積が大きくても “線/重複点” に近い退化quadが混ざりうる。
+        # ここでは以下の順で候補を増やし、後段の eval に回す。
+        #   1) all_polys のうち、area_ratio が大きいもの（ただし edge_min が0に近いものは避ける）
+        #   2) OpenCV 輪郭ベース
+        #   3) 高精度フォールバック（advanced）
+
         if all_polys:
-            sorted_all = sorted(all_polys, key=lambda d: float((d.get("quality") or {}).get("area_ratio") or 0.0), reverse=True)
-            for d in sorted_all[: max(1, int(max_poly_candidates))]:
+            def _relaxed_score(d: dict[str, Any]) -> float:
+                q = (d.get("quality") or {})
+                area = float(q.get("area_ratio") or 0.0)
+                edge_min = float(q.get("edge_min") or 0.0)
+                # edge_min が 0 に近いもの（重複点/退化）は強く減点
+                return area - (1.0 if edge_min <= 1.0 else 0.0)
+
+            sorted_all = sorted(all_polys, key=_relaxed_score, reverse=True)
+            for d in sorted_all[: max(2, int(max_poly_candidates))]:
                 candidates.append({"poly": d["poly"], "quality": d["quality"], "setting": d["setting"], "relaxed": True})
-            if candidates:
-                # 継続して eval に進める
-                pass
+
+        # OpenCV 輪郭ベース
+        fallback = detect_polygon_fallback_opencv(degraded_bgr)
+        if fallback is not None:
+            ok_fb, q_fb = _is_valid_quad(fallback, img_w=int(w), img_h=int(h))
+            if ok_fb:
+                candidates.append(
+                    {
+                        "poly": order_quad_tl_tr_br_bl(fallback).astype(np.float32),
+                        "quality": q_fb,
+                        "setting": {"model": "opencv_fallback", "type": "contour", "pad_px": 0, "input_scale": 1.0},
+                        "relaxed": True,
+                    }
+                )
+
+        # 高精度フォールバック（advanced）を候補に追加
+        adv = detect_polygon_fallback_advanced(degraded_bgr)
+        if adv is not None:
+            ok_adv, q_adv = _is_valid_quad(adv, img_w=int(w), img_h=int(h))
+            if ok_adv:
+                candidates.append(
+                    {
+                        "poly": order_quad_tl_tr_br_bl(np.asarray(adv, dtype=np.float32)).astype(np.float32),
+                        "quality": q_adv,
+                        "setting": {"model": "opencv_fallback", "type": "advanced", "pad_px": 0, "input_scale": 1.0},
+                        "relaxed": True,
+                    }
+                )
+
         if not candidates:
             return None, {"ok": False, "reason": "no_valid_polygon", "infer_runs": infer_runs, "all_polys": all_polys}
 
     # 候補評価: polygon margin 複数候補も試す
+    # NOTE(v17.14):
+    # ユーザー要望は「三角形/線のような退化検出のまま進めない」ことであり、
+    # ここでフォーム判定（マーカー/QR）が通ることを必須条件にしてしまうと、
+    # 「紙は検出できているがマーカー/QRが切れている」ケースまで DocAligner 段階で落ちてしまう。
+    # そのため、
+    #   - DocAligner 段階では *幾何的に妥当な quad* を採用する
+    #   - フォーム判定のスコアは「候補選択の補助」として利用する
+    # という設計にする。
     best: Optional[dict[str, Any]] = None
     evals: list[dict[str, Any]] = []
-
-    # test データ用の A 誤検出抑制緩和（process_one_case と同じ方針に合わせる）
-    formA_geom_cfg: Optional[MarkerGeometryConfig] = None
-    # NOTE: ここは dataset が分からないので、過剰な緩和はしない（process_one_case 側で test 用 cfg を渡す）
 
     for c in candidates:
         poly = np.asarray(c["poly"], dtype=np.float32)
         margin_list = _margin_px_candidates_for_eval(args=args, poly_xy=poly)
         for margin_px in margin_list:
             try:
-                poly_exp = expand_polygon(poly, float(margin_px), img_w=int(w), img_h=int(h))
-                rect, _H = polygon_to_rectified(degraded_bgr, poly_exp, out_max_side=int(args.docaligner_max_side))
+                rect, _H, poly_exp, rect_meta = rectify_with_margin_and_optional_padding(
+                    degraded_bgr,
+                    polygon_xy=poly,
+                    margin_px=float(margin_px),
+                    out_max_side=int(args.docaligner_max_side),
+                )
                 rect, _ = enforce_landscape(rect)
                 decision, score = _quick_eval_form_scores_for_candidate(
                     rect,
@@ -3013,10 +3986,38 @@ def detect_polygon_docaligner_multi(
                     "margin_px": float(margin_px),
                     "decision": asdict(decision),
                     "score": float(score),
+                    "rectify": rect_meta,
                 }
                 evals.append(rec)
-                if best is None or float(score) > float(best["score"]):
+                # フォーム判定スコアで一次選好。
+                # target の no_detection ケースではスコアが全て 0 になりやすいので、
+                # タイブレークは「面積」だけでなく「エッジ支持率」も使って、
+                # 机の縁/影などに引っ張られた誤quadを避ける。
+                if best is None:
                     best = {"poly": poly, "margin_px": float(margin_px), **rec}
+                else:
+                    cur_score = float(score)
+                    best_score = float(best.get("score") or 0.0)
+                    if cur_score > best_score + 1e-6:
+                        best = {"poly": poly, "margin_px": float(margin_px), **rec}
+                    elif abs(cur_score - best_score) <= 1e-6:
+                        try:
+                            cur_area = float(((c.get("quality") or {}).get("area_ratio") or 0.0))
+                            best_area = float(((best.get("quality") or {}).get("area_ratio") or 0.0))
+                            # edge support
+                            edge = cv2.Canny(cv2.cvtColor(degraded_bgr, cv2.COLOR_BGR2GRAY), 40, 140)
+                            edge = cv2.dilate(edge, np.ones((3, 3), np.uint8), iterations=1)
+                            cur_support = _score_quad_by_edge_support(quad_xy=poly_exp, edge_u8=edge)
+                            best_support = float(best.get("edge_support") or 0.0)
+
+                            # まず支持率を優先
+                            if cur_support > best_support + 0.02:
+                                best = {"poly": poly, "margin_px": float(margin_px), **rec, "edge_support": float(cur_support)}
+                            elif abs(cur_support - best_support) <= 0.02:
+                                if cur_area > best_area:
+                                    best = {"poly": poly, "margin_px": float(margin_px), **rec, "edge_support": float(cur_support)}
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.debug("[DocAligner] candidate eval failed: %s", e)
                 continue
@@ -5593,8 +6594,15 @@ def process_one_case(
     item["H_src_to_degraded"] = H_src_to_deg.astype(float).tolist()
 
     # 2) DocAligner（計測対象：推論のみ。画像保存は計測外）
+    # DocAligner multi の候補評価でも、dataset ごとの A-geometry を反映できるよう渡す。
+    formA_geom_cfg_for_case = make_formA_geom_cfg_for_case(source_dataset=str(di.source_dataset), source_form=str(di.source_form))
     t0 = time.perf_counter()
-    poly, doc_meta = detect_polygon_docaligner_multi(logger=logger, args=args, degraded_bgr=degraded_bgr)
+    poly, doc_meta = detect_polygon_docaligner_multi(
+        logger=logger,
+        args=args,
+        degraded_bgr=degraded_bgr,
+        formA_geom_cfg=formA_geom_cfg_for_case,
+    )
     times.docaligner_s = time.perf_counter() - t0
     if poly is None:
         item["stage"] = "docaligner_failed"
@@ -5637,23 +6645,27 @@ def process_one_case(
             "computed_px": float(margin_px),
         }
 
-    poly_exp = expand_polygon(
+    # 3) Rectify は padding を（必要なら）入れて、margin による clip を回避する。
+    # overlay は degraded 内で clamp した polygon を描画する。
+    overlay_poly = expand_polygon(
         poly,
         margin_px=float(margin_px),
         img_w=int(degraded_bgr.shape[1]),
         img_h=int(degraded_bgr.shape[0]),
     )
-    overlay = draw_polygon_overlay(degraded_bgr, poly_exp)
+    overlay = draw_polygon_overlay(degraded_bgr, overlay_poly)
     out_doc = out_dirs["doc"] / f"{case_id}_doc.jpg"
     _schedule_image("output_doc_overlay_image_path", out_doc, overlay)
 
     # 3) Rectify（計測対象：rectifyのみ。画像保存は計測外）
     t0 = time.perf_counter()
-    rectified, H_deg_to_rect = polygon_to_rectified(
+    rectified, H_deg_to_rect, overlay_poly2, rectify_meta = rectify_with_margin_and_optional_padding(
         degraded_bgr,
-        poly_exp,
+        polygon_xy=poly,
+        margin_px=float(margin_px),
         out_max_side=int(args.docaligner_max_side),
     )
+    item["rectify"] = rectify_meta
     # enforce_landscape の回転（90度CW）を考慮した homography も保持しておく（出力9で使用）
     rect0_h, rect0_w = rectified.shape[:2]
     rectified, rect_rotated_90cw = enforce_landscape(rectified)
@@ -5673,50 +6685,281 @@ def process_one_case(
     item["H_degraded_to_rectified_landscape"] = H_deg_to_rect_land.astype(float).tolist()
     item["rectified_landscape_rotated_90cw"] = bool(rect_rotated_90cw)
 
-    # 4) decide form by rotations（計測対象：判定ロジックのみ。画像保存は計測外）
-    t0 = time.perf_counter()
+    # ------------------------------------------------------------
+    # 4) decide form by rotations
+    #   - 通常: rectified（DocAligner polygon）で判定
+    #   - フォールバック: stage=form_unknown(no_detection) の場合のみ、
+    #     高精度 polygon フォールバック（輪郭ベース）で polygon を再推定して再試行
+    #
+    # 目的:
+    #   target（現場撮影）で DocAligner polygon が「机の縁」等に引っ張られて
+    #   紙が欠けた rectify になると、マーカー/QR が画面外になって no_detection になりやすい。
+    #   その場合に “時間は無視して” 追加探索を行う。
+    # ------------------------------------------------------------
 
-    # test データは「正例（A/B）」の取りこぼしを避けたいので、
-    # フォームA誤検出抑制のうち「周辺が白地」制約だけを緩めた config を使う。
-    # （手書きがマーカー近傍に入ると、この制約で弾かれてしまうため）
-    formA_geom_cfg: Optional[MarkerGeometryConfig] = None
-    if str(di.source_dataset) == "test" and str(src_form) in ("A", "B"):
+    def _make_formA_geom_cfg_for_case() -> Optional[MarkerGeometryConfig]:
+        """dataset に応じて A-geometry の緩和版cfgを作る（既存ロジックを関数化）。"""
+
+        formA_geom_cfg: Optional[MarkerGeometryConfig] = None
+
+        base_cfg_for_A: Optional[MarkerGeometryConfig] = None
         try:
             base_cfg_dict = (PIPELINE_DEFAULTS.get("formA") or {}).get("geometry") or {}
             allowed = set(getattr(MarkerGeometryConfig, "__dataclass_fields__", {}).keys())
-            base_cfg = MarkerGeometryConfig(**{k: v for k, v in base_cfg_dict.items() if k in allowed})
-
-            # 周辺白地制約を緩める（test 専用）
-            formA_geom_cfg = MarkerGeometryConfig(
-                **{
-                    **asdict(base_cfg),
-                    "surround_min_mean_gray": 0.0,
-                    "surround_max_ink_ratio": 1.0,
-                }
-            )
+            base_cfg_for_A = MarkerGeometryConfig(**{k: v for k, v in base_cfg_dict.items() if k in allowed})
         except Exception:
-            formA_geom_cfg = None
+            base_cfg_for_A = None
 
-    decision = decide_form_by_rotations(
-        rectified,
-        max_workers=int(args.rotation_max_workers),
-        marker_preproc=str(args.marker_preproc),
-        unknown_score_threshold=float(args.unknown_score_threshold),
-        unknown_margin=float(args.unknown_margin),
-        formA_geom_cfg=formA_geom_cfg,
-    )
+        # test dataset: 「正例の取りこぼし回避」を優先し、周辺白地制約を無効化
+        if str(di.source_dataset) == "test" and str(src_form) in ("A", "B"):
+            try:
+                base_cfg = base_cfg_for_A or MarkerGeometryConfig()
+                formA_geom_cfg = MarkerGeometryConfig(
+                    **{
+                        **asdict(base_cfg),
+                        "surround_min_mean_gray": 0.0,
+                        "surround_max_ink_ratio": 1.0,
+                    }
+                )
+            except Exception:
+                formA_geom_cfg = None
+
+        # target dataset: 実撮影では影・周辺減光で corner が暗くなりやすいので、
+        # A-geometry が厳しすぎて "検出はできているのに no_detection 扱い" になるケースがあるため、
+        # 取りこぼしを減らす方向で閾値を追加で緩める（recall優先）。
+        #
+        # 具体例（run_20260126_122133 の no_detection 代表例）:
+        # - marker_area_page_ratio_mean が 5e-5 を僅かに下回り `marker_too_small_for_page` になる
+        # - `marker_surrounding_not_blank` が ink_ratio の僅かな超過(0.05→0.07程度)で落ちる
+        #
+        # target は基本的に「実フォーム（A/B）の救済」が主目的のため、
+        # C->A 誤判定抑制の副作用で A を落とすより、まず検出できるようにする。
+        if formA_geom_cfg is None and str(di.source_dataset) == "target":
+            try:
+                base_cfg = base_cfg_for_A or MarkerGeometryConfig()
+                formA_geom_cfg = MarkerGeometryConfig(
+                    **{
+                        **asdict(base_cfg),
+                        # 影で corner 周りが暗くなる救済
+                        "surround_min_mean_gray": 150.0,
+                        # 机模様/枠線の写り込みで ring の ink_ratio が少し上がる救済
+                        "surround_max_ink_ratio": 0.08,
+                        # rectify 解像度/撮影距離によりマーカーが僅かに小さくなる救済
+                        "min_marker_area_page_ratio": 3.5e-5,
+                    }
+                )
+            except Exception:
+                formA_geom_cfg = None
+
+        return formA_geom_cfg
+
+    def _decide_on_rectified(rectified_landscape_bgr: np.ndarray, *, relax_marker_search: bool = False) -> FormDecision:
+        """rectified 画像上でフォーム判定を行う。
+
+        relax_marker_search:
+          advanced fallback（polygon再推定）時にのみ使う “最後の救済”。
+          DocAligner/輪郭ベースpolygonが少しズレた結果、マーカーが corner 付近に来ない場合がある。
+          通常は corner 付近探索に絞って誤検出を減らすが、
+          no_detection で詰まった場合のみ探索範囲/サイズ想定を緩めて再試行する。
+        """
+
+        if not relax_marker_search:
+            return decide_form_by_rotations(
+                rectified_landscape_bgr,
+                max_workers=int(args.rotation_max_workers),
+                marker_preproc=str(args.marker_preproc),
+                unknown_score_threshold=float(args.unknown_score_threshold),
+                unknown_margin=float(args.unknown_margin),
+                formA_geom_cfg=formA_geom_cfg_for_case,
+            )
+
+        # 一時的に PIPELINE_DEFAULTS['marker'] を緩める（グローバルなので必ず復元）
+        marker_cfg = PIPELINE_DEFAULTS.get("marker")
+        marker_backup = dict(marker_cfg) if isinstance(marker_cfg, dict) else {}
+        if not isinstance(marker_cfg, dict):
+            PIPELINE_DEFAULTS["marker"] = {}
+            marker_cfg = PIPELINE_DEFAULTS["marker"]
+
+        try:
+            # 探索範囲を広げる（corner誤差/rectifyズレ救済）
+            marker_cfg["corner_margin_ratio"] = float(max(0.12, float(marker_backup.get("corner_margin_ratio", 0.12)) * 1.8))
+            marker_cfg["corner_margin_ratio"] = float(min(0.30, marker_cfg["corner_margin_ratio"]))
+
+            # サイズ想定も緩める（解像度差/拡大縮小の救済）
+            marker_cfg["marker_min_size_ratio"] = float(min(0.008, float(marker_backup.get("marker_min_size_ratio", 0.008)) * 0.75))
+            marker_cfg["marker_max_size_ratio"] = float(max(0.09, float(marker_backup.get("marker_max_size_ratio", 0.07)) * 1.3))
+
+            return decide_form_by_rotations(
+                rectified_landscape_bgr,
+                max_workers=int(args.rotation_max_workers),
+                marker_preproc=str(args.marker_preproc),
+                unknown_score_threshold=float(args.unknown_score_threshold),
+                unknown_margin=float(args.unknown_margin),
+                formA_geom_cfg=formA_geom_cfg_for_case,
+            )
+        finally:
+            PIPELINE_DEFAULTS["marker"] = marker_backup
+
+    # 4) decide（初回）
+    t0 = time.perf_counter()
+    decision = _decide_on_rectified(rectified)
     times.decide_s = time.perf_counter() - t0
     item["form_decision"] = asdict(decision)
-    # すぐ参照する項目（ログ/集計向け）
     item["predicted_form"] = str(decision.form or "")
     item["predicted_angle_deg"] = "" if decision.angle_deg is None else float(decision.angle_deg)
 
-    if not decision.ok or decision.form not in ("A", "B") or decision.angle_deg is None:
+    # form_unknown の場合のみ、polygon再推定フォールバックを試す
+    if (not decision.ok) or (decision.form not in ("A", "B")) or (decision.angle_deg is None):
+        reason, _diag = extract_form_unknown_reason(asdict(decision))
+        adv_cfg = ((PIPELINE_DEFAULTS.get("docaligner") or {}).get("advanced_fallback") or {})
+        adv_enable = bool(adv_cfg.get("enable", True))
+        adv_trigger = bool(adv_cfg.get("trigger_on_form_unknown_no_detection", True))
+
+        # C は「棄却が正しい」ため無駄な再探索をしない。
+        allow_retry = bool(str(src_form) in ("A", "B") or str(di.source_dataset) == "target")
+
+        if allow_retry and adv_enable and adv_trigger and str(reason) == "no_detection":
+            t_adv0 = time.perf_counter()
+            poly_adv = detect_polygon_fallback_advanced(degraded_bgr)
+            times.docaligner_s += time.perf_counter() - t_adv0
+            if poly_adv is not None:
+                item["docaligner_fallback_advanced"] = {
+                    "ok": True,
+                    "reason": "triggered_by_form_unknown_no_detection",
+                    "poly": order_quad_tl_tr_br_bl(np.asarray(poly_adv, dtype=np.float32)).astype(float).tolist(),
+                    # 診断用: margin 試行のログ（成功/失敗も含む）
+                    "attempts": [],
+                }
+
+                # margin を複数試して、判定スコアが最大のものを採用
+                best_fb: Optional[dict[str, Any]] = None
+                margin_list = _margin_px_candidates_for_eval(args=args, poly_xy=poly_adv)
+                # target は端欠けが多いので、少し大きい margin も追加
+                if str(di.source_dataset) == "target":
+                    try:
+                        extra = polygon_margin_px_from_ratio(poly_adv, ratio=0.16, min_px=float(args.polygon_margin_min_px), max_px=float(args.polygon_margin_max_px))
+                        margin_list = margin_list + [float(extra)]
+                    except Exception:
+                        pass
+                # 重複除去（丸め）
+                seen_m: set[int] = set()
+                margin_list2: list[float] = []
+                for m in margin_list:
+                    k = int(round(float(m)))
+                    if k in seen_m:
+                        continue
+                    seen_m.add(k)
+                    margin_list2.append(float(m))
+
+                for m in margin_list2:
+                    try:
+                        t_rect0 = time.perf_counter()
+                        rect_fb, H_deg_to_rect_fb, poly_exp_fb, rect_fb_meta = rectify_with_margin_and_optional_padding(
+                            degraded_bgr,
+                            polygon_xy=poly_adv,
+                            margin_px=float(m),
+                            out_max_side=int(args.docaligner_max_side),
+                        )
+                        rect0_h2, rect0_w2 = rect_fb.shape[:2]
+                        rect_fb, rect_rot90 = enforce_landscape(rect_fb)
+                        M_rect_to_land2 = _landscape_rotation_matrix_if_applied(w=int(rect0_w2), h=int(rect0_h2), rotated_90cw=bool(rect_rot90))
+                        H_deg_to_rect_land_fb = np.asarray(M_rect_to_land2, dtype=np.float64) @ np.asarray(H_deg_to_rect_fb, dtype=np.float64)
+                        times.rectify_s += time.perf_counter() - t_rect0
+
+                        t_dec0 = time.perf_counter()
+                        # advanced fallback 時は marker 探索範囲を緩めて再挑戦（no_detection 救済）
+                        dec_fb = _decide_on_rectified(rect_fb, relax_marker_search=True)
+                        times.decide_s += time.perf_counter() - t_dec0
+
+                        # attempt 記録（失敗も含めて残す）
+                        try:
+                            u_reason, u_diag = extract_form_unknown_reason(asdict(dec_fb))
+                        except Exception:
+                            u_reason, u_diag = "unknown", {}
+                        try:
+                            item["docaligner_fallback_advanced"]["attempts"].append(
+                                {
+                                    "margin_px": float(m),
+                                    "decision": asdict(dec_fb),
+                                    "unknown_reason": str(u_reason),
+                                    "unknown_diag": u_diag,
+                                }
+                            )
+                        except Exception:
+                            pass
+
+                        if not dec_fb.ok or dec_fb.form not in ("A", "B") or dec_fb.angle_deg is None:
+                            continue
+
+                        rec = {
+                            "poly": order_quad_tl_tr_br_bl(np.asarray(poly_adv, dtype=np.float32)).astype(np.float32),
+                            "poly_exp": order_quad_tl_tr_br_bl(np.asarray(poly_exp_fb, dtype=np.float32)).astype(np.float32),
+                            "margin_px": float(m),
+                            "rectified": rect_fb,
+                            "H_deg_to_rect": np.asarray(H_deg_to_rect_fb, dtype=np.float64),
+                            "H_deg_to_rect_land": np.asarray(H_deg_to_rect_land_fb, dtype=np.float64),
+                            "rect_rotated_90cw": bool(rect_rot90),
+                            "rectify": rect_fb_meta,
+                            "decision": dec_fb,
+                            "score": float(dec_fb.score),
+                        }
+                        if best_fb is None or float(rec["score"]) > float(best_fb.get("score") or 0.0):
+                            best_fb = rec
+                    except Exception:
+                        continue
+
+                if best_fb is not None:
+                    # 置き換え: polygon/rectified/decision を更新して以降の処理を続行
+                    poly = best_fb["poly"]
+                    poly_exp = best_fb["poly_exp"]
+                    margin_px = float(best_fb["margin_px"])
+                    rectified = best_fb["rectified"]
+                    H_deg_to_rect = best_fb["H_deg_to_rect"]
+                    H_deg_to_rect_land = best_fb["H_deg_to_rect_land"]
+                    rect_rotated_90cw = bool(best_fb["rect_rotated_90cw"])
+                    decision = best_fb["decision"]
+
+                    item["docaligner_fallback_advanced"]["accepted"] = True
+                    item["docaligner_fallback_advanced"]["picked_margin_px"] = float(margin_px)
+                    item["docaligner_fallback_advanced"]["picked_decision"] = asdict(decision)
+
+                    # item 更新（後段の整合性のため、主要フィールドだけ上書き）
+                    item["polygon"] = poly.astype(float).tolist()
+                    item["polygon_margin"] = {"mode": "advanced_fallback_eval", "value": float(margin_px)}
+                    item["H_degraded_to_rectified"] = np.asarray(H_deg_to_rect, dtype=np.float64).astype(float).tolist()
+                    item["H_degraded_to_rectified_landscape"] = np.asarray(H_deg_to_rect_land, dtype=np.float64).astype(float).tolist()
+                    item["rectified_landscape_rotated_90cw"] = bool(rect_rotated_90cw)
+                    try:
+                        hr, wr = rectified.shape[:2]
+                        item["rectified_w"] = int(wr)
+                        item["rectified_h"] = int(hr)
+                    except Exception:
+                        pass
+
+                    # 保存画像も上書き（all/fail の整合のため）
+                    overlay2 = draw_polygon_overlay(degraded_bgr, poly_exp)
+                    out_doc = out_dirs["doc"] / f"{case_id}_doc.jpg"
+                    _schedule_image("output_doc_overlay_image_path", out_doc, overlay2)
+                    out_rect = out_dirs["rect"] / f"{case_id}_rect.jpg"
+                    _schedule_image("output_rectified_image_path", out_rect, rectified)
+
+                    # decision を上書き
+                    item["form_decision"] = asdict(decision)
+                    item["predicted_form"] = str(decision.form or "")
+                    item["predicted_angle_deg"] = "" if decision.angle_deg is None else float(decision.angle_deg)
+                else:
+                    item["docaligner_fallback_advanced"]["accepted"] = False
+                    # 何がダメだったかを最低限残す（scan_max_A/B は attempt から追える）
+                    item["docaligner_fallback_advanced"]["reject_reason"] = "no_margin_yielded_valid_form_decision"
+            else:
+                item["docaligner_fallback_advanced"] = {
+                    "ok": False,
+                    "reason": "polygon_not_found",
+                }
+
+    # （再評価後も）Unknown ならここで終了
+    if (not decision.ok) or (decision.form not in ("A", "B")) or (decision.angle_deg is None):
         item["stage"] = "form_unknown"
-        # 期待動作:
-        # - C: form_unknown になるべき（紙は検出できたが A/B ではない）
-        # - A/B: form_unknown になってはいけない
-        # target は「warp まで到達できれば成功」としたいので、ここでは失敗扱い。
         item["ok"] = bool(str(src_form) == "C")
         item["ok_warp"] = False
         _finalize_images_for_stage(item["stage"])
@@ -6171,7 +7414,12 @@ def process_one_observed_case(
 
     # 2) DocAligner
     t0 = time.perf_counter()
-    poly, doc_meta = detect_polygon_docaligner_multi(logger=logger, args=args, degraded_bgr=degraded_bgr)
+    poly, doc_meta = detect_polygon_docaligner_multi(
+        logger=logger,
+        args=args,
+        degraded_bgr=degraded_bgr,
+        formA_geom_cfg=make_formA_geom_cfg_for_case(source_dataset=str(source_dataset), source_form=str(src_form)),
+    )
     times.docaligner_s = time.perf_counter() - t0
     if poly is None:
         item["stage"] = "docaligner_failed"

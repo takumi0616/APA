@@ -1,0 +1,579 @@
+いちいち試運転しなくていいです
+また、現在動いているものの結果を見ても時間だけかかって正確な処理とは言えないです
+改善してください
+完璧なアルゴリズムでDocAligner後の改善処理を実装してください
+きちんとどんな場合でも入力画像から4つの角を適切な位置で検出、用紙を認識させて次のステージに進ませてほしいです
+特に絶対に改善してほしいのはDocAlignerが4つの角のうち、たまに2つの角を同じ場所だと誤認識している場合があります（この結果まるで3角形が用紙の形であるようになります）
+2つの点が被った場合は適切に点の位置を論理処理で改善する処理を絶対に入れてください
+
+
+```
+2. DocAligner（用紙 polygon）の改善案（最重要）
+2-1. まず “margin の上限 200px” が target では足りない可能性が高い
+現状デフォルト：
+
+--polygon-margin-ratio 0.12
+--polygon-margin-max-px 200
+たとえば紙の長辺が 3000px 程度なら、ratio 0.12 は本来 360px のマージンが必要ですが、max 200px で頭打ちになります。
+DocAligner polygon が内側に 250〜400px ぐらいズレると、マーカー/QR が簡単に欠けます。
+
+対応（まずは CLI だけで試せる・効果大）
+--polygon-margin-max-px を 600〜1000 くらいに上げる
+ratio も少し上げて候補を広げる（後述の評価で選ばせる）
+例（精度優先の設定例）：
+
+python APA/paper_pipeline_v17.py ^
+  --target-limit -1 ^
+  --polygon-margin-ratio 0.18 ^
+  --polygon-margin-max-px 800 ^
+  --docaligner-max-side 3200
+ポイント：
+
+margin を上げると「紙が小さく写る」副作用が出るので、rectify の最大辺も 2560→3200〜4096に上げて、角の解像度を落としにくくします。
+2-2. expand_polygon の “画像境界 clip” が形を歪ませうる（精度面で地味に効く）
+expand_polygon() は最後に
+
+out[:, 0] = np.clip(out[:, 0], 0, w-1)
+out[:, 1] = np.clip(out[:, 1], 0, h-1)
+で角点を画像内に押し込めています。
+
+margin を大きくすると、角点が外に出やすくなり、clip で四角形が潰れる → rectify がズレる、が起きます。
+
+対応（精度最優先ならかなり効くことがある）
+polygon を clip する代わりに、画像側を pad してから warp する方式にします。
+
+degraded 画像を cv2.copyMakeBorder で周囲に padding（例: 800px）
+polygon 座標を +pad だけ平行移動
+margin を十分に取っても polygon が画像外に出ないようにする
+rectify
+こうすると、「margin を増やしたのに、端で clip されて意味がない」が減ります。
+
+※ target の「端ギリギリ撮影」の救済に強いです。
+
+2-3. DocAligner Multi の “探索順序” が精度最優先としては逆（重要）
+_iter_docaligner_settings() でモデルの順序をこう並べ替えています：
+
+model_pri = {"lcnet050":0,"lcnet100":1,"fastvit_t8":2,"fastvit_sa24":3}
+models_u = sorted(models, key=...)
+つまり lcnet100 → fastvit_t8 → fastvit_sa24 の順で試します。
+
+しかし max_infer_runs=8 と max_polygon_candidates=4 により、
+
+軽量モデルで候補が4つ取れた時点で打ち切り
+高精度モデル fastvit_sa24 に到達しない
+が起き得ます。
+精度優先ならこれはかなり勿体ないです。
+
+対応（コード変更だが効果が大きい可能性）
+ユーザー指定モデル（デフォルト fastvit_sa24）を必ず最初に試す
+その後に軽量モデルを補助として回す
+例の方針：
+
+models_u = [model0] + [m for m in models_u if m != model0]
+2-4. docaligner_multi の候補評価が “target に最適化されていない”
+detect_polygon_docaligner_multi() の候補評価は _quick_eval_form_scores_for_candidate() を使い、内部で decide_form_by_rotations() を回してスコア比較しています。
+
+しかしここで使う formA_geom_cfg は None のままです（コメントにも「dataset が分からないので過剰緩和しない」）。
+
+一方 process_one_case() の本番 decide では、target の場合：
+
+surround_min_mean_gray を 150 に緩める
+surround_max_ink_ratio を 0.08 に緩める
+min_marker_area_page_ratio を 3.5e-5 に緩める
+という target 用の緩和 cfg を適用しています。
+
+つまり今は、
+
+docaligner_multi の評価が “厳しすぎて” 正しい polygon を低評価
+結果、変な polygon が残り、後段で no_detection
+が起きる構造になっています（起きていても不思議ではない）。
+
+対応（コード変更推奨・筋が良い）
+detect_polygon_docaligner_multi() に source_dataset / formA_geom_cfg を渡し、
+候補評価も本番と同じ cfg で回す
+これで「polygon 選択」と「本番 decide」が同じ評価軸になり、選択ミスが減ります。
+
+2-5. DocAligner 出力 quad の “角の微修正” を常用する
+あなたのコードには既に良い部品があります：
+
+_score_quad_by_edge_support
+_refine_quad_corners_by_shi_tomasi
+ただしこれは advanced fallback（輪郭ベース）側で主に使われています。
+
+対応（精度優先ならおすすめ）
+DocAligner の poly を得た後に、各角を Shi-Tomasi でスナップ（ただし探索窓は小さめに）
+その前後で _score_quad_by_edge_support() が上がったら採用、下がったら戻す
+これで「角が数十pxズレてマーカーが欠ける」みたいなケースに効きます。
+```
+また、一部のDocalingnerの不具合の原因がわかりました
+4つの角を探す際に、たまに2つの角を同じ場所だと誤認識している場合があります
+2つの点が被った場合は適切に点の位置を論理処理で改善する処理を入れてください
+上記の改善を行ってください
+
+
+
+
+
+改善前
+```
+2026-01-26 11:00:19 [INFO] ======================================================================
+2026-01-26 11:00:19 [INFO] paper_pipeline_v17
+2026-01-26 11:00:19 [INFO] ======================================================================
+2026-01-26 11:00:19 [INFO] OpenCV: 4.12.0
+2026-01-26 11:00:19 [INFO] torch : 2.9.1+cpu
+2026-01-26 11:00:19 [INFO] src-forms: 
+2026-01-26 11:00:19 [INFO] [INFO] Loading DocAligner...
+2026-01-26 11:00:21 [INFO] [OK] DocAligner loaded
+2026-01-26 11:00:21 [INFO] [INFO] Loading XFeat...
+2026-01-26 11:00:22 [INFO] [OK] XFeat loaded
+2026-01-26 11:00:23 [INFO] [OK] WeChat QR detector initialized: C:\Users\takumi\develop\APA\models\wechat_qrcode (pool_size=12)
+2026-01-26 11:00:23 [INFO] [OK] UVDoc loaded: ckpt=C:\Users\takumi\develop\APA\third_party\UVDoc\model\best_model.pkl img_size=(488, 712)
+2026-01-26 11:00:23 [INFO] [OK] CachedXFeatMatcher enabled
+2026-01-26 11:00:29 [INFO] [OK] template cache built: A=6 B=6
+2026-01-26 11:00:29 [INFO] [INFO] Pre-generating degraded images (NOT timed)...
+2026-01-26 11:00:29 [INFO] [DEGRADE] test dataset (image/test): skipped (use --test-limit -1 to process all)
+2026-01-26 11:00:29 [INFO] [TARGET] target dataset (image/target): 41 images (all)
+2026-01-26 11:00:32 [INFO] [OK] Pre-generated degraded inputs: 41
+2026-01-26 11:01:30 [INFO] [CASE] id=target_A_1_1_000 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=733 inlier_ratio=0.595450852965069 time_total_s=56.750025 (1_degrade=0.000000,2_doc=45.672427,3_rectify=0.015683,4_decide=0.896263,5_uvdoc=0.628870,6_bgdiv=1.071977,7_match=8.382185,8_warp=0.082620) src=A_1_1.JPG
+2026-01-26 11:01:50 [WARNING] [CASE] id=target_A_1_10_001 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=20.745236 (1_degrade=0.000000,2_doc=19.750451,3_rectify=0.011981,4_decide=0.982804,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_10.JPG
+2026-01-26 11:02:24 [INFO] [CASE] id=target_A_1_11_002 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=864 inlier_ratio=0.7212020033388982 time_total_s=32.913311 (1_degrade=0.000000,2_doc=22.323921,3_rectify=0.010185,4_decide=0.466972,5_uvdoc=0.479062,6_bgdiv=0.812305,7_match=8.757361,8_warp=0.063505) src=A_1_11.JPG
+2026-01-26 11:02:52 [INFO] [CASE] id=target_A_1_12_003 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=540 inlier_ratio=0.5666316894018888 time_total_s=28.065338 (1_degrade=0.000000,2_doc=17.666294,3_rectify=0.008794,4_decide=0.359347,5_uvdoc=0.464178,6_bgdiv=0.712048,7_match=8.791893,8_warp=0.062782) src=A_1_12.JPG
+2026-01-26 11:03:01 [WARNING] [CASE] id=target_A_1_13_004 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=8.849366 (1_degrade=0.000000,2_doc=7.458876,3_rectify=0.015251,4_decide=1.375239,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_13.JPG
+2026-01-26 11:03:36 [INFO] [CASE] id=target_A_1_14_005 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=878 inlier_ratio=0.7179067865903516 time_total_s=33.937888 (1_degrade=0.000000,2_doc=23.608485,3_rectify=0.012425,4_decide=0.534441,5_uvdoc=0.540205,6_bgdiv=0.922370,7_match=8.251445,8_warp=0.068516) src=A_1_14.JPG
+2026-01-26 11:03:47 [WARNING] [CASE] id=target_A_1_15_006 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=11.191256 (1_degrade=0.000000,2_doc=10.778470,3_rectify=0.002744,4_decide=0.410042,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_15.JPG
+2026-01-26 11:03:58 [WARNING] [CASE] id=target_A_1_16_007 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=11.271971 (1_degrade=0.000000,2_doc=10.873519,3_rectify=0.002709,4_decide=0.395743,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_16.JPG
+2026-01-26 11:04:26 [WARNING] [CASE] id=target_A_1_17_008 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=27.882305 (1_degrade=0.000000,2_doc=26.092979,3_rectify=0.046964,4_decide=1.742361,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_17.JPG
+2026-01-26 11:05:12 [INFO] [CASE] id=target_A_1_18_009 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=522 inlier_ratio=0.3945578231292517 time_total_s=44.691102 (1_degrade=0.000000,2_doc=33.249905,3_rectify=0.014883,4_decide=0.773096,5_uvdoc=0.639069,6_bgdiv=1.003386,7_match=8.934825,8_warp=0.075937) src=A_1_18.JPG
+2026-01-26 11:05:55 [INFO] [CASE] id=target_A_1_19_010 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=452 inlier_ratio=0.358161648177496 time_total_s=43.288283 (1_degrade=0.000000,2_doc=32.306765,3_rectify=0.014197,4_decide=0.539922,5_uvdoc=0.550499,6_bgdiv=0.702255,7_match=9.085042,8_warp=0.089603) src=A_1_19.JPG
+2026-01-26 11:06:34 [INFO] [CASE] id=target_A_1_2_011 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=803 inlier_ratio=0.6298039215686274 time_total_s=37.694217 (1_degrade=0.000000,2_doc=27.310697,3_rectify=0.013288,4_decide=0.732108,5_uvdoc=0.508007,6_bgdiv=0.855141,7_match=8.199953,8_warp=0.075022) src=A_1_2.JPG
+2026-01-26 11:06:58 [WARNING] [CASE] id=target_A_1_20_012 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=24.279991 (1_degrade=0.000000,2_doc=23.114820,3_rectify=0.020151,4_decide=1.145020,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_20.JPG
+2026-01-26 11:07:40 [INFO] [CASE] id=target_A_1_3_013 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=814 inlier_ratio=0.6559226430298146 time_total_s=41.482293 (1_degrade=0.000000,2_doc=31.322796,3_rectify=0.017347,4_decide=0.723091,5_uvdoc=0.576700,6_bgdiv=0.869040,7_match=7.889274,8_warp=0.084045) src=A_1_3.JPG
+2026-01-26 11:08:21 [INFO] [CASE] id=target_A_1_4_014 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=816 inlier_ratio=0.6370023419203747 time_total_s=40.593245 (1_degrade=0.000000,2_doc=30.589680,3_rectify=0.015844,4_decide=0.619382,5_uvdoc=0.529627,6_bgdiv=0.801050,7_match=7.977865,8_warp=0.059797) src=A_1_4.JPG
+2026-01-26 11:09:10 [INFO] [CASE] id=target_A_1_5_015 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=918 inlier_ratio=0.7291501191421763 time_total_s=47.922372 (1_degrade=0.000000,2_doc=37.115433,3_rectify=0.015121,4_decide=0.604058,5_uvdoc=0.618364,6_bgdiv=0.876594,7_match=8.620416,8_warp=0.072386) src=A_1_5.JPG
+2026-01-26 11:09:58 [WARNING] [CASE] id=target_A_1_6_016 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=47.785532 (1_degrade=0.000000,2_doc=44.890855,3_rectify=0.036345,4_decide=2.858331,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_6.JPG
+2026-01-26 11:10:37 [INFO] [CASE] id=target_A_1_7_017 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=690 inlier_ratio=0.5754795663052544 time_total_s=39.265465 (1_degrade=0.000000,2_doc=28.101416,3_rectify=0.013544,4_decide=0.649519,5_uvdoc=0.568689,6_bgdiv=0.689347,7_match=9.179386,8_warp=0.063563) src=A_1_7.JPG
+2026-01-26 11:11:12 [INFO] [CASE] id=target_A_1_8_018 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=748 inlier_ratio=0.6470588235294118 time_total_s=33.621762 (1_degrade=0.000000,2_doc=22.974983,3_rectify=0.009181,4_decide=0.490908,5_uvdoc=0.488755,6_bgdiv=0.783574,7_match=8.802679,8_warp=0.071681) src=A_1_8.JPG
+2026-01-26 11:11:38 [WARNING] [CASE] id=target_A_1_9_019 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=26.582506 (1_degrade=0.000000,2_doc=25.327236,3_rectify=0.016601,4_decide=1.238669,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_9.JPG
+2026-01-26 11:12:03 [INFO] [CASE] id=target_B_1_1_020 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=1003 inlier_ratio=0.6682211858760826 time_total_s=23.711527 (1_degrade=0.000000,2_doc=12.667087,3_rectify=0.015842,4_decide=0.670069,5_uvdoc=0.659072,6_bgdiv=0.941797,7_match=8.686583,8_warp=0.071076) src=B_1_1.JPG
+2026-01-26 11:12:40 [WARNING] [CASE] id=target_B_1_10_021 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=36.842790 (1_degrade=0.000000,2_doc=34.177218,3_rectify=0.011759,4_decide=2.653812,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_10.JPG
+2026-01-26 11:13:04 [WARNING] [CASE] id=target_B_1_11_022 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=23.721098 (1_degrade=0.000000,2_doc=22.505873,3_rectify=0.016321,4_decide=1.198904,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_11.JPG
+2026-01-26 11:13:30 [WARNING] [CASE] id=target_B_1_12_023 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=25.934395 (1_degrade=0.000000,2_doc=24.605897,3_rectify=0.017944,4_decide=1.310554,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_12.JPG
+2026-01-26 11:13:54 [INFO] [CASE] id=target_B_1_13_024 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=590 inlier_ratio=0.4102920723226704 time_total_s=23.178721 (1_degrade=0.000000,2_doc=12.288606,3_rectify=0.011447,4_decide=0.428044,5_uvdoc=0.517571,6_bgdiv=0.843519,7_match=9.029164,8_warp=0.060368) src=B_1_13.JPG
+2026-01-26 11:14:14 [WARNING] [CASE] id=target_B_1_14_025 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=20.183081 (1_degrade=0.000000,2_doc=19.156920,3_rectify=0.013576,4_decide=1.012584,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_14.JPG
+2026-01-26 11:14:44 [INFO] [CASE] id=target_B_1_15_026 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=738 inlier_ratio=0.537117903930131 time_total_s=28.415719 (1_degrade=0.000000,2_doc=17.000731,3_rectify=0.029132,4_decide=0.857668,5_uvdoc=0.706369,6_bgdiv=0.725869,7_match=9.028835,8_warp=0.067116) src=B_1_15.JPG
+2026-01-26 11:15:04 [WARNING] [CASE] id=target_B_1_16_027 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=20.251157 (1_degrade=0.000000,2_doc=19.251145,3_rectify=0.012657,4_decide=0.987355,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_16.JPG
+2026-01-26 11:15:22 [WARNING] [CASE] id=target_B_1_17_028 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=18.037944 (1_degrade=0.000000,2_doc=17.057719,3_rectify=0.011559,4_decide=0.968666,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_17.JPG
+2026-01-26 11:15:47 [INFO] [CASE] id=target_B_1_18_029 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=568 inlier_ratio=0.41642228739002934 time_total_s=23.785490 (1_degrade=0.000000,2_doc=13.474825,3_rectify=0.022623,4_decide=0.391678,5_uvdoc=0.483498,6_bgdiv=0.404844,7_match=8.944063,8_warp=0.063958) src=B_1_18.JPG
+2026-01-26 11:16:11 [INFO] [CASE] id=target_B_1_19_030 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=438 inlier_ratio=0.30248618784530384 time_total_s=22.660460 (1_degrade=0.000000,2_doc=11.690584,3_rectify=0.014197,4_decide=0.558847,5_uvdoc=0.569304,6_bgdiv=0.916404,7_match=8.844305,8_warp=0.066817) src=B_1_19.JPG
+2026-01-26 11:16:36 [INFO] [CASE] id=target_B_1_2_031 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=731 inlier_ratio=0.5111888111888112 time_total_s=24.057244 (1_degrade=0.000000,2_doc=13.681645,3_rectify=0.013668,4_decide=0.478798,5_uvdoc=0.541402,6_bgdiv=0.839903,7_match=8.440723,8_warp=0.061104) src=B_1_2.JPG
+2026-01-26 11:17:01 [WARNING] [CASE] id=target_B_1_20_032 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=24.962471 (1_degrade=0.000000,2_doc=23.657994,3_rectify=0.015964,4_decide=1.288512,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_20.JPG
+2026-01-26 11:17:25 [INFO] [CASE] id=target_B_1_21_033 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=608 inlier_ratio=0.41360544217687073 time_total_s=23.012029 (1_degrade=0.000000,2_doc=12.026445,3_rectify=0.015241,4_decide=0.504324,5_uvdoc=0.586235,6_bgdiv=0.888822,7_match=8.910189,8_warp=0.080773) src=B_1_21.JPG
+2026-01-26 11:17:52 [INFO] [CASE] id=target_B_1_3_034 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=869 inlier_ratio=0.6111111111111112 time_total_s=25.763205 (1_degrade=0.000000,2_doc=14.628920,3_rectify=0.029568,4_decide=0.688940,5_uvdoc=0.609614,6_bgdiv=0.872838,7_match=8.869281,8_warp=0.064043) src=B_1_3.JPG
+2026-01-26 11:18:29 [INFO] [CASE] id=target_B_1_4_035 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=981 inlier_ratio=0.6869747899159664 time_total_s=36.218016 (1_degrade=0.000000,2_doc=25.257954,3_rectify=0.014565,4_decide=0.828799,5_uvdoc=0.535891,6_bgdiv=0.862423,7_match=8.655512,8_warp=0.062873) src=B_1_4.JPG
+2026-01-26 11:18:50 [WARNING] [CASE] id=target_B_1_5_036 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=20.827962 (1_degrade=0.000000,2_doc=19.668099,3_rectify=0.030123,4_decide=1.129741,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_5.JPG
+2026-01-26 11:19:25 [WARNING] [CASE] id=target_B_1_6_037 ok=FALSE ok_warp=FALSE stage=homography_unstable unknown_reason= gt_form= pred_form=B best_template=2.jpg inliers=5 inlier_ratio=0.5555555555555556 time_total_s=34.080829 (1_degrade=0.000000,2_doc=22.951276,3_rectify=0.016849,4_decide=0.846167,5_uvdoc=0.705679,6_bgdiv=0.901656,7_match=8.659169,8_warp=0.000033) src=B_1_6.JPG
+2026-01-26 11:19:51 [INFO] [CASE] id=target_B_1_7_038 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=865 inlier_ratio=0.6336996336996337 time_total_s=24.707863 (1_degrade=0.000000,2_doc=13.692032,3_rectify=0.031915,4_decide=0.645600,5_uvdoc=0.584801,6_bgdiv=0.777586,7_match=8.907030,8_warp=0.068900) src=B_1_7.JPG
+2026-01-26 11:20:36 [WARNING] [CASE] id=target_B_1_8_039 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=45.316068 (1_degrade=0.000000,2_doc=42.430417,3_rectify=0.019083,4_decide=2.866568,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_8.JPG
+2026-01-26 11:21:01 [INFO] [CASE] id=target_B_1_9_040 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=918 inlier_ratio=0.652452025586354 time_total_s=23.058775 (1_degrade=0.000000,2_doc=11.792915,3_rectify=0.012759,4_decide=0.611667,5_uvdoc=0.618742,6_bgdiv=0.818949,7_match=9.128153,8_warp=0.075589) src=B_1_9.JPG
+2026-01-26 11:21:01 [INFO] ======================================================================
+2026-01-26 11:21:01 [INFO] [SUMMARY] total=41 ok_expected=23 (56.1%) ok_warp=23 (56.1%)
+2026-01-26 11:21:01 [INFO] [SUMMARY] elapsed avg per case: 29.959s
+2026-01-26 11:21:01 [INFO] [SUMMARY] stage counts:
+2026-01-26 11:21:01 [INFO]   done                 : 23
+2026-01-26 11:21:01 [INFO]   form_unknown         : 17
+2026-01-26 11:21:01 [INFO]   homography_unstable  : 1
+2026-01-26 11:21:01 [INFO] [SUMMARY] stage time totals (s):
+2026-01-26 11:21:01 [INFO]   degrade_s    : 0.00
+2026-01-26 11:21:01 [INFO]   docaligner_s : 924.19
+2026-01-26 11:21:01 [INFO]   rectify_s    : 0.69
+2026-01-26 11:21:01 [INFO]   decide_s     : 38.46
+2026-01-26 11:21:01 [INFO]   uvdoc_s      : 13.71
+2026-01-26 11:21:01 [INFO]   bgdiv_s      : 19.89
+2026-01-26 11:21:01 [INFO]   match_s      : 208.98
+2026-01-26 11:21:01 [INFO]   warp_s       : 1.61
+2026-01-26 11:21:01 [INFO] ======================================================================
+2026-01-26 11:21:01 [INFO] [STATS] overall
+2026-01-26 11:21:01 [INFO]   total_cases                       : 41
+2026-01-26 11:21:01 [INFO]   ok_warp(done_aligned_generated)    : 23 (56.1%)
+2026-01-26 11:21:01 [INFO]   ok_expected_behavior(user_KPI)     : 23 (56.1%)
+2026-01-26 11:21:01 [INFO]   run_elapsed_total_seconds          : 1228.337
+2026-01-26 11:21:01 [INFO]   avg_elapsed_per_case_seconds       : 29.959
+2026-01-26 11:21:01 [INFO] [STATS] A form
+2026-01-26 11:21:01 [INFO]   cases                             : 0
+2026-01-26 11:21:01 [INFO]   form_accuracy                      : 0 (nan%)
+2026-01-26 11:21:01 [INFO]   template_accuracy                  : 0 (nan%)
+2026-01-26 11:21:01 [INFO] [STATS] B form
+2026-01-26 11:21:01 [INFO]   cases                             : 0
+2026-01-26 11:21:01 [INFO]   form_accuracy                      : 0 (nan%)
+2026-01-26 11:21:01 [INFO]   template_accuracy                  : 0 (nan%)
+2026-01-26 11:21:01 [INFO] [STATS] C form (should be rejected)
+2026-01-26 11:21:01 [INFO]   cases                             : 0
+2026-01-26 11:21:01 [INFO]   reject_success(stage=form_unknown) : 0 (nan%)
+2026-01-26 11:21:01 [INFO]   false_positive_as_A                : 0 (nan%)
+2026-01-26 11:21:01 [INFO]   false_positive_as_B                : 0 (nan%)
+2026-01-26 11:21:01 [INFO] [STATS] stage time totals (s) (same as SUMMARY)
+2026-01-26 11:21:01 [INFO]   degrade_s    : 0.00
+2026-01-26 11:21:01 [INFO]   docaligner_s : 924.19
+2026-01-26 11:21:01 [INFO]   rectify_s    : 0.69
+2026-01-26 11:21:01 [INFO]   decide_s     : 38.46
+2026-01-26 11:21:01 [INFO]   uvdoc_s      : 13.71
+2026-01-26 11:21:01 [INFO]   bgdiv_s      : 19.89
+2026-01-26 11:21:01 [INFO]   match_s      : 208.98
+2026-01-26 11:21:01 [INFO]   warp_s       : 1.61
+2026-01-26 11:21:01 [INFO] [STATS] stage time mean per case (s)
+2026-01-26 11:21:01 [INFO]   degrade_s    : 0.000
+2026-01-26 11:21:01 [INFO]   docaligner_s : 22.541
+2026-01-26 11:21:01 [INFO]   rectify_s    : 0.017
+2026-01-26 11:21:01 [INFO]   decide_s     : 0.938
+2026-01-26 11:21:01 [INFO]   uvdoc_s      : 0.334
+2026-01-26 11:21:01 [INFO]   bgdiv_s      : 0.485
+2026-01-26 11:21:01 [INFO]   match_s      : 5.097
+2026-01-26 11:21:01 [INFO]   warp_s       : 0.039
+2026-01-26 11:21:01 [INFO] [STATS] per-case total time (s)
+2026-01-26 11:21:01 [INFO]   mean  : 29.452
+2026-01-26 11:21:01 [INFO]   median: 25.934
+2026-01-26 11:21:01 [INFO] [DONE] outputs: C:\Users\takumi\develop\APA\output_pipeline\run_20260126_110019
+2026-01-26 11:21:01 [INFO] [DONE] elapsed: 1228.3s
+
+```
+
+改善後
+```
+2026-01-26 13:01:34 [INFO] ======================================================================
+2026-01-26 13:01:34 [INFO] paper_pipeline_v17
+2026-01-26 13:01:34 [INFO] ======================================================================
+2026-01-26 13:01:34 [INFO] OpenCV: 4.12.0
+2026-01-26 13:01:34 [INFO] torch : 2.9.1+cpu
+2026-01-26 13:01:34 [INFO] src-forms: 
+2026-01-26 13:01:34 [INFO] [INFO] Loading DocAligner...
+2026-01-26 13:01:37 [INFO] [OK] DocAligner loaded
+2026-01-26 13:01:37 [INFO] [INFO] Loading XFeat...
+2026-01-26 13:01:38 [INFO] [OK] XFeat loaded
+2026-01-26 13:01:38 [INFO] [OK] WeChat QR detector initialized: C:\Users\takumi\develop\APA\models\wechat_qrcode (pool_size=12)
+2026-01-26 13:01:39 [INFO] [OK] UVDoc loaded: ckpt=C:\Users\takumi\develop\APA\third_party\UVDoc\model\best_model.pkl img_size=(488, 712)
+2026-01-26 13:01:39 [INFO] [OK] CachedXFeatMatcher enabled
+2026-01-26 13:01:44 [INFO] [OK] template cache built: A=6 B=6
+2026-01-26 13:01:44 [INFO] [INFO] Pre-generating degraded images (NOT timed)...
+2026-01-26 13:01:44 [INFO] [DEGRADE] test dataset (image/test): skipped (use --test-limit -1 to process all)
+2026-01-26 13:01:44 [INFO] [TARGET] target dataset (image/target): 41 images (all)
+2026-01-26 13:01:48 [INFO] [OK] Pre-generated degraded inputs: 41
+2026-01-26 13:02:44 [INFO] [CASE] id=target_A_1_1_000 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=733 inlier_ratio=0.595450852965069 time_total_s=55.385075 (1_degrade=0.000000,2_doc=44.101894,3_rectify=0.017493,4_decide=0.824940,5_uvdoc=0.579942,6_bgdiv=1.171341,7_match=8.621970,8_warp=0.067495) src=A_1_1.JPG
+2026-01-26 13:03:22 [WARNING] [CASE] id=target_A_1_10_001 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=38.120399 (1_degrade=0.000000,2_doc=18.520576,3_rectify=0.086773,4_decide=19.513051,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_10.JPG
+2026-01-26 13:03:57 [INFO] [CASE] id=target_A_1_11_002 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=864 inlier_ratio=0.7212020033388982 time_total_s=34.093848 (1_degrade=0.000000,2_doc=22.279406,3_rectify=0.018088,4_decide=0.589361,5_uvdoc=0.544946,6_bgdiv=0.891807,7_match=9.690696,8_warp=0.079545) src=A_1_11.JPG
+2026-01-26 13:04:26 [INFO] [CASE] id=target_A_1_12_003 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=540 inlier_ratio=0.5666316894018888 time_total_s=28.483341 (1_degrade=0.000000,2_doc=18.263585,3_rectify=0.008515,4_decide=0.407591,5_uvdoc=0.481410,6_bgdiv=0.669315,7_match=8.587684,8_warp=0.065241) src=A_1_12.JPG
+2026-01-26 13:04:47 [WARNING] [CASE] id=target_A_1_13_004 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=21.445276 (1_degrade=0.000000,2_doc=7.790699,3_rectify=0.079053,4_decide=13.575525,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_13.JPG
+2026-01-26 13:05:20 [INFO] [CASE] id=target_A_1_14_005 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=878 inlier_ratio=0.7179067865903516 time_total_s=32.529701 (1_degrade=0.000000,2_doc=22.252403,3_rectify=0.012247,4_decide=0.577160,5_uvdoc=0.541224,6_bgdiv=0.827429,7_match=8.256720,8_warp=0.062518) src=A_1_14.JPG
+2026-01-26 13:05:58 [WARNING] [CASE] id=target_A_1_15_006 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=37.914547 (1_degrade=0.000000,2_doc=11.106401,3_rectify=0.075255,4_decide=26.732891,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_15.JPG
+2026-01-26 13:06:37 [WARNING] [CASE] id=target_A_1_16_007 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=38.896129 (1_degrade=0.000000,2_doc=10.659187,3_rectify=0.081644,4_decide=28.155298,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_16.JPG
+2026-01-26 13:07:15 [WARNING] [CASE] id=target_A_1_17_008 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=38.411133 (1_degrade=0.000000,2_doc=24.002248,3_rectify=0.110829,4_decide=14.298056,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_17.JPG
+2026-01-26 13:07:59 [INFO] [CASE] id=target_A_1_18_009 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=522 inlier_ratio=0.3945578231292517 time_total_s=42.496707 (1_degrade=0.000000,2_doc=32.064393,3_rectify=0.015072,4_decide=0.731124,5_uvdoc=0.584028,6_bgdiv=0.831093,7_match=8.196404,8_warp=0.074594) src=A_1_18.JPG
+2026-01-26 13:08:40 [INFO] [CASE] id=target_A_1_19_010 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=452 inlier_ratio=0.358161648177496 time_total_s=41.041061 (1_degrade=0.000000,2_doc=30.552246,3_rectify=0.015185,4_decide=0.585469,5_uvdoc=0.564333,6_bgdiv=0.653322,7_match=8.604750,8_warp=0.065756) src=A_1_19.JPG
+2026-01-26 13:09:16 [INFO] [CASE] id=target_A_1_2_011 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=803 inlier_ratio=0.6298039215686274 time_total_s=35.825076 (1_degrade=0.000000,2_doc=26.560713,3_rectify=0.014921,4_decide=0.733782,5_uvdoc=0.457330,6_bgdiv=0.844794,7_match=7.134886,8_warp=0.078650) src=A_1_2.JPG
+2026-01-26 13:09:59 [WARNING] [CASE] id=target_A_1_20_012 ok=FALSE ok_warp=FALSE stage=xfeat_failed unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers= inlier_ratio= time_total_s=42.655937 (1_degrade=0.000000,2_doc=23.563243,3_rectify=0.114028,4_decide=10.484461,5_uvdoc=0.514247,6_bgdiv=0.954982,7_match=7.024977,8_warp=0.000000) src=A_1_20.JPG
+2026-01-26 13:10:41 [INFO] [CASE] id=target_A_1_3_013 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=814 inlier_ratio=0.6559226430298146 time_total_s=41.458252 (1_degrade=0.000000,2_doc=31.503999,3_rectify=0.014904,4_decide=0.696236,5_uvdoc=0.562040,6_bgdiv=0.818783,7_match=7.799592,8_warp=0.062698) src=A_1_3.JPG
+2026-01-26 13:11:22 [INFO] [CASE] id=target_A_1_4_014 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=816 inlier_ratio=0.6370023419203747 time_total_s=39.589690 (1_degrade=0.000000,2_doc=30.079091,3_rectify=0.013769,4_decide=0.562697,5_uvdoc=0.417236,6_bgdiv=0.792578,7_match=7.618898,8_warp=0.105421) src=A_1_4.JPG
+2026-01-26 13:12:06 [INFO] [CASE] id=target_A_1_5_015 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=918 inlier_ratio=0.7291501191421763 time_total_s=43.459784 (1_degrade=0.000000,2_doc=34.333758,3_rectify=0.014142,4_decide=0.614728,5_uvdoc=0.440343,6_bgdiv=0.808803,7_match=7.184896,8_warp=0.063114) src=A_1_5.JPG
+2026-01-26 13:13:07 [WARNING] [CASE] id=target_A_1_6_016 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=61.202667 (1_degrade=0.000000,2_doc=45.285784,3_rectify=0.131087,4_decide=15.785797,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_6.JPG
+2026-01-26 13:13:48 [INFO] [CASE] id=target_A_1_7_017 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=690 inlier_ratio=0.5754795663052544 time_total_s=40.140375 (1_degrade=0.000000,2_doc=27.980531,3_rectify=0.014405,4_decide=0.649253,5_uvdoc=0.468219,6_bgdiv=0.599140,7_match=10.348780,8_warp=0.080047) src=A_1_7.JPG
+2026-01-26 13:14:20 [INFO] [CASE] id=target_A_1_8_018 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=748 inlier_ratio=0.6470588235294118 time_total_s=32.166390 (1_degrade=0.000000,2_doc=23.121999,3_rectify=0.010598,4_decide=0.467576,5_uvdoc=0.361752,6_bgdiv=0.682210,7_match=7.416610,8_warp=0.105645) src=A_1_8.JPG
+2026-01-26 13:14:58 [WARNING] [CASE] id=target_A_1_9_019 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=37.508299 (1_degrade=0.000000,2_doc=22.098083,3_rectify=0.094049,4_decide=15.316168,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_9.JPG
+2026-01-26 13:15:21 [INFO] [CASE] id=target_B_1_1_020 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=1003 inlier_ratio=0.6682211858760826 time_total_s=22.576802 (1_degrade=0.000000,2_doc=12.636402,3_rectify=0.030280,4_decide=0.705609,5_uvdoc=0.622594,6_bgdiv=0.925699,7_match=7.585301,8_warp=0.070918) src=B_1_1.JPG
+2026-01-26 13:16:13 [WARNING] [CASE] id=target_B_1_10_021 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=51.715229 (1_degrade=0.000000,2_doc=34.438325,3_rectify=0.084837,4_decide=17.192067,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_10.JPG
+2026-01-26 13:17:00 [WARNING] [CASE] id=target_B_1_11_022 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=46.401606 (1_degrade=0.000000,2_doc=22.254888,3_rectify=0.103852,4_decide=24.042865,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_11.JPG
+2026-01-26 13:17:40 [WARNING] [CASE] id=target_B_1_12_023 ok=FALSE ok_warp=FALSE stage=xfeat_failed unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers= inlier_ratio= time_total_s=38.047641 (1_degrade=0.000000,2_doc=21.881082,3_rectify=0.082352,4_decide=7.160469,5_uvdoc=0.555415,6_bgdiv=0.849923,7_match=7.518399,8_warp=0.000000) src=B_1_12.JPG
+2026-01-26 13:18:03 [INFO] [CASE] id=target_B_1_13_024 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=590 inlier_ratio=0.4102920723226704 time_total_s=22.198989 (1_degrade=0.000000,2_doc=11.426280,3_rectify=0.010831,4_decide=0.441683,5_uvdoc=0.499623,6_bgdiv=0.777572,7_match=8.983054,8_warp=0.059946) src=B_1_13.JPG
+2026-01-26 13:18:39 [WARNING] [CASE] id=target_B_1_14_025 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=36.361418 (1_degrade=0.000000,2_doc=18.103995,3_rectify=0.087139,4_decide=18.170284,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_14.JPG
+2026-01-26 13:19:09 [INFO] [CASE] id=target_B_1_15_026 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=738 inlier_ratio=0.537117903930131 time_total_s=27.940266 (1_degrade=0.000000,2_doc=16.661344,3_rectify=0.030148,4_decide=0.940236,5_uvdoc=0.586162,6_bgdiv=0.668753,7_match=8.981148,8_warp=0.072476) src=B_1_15.JPG
+2026-01-26 13:19:54 [WARNING] [CASE] id=target_B_1_16_027 ok=FALSE ok_warp=FALSE stage=homography_unstable unknown_reason= gt_form= pred_form=B best_template=2.jpg inliers=4 inlier_ratio=0.6666666666666666 time_total_s=41.536977 (1_degrade=0.000000,2_doc=19.032410,3_rectify=0.086582,4_decide=12.499624,5_uvdoc=0.599510,6_bgdiv=0.841540,7_match=8.477262,8_warp=0.000049) src=B_1_16.JPG
+2026-01-26 13:20:36 [WARNING] [CASE] id=target_B_1_17_028 ok=FALSE ok_warp=FALSE stage=homography_unstable unknown_reason= gt_form= pred_form=A best_template=4.jpg inliers=6 inlier_ratio=0.5454545454545454 time_total_s=41.810237 (1_degrade=0.000000,2_doc=18.298485,3_rectify=0.078114,4_decide=15.347215,5_uvdoc=0.636276,6_bgdiv=0.837705,7_match=6.612367,8_warp=0.000075) src=B_1_17.JPG
+2026-01-26 13:21:01 [INFO] [CASE] id=target_B_1_18_029 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=568 inlier_ratio=0.41642228739002934 time_total_s=23.437911 (1_degrade=0.000000,2_doc=12.832175,3_rectify=0.018342,4_decide=0.447631,5_uvdoc=0.518228,6_bgdiv=0.353993,7_match=9.196875,8_warp=0.070668) src=B_1_18.JPG
+2026-01-26 13:21:24 [INFO] [CASE] id=target_B_1_19_030 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=438 inlier_ratio=0.30248618784530384 time_total_s=22.477270 (1_degrade=0.000000,2_doc=11.677321,3_rectify=0.013105,4_decide=0.516382,5_uvdoc=0.568463,6_bgdiv=0.812460,7_match=8.819588,8_warp=0.069951) src=B_1_19.JPG
+2026-01-26 13:21:48 [INFO] [CASE] id=target_B_1_2_031 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=731 inlier_ratio=0.5111888111888112 time_total_s=22.506533 (1_degrade=0.000000,2_doc=12.120452,3_rectify=0.015793,4_decide=0.491035,5_uvdoc=0.534872,6_bgdiv=0.742563,7_match=8.529988,8_warp=0.071830) src=B_1_2.JPG
+2026-01-26 13:22:32 [WARNING] [CASE] id=target_B_1_20_032 ok=FALSE ok_warp=FALSE stage=xfeat_failed unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers= inlier_ratio= time_total_s=42.433168 (1_degrade=0.000000,2_doc=22.361062,3_rectify=0.089094,4_decide=10.713747,5_uvdoc=0.625493,6_bgdiv=0.871034,7_match=7.772738,8_warp=0.000000) src=B_1_20.JPG
+2026-01-26 13:22:54 [INFO] [CASE] id=target_B_1_21_033 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=608 inlier_ratio=0.41360544217687073 time_total_s=21.665079 (1_degrade=0.000000,2_doc=11.379846,3_rectify=0.014278,4_decide=0.456834,5_uvdoc=0.498590,6_bgdiv=0.773496,7_match=8.475622,8_warp=0.066412) src=B_1_21.JPG
+2026-01-26 13:23:20 [INFO] [CASE] id=target_B_1_3_034 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=869 inlier_ratio=0.6111111111111112 time_total_s=24.996631 (1_degrade=0.000000,2_doc=14.204758,3_rectify=0.027518,4_decide=0.694102,5_uvdoc=0.576488,6_bgdiv=0.777167,7_match=8.646692,8_warp=0.069906) src=B_1_3.JPG
+2026-01-26 13:23:57 [INFO] [CASE] id=target_B_1_4_035 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=981 inlier_ratio=0.6869747899159664 time_total_s=35.835403 (1_degrade=0.000000,2_doc=25.220139,3_rectify=0.016465,4_decide=0.736148,5_uvdoc=0.596430,6_bgdiv=0.892425,7_match=8.313448,8_warp=0.060348) src=B_1_4.JPG
+2026-01-26 13:24:29 [WARNING] [CASE] id=target_B_1_5_036 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=32.402705 (1_degrade=0.000000,2_doc=19.331832,3_rectify=0.092456,4_decide=12.978417,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_5.JPG
+2026-01-26 13:25:02 [WARNING] [CASE] id=target_B_1_6_037 ok=FALSE ok_warp=FALSE stage=homography_unstable unknown_reason= gt_form= pred_form=B best_template=2.jpg inliers=5 inlier_ratio=0.5555555555555556 time_total_s=32.117592 (1_degrade=0.000000,2_doc=22.066748,3_rectify=0.018744,4_decide=0.697023,5_uvdoc=0.704316,6_bgdiv=0.850178,7_match=7.780538,8_warp=0.000045) src=B_1_6.JPG
+2026-01-26 13:25:28 [INFO] [CASE] id=target_B_1_7_038 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=865 inlier_ratio=0.6336996336996337 time_total_s=23.859263 (1_degrade=0.000000,2_doc=13.460314,3_rectify=0.027063,4_decide=0.567293,5_uvdoc=0.589122,6_bgdiv=0.711920,7_match=8.435271,8_warp=0.068280) src=B_1_7.JPG
+2026-01-26 13:26:28 [WARNING] [CASE] id=target_B_1_8_039 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=60.428209 (1_degrade=0.000000,2_doc=41.208440,3_rectify=0.157710,4_decide=19.062059,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_8.JPG
+2026-01-26 13:26:52 [INFO] [CASE] id=target_B_1_9_040 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=918 inlier_ratio=0.652452025586354 time_total_s=22.896079 (1_degrade=0.000000,2_doc=11.913531,3_rectify=0.013197,4_decide=0.540233,5_uvdoc=0.620173,6_bgdiv=1.027515,7_match=8.701891,8_warp=0.079539) src=B_1_9.JPG
+2026-01-26 13:26:52 [INFO] ======================================================================
+2026-01-26 13:26:52 [INFO] [SUMMARY] total=41 ok_expected=23 (56.1%) ok_warp=23 (56.1%)
+2026-01-26 13:26:52 [INFO] [SUMMARY] elapsed avg per case: 36.689s
+2026-01-26 13:26:52 [INFO] [SUMMARY] stage counts:
+2026-01-26 13:26:52 [INFO]   done                 : 23
+2026-01-26 13:26:52 [INFO]   form_unknown         : 12
+2026-01-26 13:26:52 [INFO]   homography_unstable  : 3
+2026-01-26 13:26:52 [INFO]   xfeat_failed         : 3
+2026-01-26 13:26:52 [INFO] [SUMMARY] stage time totals (s):
+2026-01-26 13:26:52 [INFO]   degrade_s    : 0.00
+2026-01-26 13:26:52 [INFO]   docaligner_s : 898.63
+2026-01-26 13:26:52 [INFO]   rectify_s    : 2.04
+2026-01-26 13:26:52 [INFO]   decide_s     : 295.70
+2026-01-26 13:26:52 [INFO]   uvdoc_s      : 15.85
+2026-01-26 13:26:52 [INFO]   bgdiv_s      : 23.26
+2026-01-26 13:26:52 [INFO]   match_s      : 239.32
+2026-01-26 13:26:52 [INFO]   warp_s       : 1.67
+2026-01-26 13:26:52 [INFO] ======================================================================
+2026-01-26 13:26:52 [INFO] [STATS] overall
+2026-01-26 13:26:52 [INFO]   total_cases                       : 41
+2026-01-26 13:26:52 [INFO]   ok_warp(done_aligned_generated)    : 23 (56.1%)
+2026-01-26 13:26:52 [INFO]   ok_expected_behavior(user_KPI)     : 23 (56.1%)
+2026-01-26 13:26:52 [INFO]   run_elapsed_total_seconds          : 1504.243
+2026-01-26 13:26:52 [INFO]   avg_elapsed_per_case_seconds       : 36.689
+2026-01-26 13:26:52 [INFO] [STATS] A form
+2026-01-26 13:26:52 [INFO]   cases                             : 0
+2026-01-26 13:26:52 [INFO]   form_accuracy                      : 0 (nan%)
+2026-01-26 13:26:52 [INFO]   template_accuracy                  : 0 (nan%)
+2026-01-26 13:26:52 [INFO] [STATS] B form
+2026-01-26 13:26:52 [INFO]   cases                             : 0
+2026-01-26 13:26:52 [INFO]   form_accuracy                      : 0 (nan%)
+2026-01-26 13:26:52 [INFO]   template_accuracy                  : 0 (nan%)
+2026-01-26 13:26:52 [INFO] [STATS] C form (should be rejected)
+2026-01-26 13:26:52 [INFO]   cases                             : 0
+2026-01-26 13:26:52 [INFO]   reject_success(stage=form_unknown) : 0 (nan%)
+2026-01-26 13:26:52 [INFO]   false_positive_as_A                : 0 (nan%)
+2026-01-26 13:26:52 [INFO]   false_positive_as_B                : 0 (nan%)
+2026-01-26 13:26:52 [INFO] [STATS] stage time totals (s) (same as SUMMARY)
+2026-01-26 13:26:52 [INFO]   degrade_s    : 0.00
+2026-01-26 13:26:52 [INFO]   docaligner_s : 898.63
+2026-01-26 13:26:52 [INFO]   rectify_s    : 2.04
+2026-01-26 13:26:52 [INFO]   decide_s     : 295.70
+2026-01-26 13:26:52 [INFO]   uvdoc_s      : 15.85
+2026-01-26 13:26:52 [INFO]   bgdiv_s      : 23.26
+2026-01-26 13:26:52 [INFO]   match_s      : 239.32
+2026-01-26 13:26:52 [INFO]   warp_s       : 1.67
+2026-01-26 13:26:52 [INFO] [STATS] stage time mean per case (s)
+2026-01-26 13:26:52 [INFO]   degrade_s    : 0.000
+2026-01-26 13:26:52 [INFO]   docaligner_s : 21.918
+2026-01-26 13:26:52 [INFO]   rectify_s    : 0.050
+2026-01-26 13:26:52 [INFO]   decide_s     : 7.212
+2026-01-26 13:26:52 [INFO]   uvdoc_s      : 0.387
+2026-01-26 13:26:52 [INFO]   bgdiv_s      : 0.567
+2026-01-26 13:26:52 [INFO]   match_s      : 5.837
+2026-01-26 13:26:52 [INFO]   warp_s       : 0.041
+2026-01-26 13:26:52 [INFO] [STATS] per-case total time (s)
+2026-01-26 13:26:52 [INFO]   mean  : 36.011
+2026-01-26 13:26:52 [INFO]   median: 37.508
+2026-01-26 13:26:52 [INFO] [DONE] outputs: C:\Users\takumi\develop\APA\output_pipeline\run_20260126_130134
+2026-01-26 13:26:52 [INFO] [DONE] elapsed: 1504.2s
+
+```
+
+正解数は変わらず、ただ時間が伸びただけです
+まだDocAlignerの検出において2点や3点しか検出できていないものがあります
+さらに詳細な解析を行うような処理に改善して4つの角を正確に探索でき、用紙を認識できるようにしてください
+大きな改善でも問題ないです
+精度向上に尽くしてください
+現在OKのものはそのままOK、現在うまくいっていないものがうまくいくようにしてください
+処理時間は無視してください
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# タスク（プロンプト）を行う前に必ず以下の資料を読んでください
+
+この資料は環境がどう構築されたかを記しておりコマンド実行などの際は必ず参考にしてください
+@/git_installation_guide.md
+@/miniconda_installation_guide.md
+
+タスクを行った際は、タスク成功後に、行ったことをマークダウン記法でまとめたものを@/APA\document\report の中にファイルを作成してください
+ファイル名のルール：番号_年月日_行ったことを日本語.md（例：1_20260106_環境構築）
+番号は@/APA\document\report の中を精査して確認してください
+これまでのreportも読み込んでからタスクを行ってください
+---
+# プロンプト
+
+@/APA/paper_pipeline_v17.py
+上記のプログラムに以下の改善を行ってほしいです
+
+改善1
+
+現在はDocAligneでは検出ミスがいくつか発生しています
+特に散見されるのが、3角形のような認識をしている場合や線のような認識をしている場合など、用紙の4つの頂点のうちどれかを認識できずにいます
+そのような検出をされたまま進むと、当然他のstageでも検出などができません
+以下の改善は一例なので、もっと効きそうな改善があれば積極的に取り入れてください
+DocAlignerが十分な検証を経て、きちんと用紙と判定できるような4つの角を認識してから、次に進めるようにしたいです
+```
+1. DocAligner（紙検出）改善：最優先
+ユーザーの所感どおり、ここが target のスコアを決めています。改善は大きく3系統あります。
+
+1-A) DocAlignerを“1発勝負”にしない（複数候補→後段で選ぶ）
+精度優先ならこれが最も効きます。
+
+案：DocAlignerを複数条件で実行して polygon 候補を複数生成し、後段スコアで最良を採用
+
+候補生成のバリエーション例
+--docaligner-model: fastvit_sa24 / fastvit_t8 / lcnet100
+--docaligner-type: heatmap / point
+pad_px: 100 / 200 / 300
+入力リサイズ：0.75x / 1.0x / 1.25x（polygonはスケールで戻す）
+候補の選び方（重要）
+候補ごとに rectify →（簡易）フォーム判定し、A/Bスコアが高いものを採用 （マーカー/QRは「紙の切れ」に極端に弱いので、ここが“評価関数”として優秀）
+さらに攻めるなら rectify → XFeat（低解像・軽量）を1テンプレだけ当てて inliers を見る、でも良い
+実装のポイント：process_one_case の stage2〜4 を「候補ループ」にして、最良候補だけ stage5〜へ進める。
+
+これで DocAlignerが少しズレても「ズレない候補」が残り、target の form_unknown が減ります。
+
+1-B) pad を増やす（targetで端ギリギリ撮影が多いなら特効）
+detect_polygon_docaligner() は cb.pad(image_bgr, pad_px) を入れていますが、pad=100固定です。
+targetで「紙が画像端に近い」ケースがあるなら、DocAlignerが角を外しやすいです。
+
+提案：
+PIPELINE_DEFAULTS["docaligner"]["pad_px"] = 200〜400
+もしくは画像の短辺比で pad_px = int(min(h,w)*0.08) のように自動化
+pad増加は計算量も増えますが、CPUでも「精度優先」なら最初にやる価値があります。
+
+1-C) polygon拡張（expand_polygon）が“中心から放射状”なのが地味に危険
+現状の expand_polygon() は「中心→各頂点方向」に押し出しています。
+このやり方は、強い透視歪みや角の誤差があると「本当に欲しい外側方向」とズレます（四辺が平行移動されない）。
+
+提案：辺法線方向にオフセットして、隣接辺の交点で新しい四角形を作る（いわゆる“polygon offset”）
+これをやるだけで、「マーカー/QRがギリギリ切れる」系が減ることがあります
+さらに精度優先なら：margin_px を単一値で決めずに
+margin_px ∈ {0, 0.03*ref, 0.06*ref, 0.10*ref} を試して
+フォーム判定スコアが最大のmarginを採用
+（時間は増えるが、target成功率は上がりやすい）
+```
+また、現在のtargetの結果が以下です
+```
+2026-01-26 08:50:45 [INFO] ======================================================================
+2026-01-26 08:50:45 [INFO] paper_pipeline_v17
+2026-01-26 08:50:45 [INFO] ======================================================================
+2026-01-26 08:50:45 [INFO] OpenCV: 4.12.0
+2026-01-26 08:50:45 [INFO] torch : 2.9.1+cpu
+2026-01-26 08:50:45 [INFO] src-forms: 
+2026-01-26 08:50:45 [INFO] [INFO] Loading DocAligner...
+2026-01-26 08:50:53 [INFO] [OK] DocAligner loaded
+2026-01-26 08:50:53 [INFO] [INFO] Loading XFeat...
+2026-01-26 08:50:55 [INFO] [OK] XFeat loaded
+2026-01-26 08:50:56 [INFO] [OK] WeChat QR detector initialized: C:\Users\takumi\develop\APA\models\wechat_qrcode (pool_size=12)
+2026-01-26 08:50:56 [INFO] [OK] UVDoc loaded: ckpt=C:\Users\takumi\develop\APA\third_party\UVDoc\model\best_model.pkl img_size=(488, 712)
+2026-01-26 08:50:56 [INFO] [OK] CachedXFeatMatcher enabled
+2026-01-26 08:51:03 [INFO] [OK] template cache built: A=6 B=6
+2026-01-26 08:51:03 [INFO] [INFO] Pre-generating degraded images (NOT timed)...
+2026-01-26 08:51:03 [INFO] [DEGRADE] test dataset (image/test): skipped (use --test-limit -1 to process all)
+2026-01-26 08:51:03 [INFO] [TARGET] target dataset (image/target): 41 images (all)
+2026-01-26 08:51:06 [INFO] [OK] Pre-generated degraded inputs: 41
+2026-01-26 08:51:09 [WARNING] [CASE] id=target_A_1_1_000 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=2.696619 (1_degrade=0.000000,2_doc=2.696619,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_1.JPG
+2026-01-26 08:51:27 [WARNING] [CASE] id=target_A_1_10_001 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=17.664463 (1_degrade=0.000000,2_doc=16.697606,3_rectify=0.014316,4_decide=0.952540,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_10.JPG
+2026-01-26 08:51:59 [WARNING] [CASE] id=target_A_1_11_002 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=32.529105 (1_degrade=0.000000,2_doc=30.467253,3_rectify=0.012398,4_decide=2.049454,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_11.JPG
+2026-01-26 08:52:28 [WARNING] [CASE] id=target_A_1_12_003 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=29.123004 (1_degrade=0.000000,2_doc=27.644559,3_rectify=0.010057,4_decide=1.468388,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_12.JPG
+2026-01-26 08:53:06 [WARNING] [CASE] id=target_A_1_13_004 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=37.286155 (1_degrade=0.000000,2_doc=34.914009,3_rectify=0.014662,4_decide=2.357484,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_13.JPG
+2026-01-26 08:53:45 [WARNING] [CASE] id=target_A_1_14_005 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=38.858463 (1_degrade=0.000000,2_doc=36.205912,3_rectify=0.015713,4_decide=2.636839,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_14.JPG
+2026-01-26 08:53:54 [WARNING] [CASE] id=target_A_1_15_006 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=9.354306 (1_degrade=0.000000,2_doc=8.879644,3_rectify=0.003461,4_decide=0.471202,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_15.JPG
+2026-01-26 08:54:04 [WARNING] [CASE] id=target_A_1_16_007 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=9.329168 (1_degrade=0.000000,2_doc=8.916092,3_rectify=0.003506,4_decide=0.409570,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_16.JPG
+2026-01-26 08:54:32 [WARNING] [CASE] id=target_A_1_17_008 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=28.610596 (1_degrade=0.000000,2_doc=27.016934,3_rectify=0.049385,4_decide=1.544277,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_17.JPG
+2026-01-26 08:55:33 [INFO] [CASE] id=target_A_1_18_009 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=542 inlier_ratio=0.4244322631166797 time_total_s=60.255948 (1_degrade=0.000000,2_doc=47.964736,3_rectify=0.018830,4_decide=1.366285,5_uvdoc=0.693419,6_bgdiv=1.068540,7_match=9.063536,8_warp=0.080603) src=A_1_18.JPG
+2026-01-26 08:56:25 [WARNING] [CASE] id=target_A_1_19_010 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=51.741438 (1_degrade=0.000000,2_doc=49.082833,3_rectify=0.020237,4_decide=2.638369,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_19.JPG
+2026-01-26 08:56:59 [INFO] [CASE] id=target_A_1_2_011 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=861 inlier_ratio=0.6747648902821317 time_total_s=33.667470 (1_degrade=0.000000,2_doc=22.118334,3_rectify=0.015653,4_decide=2.040907,5_uvdoc=0.488314,6_bgdiv=0.890533,7_match=8.037724,8_warp=0.076005) src=A_1_2.JPG
+2026-01-26 08:57:24 [WARNING] [CASE] id=target_A_1_20_012 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=24.480156 (1_degrade=0.000000,2_doc=22.936695,3_rectify=0.025867,4_decide=1.517594,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_20.JPG
+2026-01-26 08:57:25 [WARNING] [CASE] id=target_A_1_3_013 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=1.361565 (1_degrade=0.000000,2_doc=1.361565,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_3.JPG
+2026-01-26 08:58:13 [INFO] [CASE] id=target_A_1_4_014 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=881 inlier_ratio=0.6730328495034378 time_total_s=47.290449 (1_degrade=0.000000,2_doc=35.985600,3_rectify=0.013169,4_decide=1.537423,5_uvdoc=0.540810,6_bgdiv=0.824252,7_match=8.317021,8_warp=0.072173) src=A_1_4.JPG
+2026-01-26 08:58:14 [WARNING] [CASE] id=target_A_1_5_015 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=1.016220 (1_degrade=0.000000,2_doc=1.016220,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_5.JPG
+2026-01-26 08:59:10 [WARNING] [CASE] id=target_A_1_6_016 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=56.054201 (1_degrade=0.000000,2_doc=53.383370,3_rectify=0.038383,4_decide=2.632448,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_6.JPG
+2026-01-26 09:00:01 [INFO] [CASE] id=target_A_1_7_017 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=A best_template=1.jpg inliers=626 inlier_ratio=0.5044319097502015 time_total_s=50.168261 (1_degrade=0.000000,2_doc=39.111402,3_rectify=0.016274,4_decide=1.294546,5_uvdoc=0.537444,6_bgdiv=0.660923,7_match=8.481529,8_warp=0.066143) src=A_1_7.JPG
+2026-01-26 09:00:18 [WARNING] [CASE] id=target_A_1_8_018 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=17.274097 (1_degrade=0.000000,2_doc=15.296156,3_rectify=0.010778,4_decide=1.967162,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_8.JPG
+2026-01-26 09:00:39 [WARNING] [CASE] id=target_A_1_9_019 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=20.302077 (1_degrade=0.000000,2_doc=19.211642,3_rectify=0.014935,4_decide=1.075500,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=A_1_9.JPG
+2026-01-26 09:01:01 [INFO] [CASE] id=target_B_1_1_020 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=835 inlier_ratio=0.5876143560872625 time_total_s=21.913865 (1_degrade=0.000000,2_doc=10.715826,3_rectify=0.014873,4_decide=1.088949,5_uvdoc=0.604158,6_bgdiv=0.907845,7_match=8.512388,8_warp=0.069826) src=B_1_1.JPG
+2026-01-26 09:01:34 [WARNING] [CASE] id=target_B_1_10_021 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=32.157325 (1_degrade=0.000000,2_doc=29.549547,3_rectify=0.011525,4_decide=2.596252,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_10.JPG
+2026-01-26 09:01:55 [WARNING] [CASE] id=target_B_1_11_022 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=21.048121 (1_degrade=0.000000,2_doc=19.910625,3_rectify=0.016740,4_decide=1.120756,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_11.JPG
+2026-01-26 09:02:16 [WARNING] [CASE] id=target_B_1_12_023 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=21.037606 (1_degrade=0.000000,2_doc=19.849062,3_rectify=0.018173,4_decide=1.170372,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_12.JPG
+2026-01-26 09:02:46 [INFO] [CASE] id=target_B_1_13_024 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=538 inlier_ratio=0.36899862825788754 time_total_s=29.404907 (1_degrade=0.000000,2_doc=18.237939,3_rectify=0.011151,4_decide=0.871769,5_uvdoc=0.493141,6_bgdiv=0.739599,7_match=8.972306,8_warp=0.079001) src=B_1_13.JPG
+2026-01-26 09:03:04 [WARNING] [CASE] id=target_B_1_14_025 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=17.820665 (1_degrade=0.000000,2_doc=16.894870,3_rectify=0.015154,4_decide=0.910641,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_14.JPG
+2026-01-26 09:03:40 [INFO] [CASE] id=target_B_1_15_026 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=715 inlier_ratio=0.5188679245283019 time_total_s=35.383922 (1_degrade=0.000000,2_doc=23.477833,3_rectify=0.029836,4_decide=2.023442,5_uvdoc=0.533632,6_bgdiv=0.687569,7_match=8.555625,8_warp=0.075985) src=B_1_15.JPG
+2026-01-26 09:03:58 [WARNING] [CASE] id=target_B_1_16_027 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=18.200939 (1_degrade=0.000000,2_doc=17.190994,3_rectify=0.012610,4_decide=0.997335,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_16.JPG
+2026-01-26 09:04:14 [WARNING] [CASE] id=target_B_1_17_028 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=15.964980 (1_degrade=0.000000,2_doc=15.129817,3_rectify=0.012627,4_decide=0.822536,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_17.JPG
+2026-01-26 09:04:46 [INFO] [CASE] id=target_B_1_18_029 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=590 inlier_ratio=0.4229390681003584 time_total_s=30.451568 (1_degrade=0.000000,2_doc=19.943502,3_rectify=0.020020,4_decide=0.650677,5_uvdoc=0.476426,6_bgdiv=0.378857,7_match=8.918285,8_warp=0.063801) src=B_1_18.JPG
+2026-01-26 09:05:34 [INFO] [CASE] id=target_B_1_19_030 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=479 inlier_ratio=0.33356545961002787 time_total_s=47.291846 (1_degrade=0.000000,2_doc=36.612819,3_rectify=0.014948,4_decide=0.890310,5_uvdoc=0.533700,6_bgdiv=0.860745,7_match=8.313585,8_warp=0.065739) src=B_1_19.JPG
+2026-01-26 09:05:53 [INFO] [CASE] id=target_B_1_2_031 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=767 inlier_ratio=0.5537906137184115 time_total_s=17.915456 (1_degrade=0.000000,2_doc=7.717281,3_rectify=0.012582,4_decide=0.672389,5_uvdoc=0.480736,6_bgdiv=0.675765,7_match=8.286432,8_warp=0.070270) src=B_1_2.JPG
+2026-01-26 09:06:14 [WARNING] [CASE] id=target_B_1_20_032 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=21.230231 (1_degrade=0.000000,2_doc=20.019372,3_rectify=0.015803,4_decide=1.195056,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_20.JPG
+2026-01-26 09:06:47 [INFO] [CASE] id=target_B_1_21_033 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=649 inlier_ratio=0.44452054794520546 time_total_s=31.054051 (1_degrade=0.000000,2_doc=20.011422,3_rectify=0.013004,4_decide=0.981650,5_uvdoc=0.531963,6_bgdiv=0.841105,7_match=8.606620,8_warp=0.068288) src=B_1_21.JPG
+2026-01-26 09:07:20 [INFO] [CASE] id=target_B_1_3_034 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=802 inlier_ratio=0.5858290723155588 time_total_s=32.090372 (1_degrade=0.000000,2_doc=21.451466,3_rectify=0.027212,4_decide=1.299437,5_uvdoc=0.502151,6_bgdiv=0.711709,7_match=8.034924,8_warp=0.063474) src=B_1_3.JPG
+2026-01-26 09:07:21 [WARNING] [CASE] id=target_B_1_4_035 ok=FALSE ok_warp=FALSE stage=docaligner_failed unknown_reason=unknown gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=1.005539 (1_degrade=0.000000,2_doc=1.005539,3_rectify=0.000000,4_decide=0.000000,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_4.JPG
+2026-01-26 09:07:33 [WARNING] [CASE] id=target_B_1_5_036 ok=FALSE ok_warp=FALSE stage=form_unknown unknown_reason=no_detection gt_form= pred_form= best_template= inliers= inlier_ratio= time_total_s=11.823237 (1_degrade=0.000000,2_doc=9.710692,3_rectify=0.035456,4_decide=2.077088,5_uvdoc=0.000000,6_bgdiv=0.000000,7_match=0.000000,8_warp=0.000000) src=B_1_5.JPG
+2026-01-26 09:08:15 [WARNING] [CASE] id=target_B_1_6_037 ok=FALSE ok_warp=FALSE stage=xfeat_failed unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers= inlier_ratio= time_total_s=41.783846 (1_degrade=0.000000,2_doc=31.635973,3_rectify=0.018130,4_decide=0.927217,5_uvdoc=0.686407,6_bgdiv=0.768344,7_match=7.747774,8_warp=0.000000) src=B_1_6.JPG
+2026-01-26 09:08:49 [INFO] [CASE] id=target_B_1_7_038 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=895 inlier_ratio=0.6499636891793754 time_total_s=33.059385 (1_degrade=0.000000,2_doc=20.849463,3_rectify=0.028905,4_decide=2.037014,5_uvdoc=0.561773,6_bgdiv=0.807780,7_match=8.711737,8_warp=0.062713) src=B_1_7.JPG
+2026-01-26 09:09:18 [WARNING] [CASE] id=target_B_1_8_039 ok=FALSE ok_warp=FALSE stage=homography_unstable unknown_reason= gt_form= pred_form=B best_template=5.jpg inliers=6 inlier_ratio=0.6 time_total_s=28.144379 (1_degrade=0.000000,2_doc=17.053895,3_rectify=0.019361,4_decide=1.595316,5_uvdoc=0.626368,6_bgdiv=0.978846,7_match=7.870548,8_warp=0.000045) src=B_1_8.JPG
+2026-01-26 09:09:47 [INFO] [CASE] id=target_B_1_9_040 ok=TRUE ok_warp=TRUE stage=done unknown_reason= gt_form= pred_form=B best_template=1.jpg inliers=997 inlier_ratio=0.6894882434301521 time_total_s=28.250702 (1_degrade=0.000000,2_doc=17.062735,3_rectify=0.015708,4_decide=0.987151,5_uvdoc=0.559258,6_bgdiv=0.789783,7_match=8.767820,8_warp=0.068247) src=B_1_9.JPG
+2026-01-26 09:09:47 [INFO] ======================================================================
+2026-01-26 09:09:47 [INFO] [SUMMARY] total=41 ok_expected=14 (34.1%) ok_warp=14 (34.1%)
+2026-01-26 09:09:47 [INFO] [SUMMARY] elapsed avg per case: 27.329s
+2026-01-26 09:09:47 [INFO] [SUMMARY] stage counts:
+2026-01-26 09:09:47 [INFO]   form_unknown         : 21
+2026-01-26 09:09:47 [INFO]   done                 : 14
+2026-01-26 09:09:47 [INFO]   docaligner_failed    : 4
+2026-01-26 09:09:47 [INFO]   homography_unstable  : 1
+2026-01-26 09:09:47 [INFO]   xfeat_failed         : 1
+2026-01-26 09:09:47 [INFO] [SUMMARY] stage time totals (s):
+2026-01-26 09:09:47 [INFO]   degrade_s    : 0.00
+2026-01-26 09:09:47 [INFO]   docaligner_s : 894.94
+2026-01-26 09:09:47 [INFO]   rectify_s    : 0.66
+2026-01-26 09:09:47 [INFO]   decide_s     : 52.88
+2026-01-26 09:09:47 [INFO]   uvdoc_s      : 8.85
+2026-01-26 09:09:47 [INFO]   bgdiv_s      : 12.59
+2026-01-26 09:09:47 [INFO]   match_s      : 135.20
+2026-01-26 09:09:47 [INFO]   warp_s       : 0.98
+2026-01-26 09:09:47 [INFO] ======================================================================
+2026-01-26 09:09:47 [INFO] [STATS] overall
+2026-01-26 09:09:47 [INFO]   total_cases                       : 41
+2026-01-26 09:09:47 [INFO]   ok_warp(done_aligned_generated)    : 14 (34.1%)
+2026-01-26 09:09:47 [INFO]   ok_expected_behavior(user_KPI)     : 14 (34.1%)
+2026-01-26 09:09:47 [INFO]   run_elapsed_total_seconds          : 1120.509
+2026-01-26 09:09:47 [INFO]   avg_elapsed_per_case_seconds       : 27.329
+2026-01-26 09:09:47 [INFO] [STATS] A form
+2026-01-26 09:09:47 [INFO]   cases                             : 0
+2026-01-26 09:09:47 [INFO]   form_accuracy                      : 0 (nan%)
+2026-01-26 09:09:47 [INFO]   template_accuracy                  : 0 (nan%)
+2026-01-26 09:09:47 [INFO] [STATS] B form
+2026-01-26 09:09:47 [INFO]   cases                             : 0
+2026-01-26 09:09:47 [INFO]   form_accuracy                      : 0 (nan%)
+2026-01-26 09:09:47 [INFO]   template_accuracy                  : 0 (nan%)
+2026-01-26 09:09:47 [INFO] [STATS] C form (should be rejected)
+2026-01-26 09:09:47 [INFO]   cases                             : 0
+2026-01-26 09:09:47 [INFO]   reject_success(stage=form_unknown) : 0 (nan%)
+2026-01-26 09:09:47 [INFO]   false_positive_as_A                : 0 (nan%)
+2026-01-26 09:09:47 [INFO]   false_positive_as_B                : 0 (nan%)
+2026-01-26 09:09:47 [INFO] [STATS] stage time totals (s) (same as SUMMARY)
+2026-01-26 09:09:47 [INFO]   degrade_s    : 0.00
+2026-01-26 09:09:47 [INFO]   docaligner_s : 894.94
+2026-01-26 09:09:47 [INFO]   rectify_s    : 0.66
+2026-01-26 09:09:47 [INFO]   decide_s     : 52.88
+2026-01-26 09:09:47 [INFO]   uvdoc_s      : 8.85
+2026-01-26 09:09:47 [INFO]   bgdiv_s      : 12.59
+2026-01-26 09:09:47 [INFO]   match_s      : 135.20
+2026-01-26 09:09:47 [INFO]   warp_s       : 0.98
+2026-01-26 09:09:47 [INFO] [STATS] stage time mean per case (s)
+2026-01-26 09:09:47 [INFO]   degrade_s    : 0.000
+2026-01-26 09:09:47 [INFO]   docaligner_s : 21.828
+2026-01-26 09:09:47 [INFO]   rectify_s    : 0.016
+2026-01-26 09:09:47 [INFO]   decide_s     : 1.290
+2026-01-26 09:09:47 [INFO]   uvdoc_s      : 0.216
+2026-01-26 09:09:47 [INFO]   bgdiv_s      : 0.307
+2026-01-26 09:09:47 [INFO]   match_s      : 3.298
+2026-01-26 09:09:47 [INFO]   warp_s       : 0.024
+2026-01-26 09:09:47 [INFO] [STATS] per-case total time (s)
+2026-01-26 09:09:47 [INFO]   mean  : 26.978
+2026-01-26 09:09:47 [INFO]   median: 28.251
+2026-01-26 09:09:47 [INFO] [DONE] outputs: C:\Users\takumi\develop\APA\output_pipeline\run_20260126_085045
+2026-01-26 09:09:47 [INFO] [DONE] elapsed: 1120.5s
+
+```
+この結果から大幅に改善させたいと考えています
+
+プログラムを改善してください
+
+上記の改善を順番に確実に行ってください
+プログラムをすべて改善できたのちに実行して結果確認、エラーが出る場合は試行錯誤して適宜改善してください
+全ての改善が無事に終了したときに、プログラムファイルの先頭のコメントアウトを更新、さらにレポートの作成を行ってください
