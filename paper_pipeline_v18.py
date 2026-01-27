@@ -34,8 +34,8 @@
 
 本スクリプトは **複数の入力ソース**をまとめて処理します。
 
-v18.12+ のデフォルトは「現場画像想定の target のみ」を処理します。
-（synthetic/test は明示指定したときだけ処理します）
+v18.??+ のデフォルトは **synthetic（A/B/C） + test + target** を処理します。
+（処理対象を絞りたい場合は `--src-forms` / `--test-limit` / `--target-limit` で調整します）
 
 1) synthetic（改悪あり）: `APA/image/{A,B,C}/`
    - デフォルトは `1.jpg`〜`6.jpg` を対象（`PIPELINE_DEFAULTS["template_numbers"]`）
@@ -948,11 +948,10 @@ class UVDocUnwrapper:
 
 PIPELINE_DEFAULTS: dict[str, Any] = {
     # 入力
-    # NOTE(v18.13):
-    # デフォルトは「target のみ」処理したい。
-    # - src_forms を空にすると synthetic(A/B/C) を生成しない。
-    # - target_limit を -1 にして image/target を全件処理する。
-    "src_forms": [],  # 入力元フォーム（synthetic生成）。空=syntheticを処理しない
+    # NOTE(2026-01-27):
+    # ユーザー要望により、デフォルトで synthetic(A/B/C) と test/target も処理する。
+    # ただし重いので、必要に応じて --src-forms / --test-limit / --target-limit で絞り込み可能。
+    "src_forms": ["A", "B", "C"],  # 入力元フォーム（synthetic生成）
     "limit": 0,  # デバッグ用：各フォームで先頭N枚だけ処理（0=全て）
     # NOTE(v18.12):
     # 旧挙動では 0=全件処理 だったが、src-forms の軽い実行でも image/test / image/target まで
@@ -962,7 +961,7 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
     #   - >0: 先頭N枚だけ処理
     #   - <0: 全件処理
     "target_limit": -1,  # デバッグ用：image/target の先頭N枚だけ処理（0=skip, <0=all）
-    "test_limit": 0,  # デバッグ用：image/test の先頭N枚だけ処理（0=skip, <0=all）
+    "test_limit": -1,  # デバッグ用：image/test の先頭N枚だけ処理（0=skip, <0=all）
     "template_numbers": [1, 2, 3, 4, 5, 6],  # テンプレ/入力画像の対象番号（例: 1.jpg〜6.jpg）
 
     # 改悪生成（degrade）
@@ -1126,6 +1125,16 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
             "max_infer_runs": 8,
             # 後段で評価する raw polygon 候補の上限
             "max_polygon_candidates": 4,
+
+            # v18.18+（精度優先 + 10秒/枚目標）:
+            # DocAligner multi は「候補生成（推論）」に加えて「候補評価（rectify→フォーム判定）」も行うが、
+            # 評価をやりすぎると docaligner_s が肥大化する。
+            # そこで、幾何品質で上位のみを評価し、margin の探索数も制限する。
+            "eval_max_candidates": 2,
+            "eval_max_margins": 2,
+            # 候補評価用のフォーム判定は、0/180 の2方向のみなので並列化メリットが小さい。
+            # スレッド生成/同期コストを避けるため既定は 1。
+            "eval_rotation_workers": 1,
         },
 
         # polygon を外側に広げる margin
@@ -1284,6 +1293,247 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
         "max_h_cond": 1e6,  # Homographyの条件数上限（大きいと不安定）
     },
 }
+
+
+# ============================================================
+# Speed profile（大幅高速化用）
+# ============================================================
+
+
+def resolve_speed_profile(args: argparse.Namespace, *, dataset: str) -> str:
+    """speed profile を決定する。
+
+    - fast    : 精度を多少犠牲にして大幅高速化（target向け）
+    - accurate: 既存の高精度（重い）フロー
+    - auto    : dataset=target のみ fast、他は accurate
+    """
+
+    p = str(getattr(args, "speed_profile", "auto") or "auto")
+    if p not in ("auto", "fast", "accurate"):
+        p = "auto"
+    # NOTE(2026-01-27):
+    # ユーザー要望により、target のデフォルトは「速度より精度（ただし1枚~10秒程度）」へ戻す。
+    # fast は明示指定したときのみ有効とする。
+    if p == "auto":
+        return "accurate"
+    return p
+
+
+def resolve_extra_outputs_mode(args: argparse.Namespace, *, profile: str) -> str:
+    """デモ/可視化などの追加出力のモードを決める。
+
+    auto:
+      - accurate: all
+      - fast    : none
+    """
+
+    m = str(getattr(args, "extra_outputs", "auto") or "auto")
+    if m not in ("auto", "all", "none"):
+        m = "auto"
+    if m == "auto":
+        return "none" if str(profile) == "fast" else "all"
+    return m
+
+
+def _get_docaligner_model_cached(model_name: str, model_type: str) -> tuple[Any, Any]:
+    """DocAligner model を (model_name, model_type) でキャッシュして返す。"""
+
+    cache = getattr(_get_docaligner_model_cached, "_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(_get_docaligner_model_cached, "_cache", cache)
+    key = (str(model_name), str(model_type))
+    if key in cache:
+        return cache[key]
+    m, cb = load_docaligner_model(str(model_name), str(model_type))
+    cache[key] = (m, cb)
+    return m, cb
+
+
+def detect_polygon_docaligner_fast(
+    *,
+    logger: logging.Logger,
+    degraded_bgr: np.ndarray,
+    max_input_side_px: int = 1200,
+    model_name: str = "lcnet100",
+    model_type: str = "heatmap",
+) -> tuple[Optional[np.ndarray], dict[str, Any]]:
+    """DocAligner を fast 設定で最小回数だけ実行する。
+
+    目的:
+      - v18 の最大ボトルネック（DocAligner multi + 高解像度入力）を一気に削る
+
+    方針:
+      - 画像を max_input_side_px に収まるよう縮小（input_scale）
+      - pad も控えめ（1〜2回の試行のみ）
+      - multi/advanced fallback は行わない
+    """
+
+    if degraded_bgr is None:
+        return None, {"ok": False, "mode": "fast", "reason": "image_is_none"}
+
+    h, w = degraded_bgr.shape[:2]
+    mside = max(1, int(max(h, w)))
+    s = min(1.0, float(max_input_side_px) / float(mside))
+    # 縮小しすぎは精度が落ちすぎるため下限を設ける
+    s = float(max(0.35, min(1.0, s)))
+
+    try:
+        model, cb = _get_docaligner_model_cached(str(model_name), str(model_type))
+    except Exception as e:
+        return None, {"ok": False, "mode": "fast", "reason": f"model_load_failed:{e}", "model": model_name, "type": model_type}
+
+    attempts: list[dict[str, Any]] = []
+    for pad_px in [120, 240]:
+        try:
+            poly = _run_docaligner_once(
+                model=model,
+                cb=cb,
+                image_bgr=degraded_bgr,
+                pad_px=int(pad_px),
+                input_scale=float(s),
+            )
+        except Exception as e:
+            attempts.append({"pad_px": int(pad_px), "input_scale": float(s), "ok": False, "error": str(e)})
+            continue
+
+        if poly is None:
+            attempts.append({"pad_px": int(pad_px), "input_scale": float(s), "ok": False, "issue": "model_returned_none"})
+            continue
+
+        try:
+            poly = _clamp_poly_to_image(poly, img_w=int(w), img_h=int(h))
+            ok, q = _is_valid_quad(poly, img_w=int(w), img_h=int(h))
+            attempts.append({"pad_px": int(pad_px), "input_scale": float(s), "ok": bool(ok), "quality": q})
+            if ok:
+                return poly, {
+                    "ok": True,
+                    "mode": "fast",
+                    "model": str(model_name),
+                    "type": str(model_type),
+                    "pad_px": int(pad_px),
+                    "input_scale": float(s),
+                    "attempts": attempts,
+                }
+        except Exception as e:
+            attempts.append({"pad_px": int(pad_px), "input_scale": float(s), "ok": False, "error": str(e)})
+
+    logger.debug("[DocAligner fast] no valid polygon. attempts=%s", attempts)
+    return None, {
+        "ok": False,
+        "mode": "fast",
+        "model": str(model_name),
+        "type": str(model_type),
+        "input_scale": float(s),
+        "attempts": attempts,
+        "reason": "no_valid_polygon",
+    }
+
+
+def decide_form_fast(
+    rectified_bgr: np.ndarray,
+    *,
+    unknown_score_threshold: float,
+    unknown_margin: float,
+    formA_geom_cfg: Optional[MarkerGeometryConfig],
+    marker_preproc: str = "none",
+) -> FormDecision:
+    """fast profile 用のフォーム判定。
+
+    大幅高速化のため、以下に簡略化:
+      - 角度は 0/180 のみ（従来通り）
+      - A: marker_preproc は 1 種類のみ（バリエーションは作らない）。
+        ※精度/速度のトレードオフとして、呼び出し側（CLI: --marker-preproc）で調整する。
+      - B: WeChat detector を「生画像1発」だけ（前処理/マルチスケール無し）
+      - morph fallback / robust fallback は行わない
+    """
+
+    if rectified_bgr is None:
+        return FormDecision(False, None, None, 0.0, {"reason": "image_is_none", "mode": "fast"})
+
+    scan_angles = [0.0, 180.0]
+    thr = float(unknown_score_threshold or 0.0)
+
+    wechat = getattr(score_formB, "_wechat", None)
+    scan: list[dict[str, Any]] = []
+
+    bestA: Optional[FormDecision] = None
+    bestB: Optional[FormDecision] = None
+
+    for a in scan_angles:
+        rot = rotate_image_bound(rectified_bgr, float(a))
+        h, w = rot.shape[:2]
+        if h > w:
+            scan.append({"angle": float(a), "skip": True})
+            continue
+
+        okA, scoreA, detA = score_formA(rot, marker_preproc=str(marker_preproc), geom_cfg=formA_geom_cfg)
+        rec: dict[str, Any] = {"angle": float(a), "skip": False, "A": {"ok": bool(okA), "score": float(scoreA), "detail": detA}}
+
+        if wechat is not None:
+            try:
+                qrs = detect_qr_codes_wechat(rot, wechat)
+            except Exception:
+                qrs = []
+            if qrs:
+                bscore, bdet = score_best_qr_candidate(rot, qrs)
+                rec["B"] = {"ok": True, "score": float(1.0 + bscore), "detail": {**bdet, "phase": "fast_minimal"}}
+            else:
+                rec["B"] = {"ok": False, "score": 0.0, "detail": {"qrs": [], "reason": "wechat_no_qr", "phase": "fast_minimal"}}
+        else:
+            rec["B"] = {"ok": False, "score": 0.0, "detail": {"qrs": [], "reason": "wechat_detector_disabled", "phase": "fast_minimal"}}
+
+        scan.append(rec)
+
+        if okA:
+            cand = FormDecision(True, "A", float(a), float(scoreA), {"A": detA, "phase": "fast_A"})
+            if bestA is None or cand.score > bestA.score:
+                bestA = cand
+        if (rec.get("B") or {}).get("ok"):
+            cand = FormDecision(True, "B", float(a), float(rec["B"]["score"]), {"B": rec["B"]["detail"], "phase": "fast_B"})
+            if bestB is None or cand.score > bestB.score:
+                bestB = cand
+
+    # A/B のどちらかが見つかっていればスコアで選ぶ
+    # （ただし threshold/margin の Unknown 判定は従来の思想を踏襲）
+    cand: Optional[FormDecision] = None
+    if bestA is not None and bestB is not None:
+        cand = bestA if bestA.score >= bestB.score else bestB
+    else:
+        cand = bestA or bestB
+
+    if cand is None:
+        return FormDecision(False, None, None, 0.0, {"reason": "no_detection", "scan": scan, "scan_angles": scan_angles, "mode": "fast"})
+
+    if thr > 0 and float(cand.score) < thr:
+        return FormDecision(
+            False,
+            None,
+            None,
+            float(cand.score),
+            {"reason": "below_threshold", "threshold": float(thr), "scan": scan, "scan_angles": scan_angles, "mode": "fast"},
+        )
+
+    # margin 判定（曖昧）: A/B の両方が取れているときのみ適用
+    if bestA is not None and bestB is not None:
+        if abs(float(bestA.score) - float(bestB.score)) < float(unknown_margin or 0.0):
+            return FormDecision(
+                False,
+                None,
+                None,
+                float(max(bestA.score, bestB.score)),
+                {
+                    "reason": "ambiguous",
+                    "unknown_margin": float(unknown_margin or 0.0),
+                    "a_score": float(bestA.score),
+                    "b_score": float(bestB.score),
+                    "scan": scan,
+                    "scan_angles": scan_angles,
+                    "mode": "fast",
+                },
+            )
+
+    return cand
 
 
 # ------------------------------------------------------------
@@ -3556,7 +3806,7 @@ def _iter_docaligner_settings(
     # pad candidates: base + auto + configured list
     # 改善1（DocAligner）:
     # 端ギリギリ撮影の救済には pad が効くが、
-    # v18.13〜の target-only 運用では「max_infer_runs が小さい」ため、
+    # v18.13〜の target-only 運用（過去）では「max_infer_runs が小さい」ため、
     # *scale を先に総当たりして pad が試せない* という順序が精度を下げやすい。
     # そのため、ここでは「pad（候補）→ scale」の順でまず試し、
     # 最低限の回数で大きめ pad まで到達できるように優先度順を設計する。
@@ -3652,12 +3902,13 @@ def _margin_px_candidates_for_eval(*, args: argparse.Namespace, poly_xy: np.ndar
     if fixed > 0:
         return [float(fixed)]
 
+    # NOTE:
+    # v18.18+ では「候補評価」内での margin 探索を絞る（速度/安定の両立）。
+    # ただし advanced_fallback 側で必要に応じて再探索するため、ここで無理に網羅しない。
     ratios = [
         float(getattr(args, "polygon_margin_ratio", 0.0) or 0.0),
         0.0,
-        0.03,
         0.06,
-        0.10,
     ]
     # uniq
     seen: set[float] = set()
@@ -3872,7 +4123,10 @@ def detect_polygon_docaligner_multi(
 
         infer_runs += 1
         try:
-            poly = _run_docaligner_once(
+            # v18.18+ 改善:
+            # _run_docaligner_once_with_meta 内で normalize_polygon_to_quad_with_meta を実施しているため、
+            # ここで再度 normalize を回して「二重実行」しない。
+            poly, _norm_meta = _run_docaligner_once_with_meta(
                 model=model,
                 cb=cb,
                 image_bgr=degraded_bgr,
@@ -3888,22 +4142,13 @@ def detect_polygon_docaligner_multi(
 
         poly = _clamp_poly_to_image(poly, img_w=int(w), img_h=int(h))
 
-        # v18.18: 「重複点/三角形化」修復の診断を meta に残す
-        # _run_docaligner_once で既に正規化済みだが、
-        # ここでは returned quad が "直接order" で成立していたか/修復経路だったかを推定するため、
-        # もう一度 meta付きチェックを回す（計算コストは軽微・精度優先）。
-        try:
-            _q_tmp, _norm_meta = normalize_polygon_to_quad_with_meta(poly, image_bgr=degraded_bgr)
-        except Exception:
-            _norm_meta = {"ok": False, "method": "", "issue": "norm_meta_failed"}
-
         ok, q = _is_valid_quad(poly, img_w=int(w), img_h=int(h))
         all_polys.append(
             {
                 "poly": order_quad_tl_tr_br_bl(poly).astype(np.float32),
                 "quality": q,
                 "setting": {"model": model_name, "type": model_type, "pad_px": int(pad_px), "input_scale": float(input_scale)},
-                "norm": _norm_meta,
+                "norm": _norm_meta if isinstance(_norm_meta, dict) else {"ok": False, "issue": "norm_meta_not_dict"},
                 "strict_ok": bool(ok),
             }
         )
@@ -3920,7 +4165,7 @@ def detect_polygon_docaligner_multi(
                 "poly": order_quad_tl_tr_br_bl(poly).astype(np.float32),
                 "quality": q,
                 "setting": {"model": model_name, "type": model_type, "pad_px": int(pad_px), "input_scale": float(input_scale)},
-                "norm": _norm_meta,
+                "norm": _norm_meta if isinstance(_norm_meta, dict) else {"ok": False, "issue": "norm_meta_not_dict"},
             }
         )
         if len(candidates) >= max_poly_candidates:
@@ -4002,9 +4247,42 @@ def detect_polygon_docaligner_multi(
             edge_u8 = e
         return edge_u8
 
-    for c in candidates:
+    # ---- 候補の評価数を絞る（幾何品質で上位のみ） ----
+    try:
+        eval_max_candidates = int(cfg_multi.get("eval_max_candidates") or 0)
+    except Exception:
+        eval_max_candidates = 0
+    if eval_max_candidates <= 0:
+        eval_max_candidates = int(max(1, min(2, len(candidates))))
+
+    def _cand_quality_score(d: dict[str, Any]) -> float:
+        q = d.get("quality") or {}
+        # 面積比を最重要。edge_ratio は小さいほど良い。
+        area = float(q.get("area_ratio") or 0.0)
+        edge_ratio = float(q.get("edge_ratio") or 1e9)
+        edge_min = float(q.get("edge_min") or 0.0)
+        # スコア: areaを押し上げ、edge_ratioを弱く減点、edge_minを僅かに加点
+        return area * 10.0 - (edge_ratio * 0.15) + (edge_min * 1e-4)
+
+    candidates_for_eval = sorted(candidates, key=_cand_quality_score, reverse=True)[: int(eval_max_candidates)]
+
+    # 評価用の decide は軽量化（0/180固定なので並列化しない方が速いことが多い）
+    try:
+        eval_rotation_workers = int(cfg_multi.get("eval_rotation_workers") or 1)
+    except Exception:
+        eval_rotation_workers = 1
+    eval_rotation_workers = int(max(1, min(4, eval_rotation_workers)))
+
+    try:
+        eval_max_margins = int(cfg_multi.get("eval_max_margins") or 2)
+    except Exception:
+        eval_max_margins = 2
+    eval_max_margins = int(max(1, min(4, eval_max_margins)))
+
+    for c in candidates_for_eval:
         poly = np.asarray(c["poly"], dtype=np.float32)
         margin_list = _margin_px_candidates_for_eval(args=args, poly_xy=poly)
+        margin_list = margin_list[: int(eval_max_margins)]
         for margin_px in margin_list:
             try:
                 rect, _H, poly_exp, rect_meta = rectify_with_margin_and_optional_padding(
@@ -4016,7 +4294,7 @@ def detect_polygon_docaligner_multi(
                 rect, _ = enforce_landscape(rect)
                 decision, score = _quick_eval_form_scores_for_candidate(
                     rect,
-                    rotation_max_workers=int(args.rotation_max_workers),
+                    rotation_max_workers=int(eval_rotation_workers),
                     marker_preproc=str(args.marker_preproc),
                     unknown_score_threshold=float(args.unknown_score_threshold),
                     unknown_margin=float(args.unknown_margin),
@@ -4333,6 +4611,7 @@ def detect_qr_codes_wechat_multiscale(
     wechat: Optional[Any],
     *,
     mode: str = "robust",
+    preprocessed_variants: Optional[list[tuple[str, np.ndarray]]] = None,
 ) -> list[dict[str, Any]]:
     """WeChatエンジンによるQR検出（前処理 + マルチスケール）。
 
@@ -4364,7 +4643,15 @@ def detect_qr_codes_wechat_multiscale(
     min_side = int(PIPELINE_DEFAULTS.get("qr", {}).get("min_test_side_px", 120))
     max_side = int(cfg_all.get("max_test_side_px", 6500))
 
-    variants = _preprocess_variants_for_qr(image_bgr, variant_names)
+    # 改善（高速化）:
+    # fast/robust の両方を同一画像に対して呼ぶ場合、前処理生成（gray/clahe/adaptive等）を共有できる。
+    # preprocessed_variants が渡された場合はそれを使い回す。
+    # ただし、呼び出し側の variants が「robust全量」などの場合があるため、ここで variant_names でフィルタする。
+    if preprocessed_variants is not None:
+        allowed = set(str(x) for x in (variant_names or []))
+        variants = [(n, img) for (n, img) in list(preprocessed_variants) if (not allowed) or (str(n) in allowed)]
+    else:
+        variants = _preprocess_variants_for_qr(image_bgr, variant_names)
 
     best: list[dict[str, Any]] = []
     best_score = float("-inf")
@@ -4408,10 +4695,13 @@ def detect_qr_codes_wechat_multiscale(
             if mode == "fast":
                 return qrs
 
-            # robust: best を選ぶ
+            # robust: best を選ぶ（ただし、十分良い候補が出たら早期終了して無駄な wechat 呼び出しを減らす）
             score = float("-inf")
             try:
-                score, _ = score_best_qr_candidate(test if abs(s - 1.0) < 1e-9 else src, qrs)
+                score, det = score_best_qr_candidate(test if abs(s - 1.0) < 1e-9 else src, qrs)
+                # 右上象限ボーナス（+100）が入っていれば、ほぼ確定とみなして早期return
+                if float(score) >= 50.0 or bool(det.get("qr_is_in_top_right_quadrant")):
+                    return det.get("qrs") or qrs
             except Exception:
                 score = 0.0
 
@@ -4949,217 +5239,178 @@ def decide_form_by_rotations(
         scan_angles = [0.0, 180.0]
 
     scan_results: list[dict[str, Any]] = []
-
-    # threshold 未満で棄却された候補の記録（診断用）
     rejected_by_threshold: dict[str, Any] = {}
     thr = float(unknown_score_threshold or 0.0)
+
+    # rotate の重複計算を避ける（A探索 / morph / Bfast / Brobust で同じ回転画像を何度も使うため）
+    rotated_cache: dict[float, np.ndarray] = {}
+
+    def _get_rot(angle: float) -> np.ndarray:
+        a = float(angle)
+        if a not in rotated_cache:
+            rotated_cache[a] = rotate_image_bound(rectified_bgr, a)
+        return rotated_cache[a]
+
+    def _valid_angles() -> list[float]:
+        out: list[float] = []
+        for a in scan_angles:
+            try:
+                rot = _get_rot(a)
+                h, w = rot.shape[:2]
+                if h > w:
+                    # enforce_landscape 後なら通常起きないが、安全側で除外
+                    scan_results.append({"angle": float(a), "skip": True, "reason": "portrait"})
+                    continue
+                out.append(float(a))
+            except Exception:
+                continue
+        return out
+
+    valid_angles = _valid_angles()
+    if not valid_angles:
+        return FormDecision(False, None, None, 0.0, {"reason": "no_valid_angle", "scan_angles": scan_angles})
+
+    def _run_parallel(func, angles: list[float]) -> list[dict[str, Any]]:
+        if int(max_workers) <= 1 or len(angles) <= 1:
+            out: list[dict[str, Any]] = []
+            for a in angles:
+                out.append(func(a))
+            return out
+        with ThreadPoolExecutor(max_workers=min(int(max_workers), len(angles))) as ex:
+            futures = [ex.submit(func, a) for a in angles]
+            return [f.result() for f in as_completed(futures)]
+
+    def _merge_scan_result(angle: float, key: str, value: Any) -> None:
+        for sr in scan_results:
+            if abs(float(sr.get("angle", -999.0)) - float(angle)) < 1e-6:
+                sr[key] = value
+                return
+        scan_results.append({"angle": float(angle), "skip": False, key: value})
 
     # ----------------------------------
     # Step 1: A探索（見つかればA確定）
     # ----------------------------------
-
     def _eval_formA(angle: float) -> dict[str, Any]:
-        rotated = rotate_image_bound(rectified_bgr, angle)
-        h, w = rotated.shape[:2]
+        rot = _get_rot(angle)
+        h, w = rot.shape[:2]
         if h > w:
             return {"angle": float(angle), "skip": True}
-        okA, scoreA, detA = score_formA(rotated, marker_preproc=marker_preproc, geom_cfg=formA_geom_cfg)
-        return {
-            "angle": float(angle),
-            "skip": False,
-            "A": {"ok": bool(okA), "score": float(scoreA), "detail": detA},
-        }
+        okA, scoreA, detA = score_formA(rot, marker_preproc=str(marker_preproc), geom_cfg=formA_geom_cfg)
+        return {"angle": float(angle), "skip": False, "A": {"ok": bool(okA), "score": float(scoreA), "detail": detA}}
 
     bestA: Optional[FormDecision] = None
+    for r in _run_parallel(_eval_formA, valid_angles):
+        if not r or r.get("skip"):
+            continue
+        scan_results.append(r)
+        if (r.get("A") or {}).get("ok"):
+            a = float(r["angle"])
+            candA = FormDecision(True, "A", a, float(r["A"]["score"]), {"A": r["A"]["detail"], "phase": "formA_found"})
+            if bestA is None or candA.score > bestA.score:
+                bestA = candA
 
-    with ThreadPoolExecutor(max_workers=min(int(max_workers), len(scan_angles))) as ex:
-        futures = [ex.submit(_eval_formA, a) for a in scan_angles]
-        for fut in as_completed(futures):
-            r = fut.result()
-            if not r or r.get("skip"):
-                continue
-            scan_results.append(r)
-            angle = float(r["angle"])
-            if (r.get("A") or {}).get("ok"):
-                candA = FormDecision(True, "A", angle, float(r["A"]["score"]), {"A": r["A"]["detail"], "phase": "formA_found"})
-                if bestA is None or candA.score > bestA.score:
-                    bestA = candA
-
-    # Aが見つかった場合は即座にA確定
     if bestA is not None:
-        # v18.6 修正:
-        # Aが検出できてもスコアが閾値未満なら、ここで Unknown に確定せず、
-        # B探索へフォールバックする（BのQRが見えるケースを取りこぼさない）。
-        if thr > 0 and bestA.score < thr:
-            rejected_by_threshold["A"] = {"score": float(bestA.score), "phase": str((bestA.detail or {}).get("phase") or "formA_found")}
+        # Aが検出できてもスコアが閾値未満なら Unknown に確定せず B探索へフォールバック
+        if thr > 0 and float(bestA.score) < thr:
+            rejected_by_threshold["A"] = {"score": float(bestA.score), "phase": "formA_found"}
         else:
             return bestA
 
-    # v18.4 追加:
-    # test データや強い改悪条件では marker_preproc=basic で取りこぼすことがあるため、
-    # A が全滅した場合のみ「morph」を追加で試す（2角度なのでオーバーヘッドは小さい）。
+    # A が全滅した場合のみ「morph」を追加で試す
     if str(marker_preproc) != "morph":
 
         def _eval_formA_morph(angle: float) -> dict[str, Any]:
-            rotated = rotate_image_bound(rectified_bgr, angle)
-            h, w = rotated.shape[:2]
+            rot = _get_rot(angle)
+            h, w = rot.shape[:2]
             if h > w:
                 return {"angle": float(angle), "skip": True}
-            okA, scoreA, detA = score_formA(rotated, marker_preproc="morph", geom_cfg=formA_geom_cfg)
-            return {
-                "angle": float(angle),
-                "skip": False,
-                "A_morph": {"ok": bool(okA), "score": float(scoreA), "detail": detA},
-            }
+            okA, scoreA, detA = score_formA(rot, marker_preproc="morph", geom_cfg=formA_geom_cfg)
+            return {"angle": float(angle), "skip": False, "A_morph": {"ok": bool(okA), "score": float(scoreA), "detail": detA}}
 
         bestA_morph: Optional[FormDecision] = None
-        with ThreadPoolExecutor(max_workers=min(int(max_workers), len(scan_angles))) as ex:
-            futures = [ex.submit(_eval_formA_morph, a) for a in scan_angles]
-            for fut in as_completed(futures):
-                r = fut.result()
-                if not r or r.get("skip"):
-                    continue
-
-                # scan_results に追記（angle でマージ）
-                for sr in scan_results:
-                    if abs(sr.get("angle", -999) - r.get("angle", -999)) < 1e-6:
-                        sr["A_morph"] = r.get("A_morph")
-                        break
-                else:
-                    scan_results.append(r)
-
-                angle = float(r["angle"])
-                if (r.get("A_morph") or {}).get("ok"):
-                    candA = FormDecision(
-                        True,
-                        "A",
-                        angle,
-                        float(r["A_morph"]["score"]),
-                        {"A": r["A_morph"]["detail"], "phase": "formA_found_fallback_morph"},
-                    )
-                    if bestA_morph is None or candA.score > bestA_morph.score:
-                        bestA_morph = candA
+        for r in _run_parallel(_eval_formA_morph, valid_angles):
+            if not r or r.get("skip"):
+                continue
+            _merge_scan_result(float(r["angle"]), "A_morph", r.get("A_morph"))
+            if (r.get("A_morph") or {}).get("ok"):
+                a = float(r["angle"])
+                candA = FormDecision(
+                    True,
+                    "A",
+                    a,
+                    float(r["A_morph"]["score"]),
+                    {"A": r["A_morph"]["detail"], "phase": "formA_found_fallback_morph"},
+                )
+                if bestA_morph is None or candA.score > bestA_morph.score:
+                    bestA_morph = candA
 
         if bestA_morph is not None:
-            if thr > 0 and bestA_morph.score < thr:
-                rejected_by_threshold["A_morph"] = {
-                    "score": float(bestA_morph.score),
-                    "phase": str((bestA_morph.detail or {}).get("phase") or "formA_found_fallback_morph"),
-                }
+            if thr > 0 and float(bestA_morph.score) < thr:
+                rejected_by_threshold["A_morph"] = {"score": float(bestA_morph.score), "phase": "formA_found_fallback_morph"}
             else:
                 return bestA_morph
 
     # ----------------------------------
-    # Step 2: Aが見つからない → Bのfast探索
+    # Step 2: B の fast 探索
     # ----------------------------------
-
     def _eval_formB_fast(angle: float) -> dict[str, Any]:
-        rotated = rotate_image_bound(rectified_bgr, angle)
-        h, w = rotated.shape[:2]
+        rot = _get_rot(angle)
+        h, w = rot.shape[:2]
         if h > w:
             return {"angle": float(angle), "skip": True}
-        okBf, scoreBf, detBf = score_formB_fast(rotated)
-        return {
-            "angle": float(angle),
-            "skip": False,
-            "B_fast": {"ok": bool(okBf), "score": float(scoreBf), "detail": detBf},
-        }
+        okB, scoreB, detB = score_formB_fast(rot)
+        return {"angle": float(angle), "skip": False, "B_fast": {"ok": bool(okB), "score": float(scoreB), "detail": detB}}
 
     bestB_fast: Optional[FormDecision] = None
+    for r in _run_parallel(_eval_formB_fast, valid_angles):
+        if not r or r.get("skip"):
+            continue
+        _merge_scan_result(float(r["angle"]), "B_fast", r.get("B_fast"))
+        if (r.get("B_fast") or {}).get("ok"):
+            a = float(r["angle"])
+            candB = FormDecision(True, "B", a, float(r["B_fast"]["score"]), {"B_fast": r["B_fast"]["detail"], "phase": "formB_fast_found"})
+            if bestB_fast is None or candB.score > bestB_fast.score:
+                bestB_fast = candB
 
-    with ThreadPoolExecutor(max_workers=min(int(max_workers), len(scan_angles))) as ex:
-        futures = [ex.submit(_eval_formB_fast, a) for a in scan_angles]
-        for fut in as_completed(futures):
-            r = fut.result()
-            if not r or r.get("skip"):
-                continue
-            # scan_resultsに追加（B_fast情報をマージ）
-            for sr in scan_results:
-                if abs(sr.get("angle", -999) - r.get("angle", -999)) < 1e-6:
-                    sr["B_fast"] = r.get("B_fast")
-                    break
-            else:
-                scan_results.append(r)
-
-            angle = float(r["angle"])
-            if (r.get("B_fast") or {}).get("ok"):
-                candB = FormDecision(
-                    True,
-                    "B",
-                    angle,
-                    float(r["B_fast"]["score"]),
-                    {"B_fast": r["B_fast"]["detail"], "phase": "formB_fast_found"},
-                )
-                if bestB_fast is None or candB.score > bestB_fast.score:
-                    bestB_fast = candB
-
-    # fastで見つかればB確定
     if bestB_fast is not None:
-        if thr > 0 and bestB_fast.score < thr:
-            rejected_by_threshold["B_fast"] = {"score": float(bestB_fast.score), "phase": str((bestB_fast.detail or {}).get("phase") or "formB_fast_found")}
+        if thr > 0 and float(bestB_fast.score) < thr:
+            rejected_by_threshold["B_fast"] = {"score": float(bestB_fast.score), "phase": "formB_fast_found"}
         else:
             return bestB_fast
 
     # ----------------------------------
-    # Step 3: fastで見つからない → robustで再挑戦
+    # Step 3: B の robust 再挑戦
     # ----------------------------------
-
     def _eval_formB_robust(angle: float) -> dict[str, Any]:
-        rotated = rotate_image_bound(rectified_bgr, angle)
-        h, w = rotated.shape[:2]
+        rot = _get_rot(angle)
+        h, w = rot.shape[:2]
         if h > w:
             return {"angle": float(angle), "skip": True}
-        okB, scoreB, detB = score_formB(rotated)
-        return {
-            "angle": float(angle),
-            "skip": False,
-            "B_robust": {"ok": bool(okB), "score": float(scoreB), "detail": detB},
-        }
+        okB, scoreB, detB = score_formB(rot)
+        return {"angle": float(angle), "skip": False, "B_robust": {"ok": bool(okB), "score": float(scoreB), "detail": detB}}
 
     bestB_robust: Optional[FormDecision] = None
+    for r in _run_parallel(_eval_formB_robust, valid_angles):
+        if not r or r.get("skip"):
+            continue
+        _merge_scan_result(float(r["angle"]), "B_robust", r.get("B_robust"))
+        if (r.get("B_robust") or {}).get("ok"):
+            a = float(r["angle"])
+            candB = FormDecision(True, "B", a, float(r["B_robust"]["score"]), {"B": r["B_robust"]["detail"], "phase": "formB_robust_fallback"})
+            if bestB_robust is None or candB.score > bestB_robust.score:
+                bestB_robust = candB
 
-    with ThreadPoolExecutor(max_workers=min(int(max_workers), len(scan_angles))) as ex:
-        futures = [ex.submit(_eval_formB_robust, a) for a in scan_angles]
-        for fut in as_completed(futures):
-            r = fut.result()
-            if not r or r.get("skip"):
-                continue
-            # scan_resultsに追加（B_robust情報をマージ）
-            for sr in scan_results:
-                if abs(sr.get("angle", -999) - r.get("angle", -999)) < 1e-6:
-                    sr["B_robust"] = r.get("B_robust")
-                    break
-            else:
-                scan_results.append(r)
-
-            angle = float(r["angle"])
-            if (r.get("B_robust") or {}).get("ok"):
-                candB = FormDecision(
-                    True,
-                    "B",
-                    angle,
-                    float(r["B_robust"]["score"]),
-                    {"B": r["B_robust"]["detail"], "phase": "formB_robust_fallback"},
-                )
-                if bestB_robust is None or candB.score > bestB_robust.score:
-                    bestB_robust = candB
-
-    # robustで見つかればB確定
     if bestB_robust is not None:
-        if thr > 0 and bestB_robust.score < thr:
-            rejected_by_threshold["B_robust"] = {
-                "score": float(bestB_robust.score),
-                "phase": str((bestB_robust.detail or {}).get("phase") or "formB_robust_fallback"),
-            }
+        if thr > 0 and float(bestB_robust.score) < thr:
+            rejected_by_threshold["B_robust"] = {"score": float(bestB_robust.score), "phase": "formB_robust_fallback"}
         else:
             return bestB_robust
 
     # ----------------------------------
-    # Step 4: robustでも見つからなければUnknown
+    # Step 4: Unknown
     # ----------------------------------
-
-    # 閾値未満で棄却された候補があるなら、その情報を含めて Unknown を返す。
     if rejected_by_threshold:
+        best_rejected = 0.0
         try:
             best_rejected = max((float(v.get("score", 0.0)) for v in rejected_by_threshold.values()), default=0.0)
         except Exception:
@@ -5179,18 +5430,7 @@ def decide_form_by_rotations(
             },
         )
 
-    return FormDecision(
-        False,
-        None,
-        None,
-        0.0,
-        {
-            "reason": "no_detection",
-            "scan": scan_results,
-            "scan_angles": scan_angles,
-            "note": "fallback_all_failed",
-        },
-    )
+    return FormDecision(False, None, None, 0.0, {"reason": "no_detection", "scan": scan_results, "scan_angles": scan_angles, "note": "fallback_all_failed"})
 
 
 
@@ -5901,6 +6141,58 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
 
     # ----------------------------
+    # Speed profile（大幅高速化）
+    # ----------------------------
+    p.add_argument(
+        "--speed-profile",
+        choices=["auto", "fast", "accurate"],
+        default="auto",
+        help=(
+            "速度プロファイル。auto=targetのみfast/それ以外accurate。"
+            "fastは精度を多少犠牲にして大幅高速化（DocAligner/decide/uvdoc/bgdiv等を簡略化）。"
+        ),
+    )
+    p.add_argument(
+        "--extra-outputs",
+        choices=["auto", "all", "none"],
+        default="auto",
+        help=(
+            "追加の可視化出力（demo9/debug_matches）を出すか。"
+            "auto=accurateはall/fastはnone。"
+        ),
+    )
+
+    # fast profile の個別パラメータ（必要なら微調整可能）
+    p.add_argument(
+        "--fast-docaligner-input-max-side",
+        type=int,
+        default=1200,
+        help="fast profile 時の DocAligner 入力画像の最大辺(px)。小さいほど速いが検出率は落ちる。",
+    )
+    p.add_argument(
+        "--fast-rectified-max-side",
+        type=int,
+        default=1600,
+        help="fast profile 時の rectify 後画像の最大辺(px)。小さいほど速いがマーカー/QRの視認性が落ちる。",
+    )
+    p.add_argument(
+        "--fast-match-input-max-side",
+        type=int,
+        default=900,
+        help="fast profile 時の XFeat matching/warp に投入する画像の最大辺(px)。小さいほど速いが精度は落ちる。",
+    )
+    p.add_argument(
+        "--fast-skip-uvdoc",
+        action="store_true",
+        help="fast profile 時に UVDoc をスキップする（大幅高速化）。",
+    )
+    p.add_argument(
+        "--fast-skip-bgdiv",
+        action="store_true",
+        help="fast profile 時に background division をスキップする（高速化）。",
+    )
+
+    # ----------------------------
     # 入力/件数
     # ----------------------------
     p.add_argument(
@@ -6382,6 +6674,20 @@ def print_config(args: argparse.Namespace) -> None:
     print(f"  device              : {args.device}")
     print(f"  top-k               : {args.top_k}")
     print(f"  match-max-side      : {args.match_max_side} px")
+    try:
+        print(f"  speed-profile       : {getattr(args, 'speed_profile', 'auto')}")
+        print(f"  extra-outputs       : {getattr(args, 'extra_outputs', 'auto')}")
+        if str(getattr(args, 'speed_profile', 'auto')) in ("auto", "fast"):
+            print(
+                "  fast-settings       : "
+                f"doc_in_max={getattr(args, 'fast_docaligner_input_max_side', 1200)} "
+                f"rect_max={getattr(args, 'fast_rectified_max_side', 1600)} "
+                f"match_in_max={getattr(args, 'fast_match_input_max_side', 900)} "
+                f"skip_uvdoc={bool(getattr(args, 'fast_skip_uvdoc', False))} "
+                f"skip_bgdiv={bool(getattr(args, 'fast_skip_bgdiv', False))}"
+            )
+    except Exception:
+        pass
 
 
 def load_docaligner_model(model_name: str, model_type: str) -> tuple[Any, Any]:
@@ -6543,6 +6849,9 @@ def process_one_case(
     src_path = Path(di.source_path)
     case_id = str(di.case_id)
 
+    profile = resolve_speed_profile(args, dataset=str(di.source_dataset))
+    extra_outputs_mode = resolve_extra_outputs_mode(args, profile=profile)
+
     item: dict[str, Any] = {
         "source_dataset": str(di.source_dataset),
         "source_form": str(di.source_form),
@@ -6640,12 +6949,23 @@ def process_one_case(
     # DocAligner multi の候補評価でも、dataset ごとの A-geometry を反映できるよう渡す。
     formA_geom_cfg_for_case = make_formA_geom_cfg_for_case(source_dataset=str(di.source_dataset), source_form=str(di.source_form))
     t0 = time.perf_counter()
-    poly, doc_meta = detect_polygon_docaligner_multi(
-        logger=logger,
-        args=args,
-        degraded_bgr=degraded_bgr,
-        formA_geom_cfg=formA_geom_cfg_for_case,
-    )
+
+    # speed profile により DocAligner の重さを変える
+    if str(profile) == "fast":
+        poly, doc_meta = detect_polygon_docaligner_fast(
+            logger=logger,
+            degraded_bgr=degraded_bgr,
+            max_input_side_px=int(getattr(args, "fast_docaligner_input_max_side", 1200) or 1200),
+            model_name=str(getattr(args, "fast_docaligner_model", "lcnet100") or "lcnet100"),
+            model_type="heatmap",
+        )
+    else:
+        poly, doc_meta = detect_polygon_docaligner_multi(
+            logger=logger,
+            args=args,
+            degraded_bgr=degraded_bgr,
+            formA_geom_cfg=formA_geom_cfg_for_case,
+        )
     times.docaligner_s = time.perf_counter() - t0
     if poly is None:
         item["stage"] = "docaligner_failed"
@@ -6702,11 +7022,16 @@ def process_one_case(
 
     # 3) Rectify（計測対象：rectifyのみ。画像保存は計測外）
     t0 = time.perf_counter()
+
+    rectify_max_side = int(args.docaligner_max_side)
+    if str(profile) == "fast":
+        rectify_max_side = int(getattr(args, "fast_rectified_max_side", 1600) or 1600)
+
     rectified, H_deg_to_rect, overlay_poly2, rectify_meta = rectify_with_margin_and_optional_padding(
         degraded_bgr,
         polygon_xy=poly,
         margin_px=float(margin_px),
-        out_max_side=int(args.docaligner_max_side),
+        out_max_side=int(rectify_max_side),
     )
     item["rectify"] = rectify_meta
     # enforce_landscape の回転（90度CW）を考慮した homography も保持しておく（出力9で使用）
@@ -6740,62 +7065,6 @@ def process_one_case(
     #   その場合に “時間は無視して” 追加探索を行う。
     # ------------------------------------------------------------
 
-    def _make_formA_geom_cfg_for_case() -> Optional[MarkerGeometryConfig]:
-        """dataset に応じて A-geometry の緩和版cfgを作る（既存ロジックを関数化）。"""
-
-        formA_geom_cfg: Optional[MarkerGeometryConfig] = None
-
-        base_cfg_for_A: Optional[MarkerGeometryConfig] = None
-        try:
-            base_cfg_dict = (PIPELINE_DEFAULTS.get("formA") or {}).get("geometry") or {}
-            allowed = set(getattr(MarkerGeometryConfig, "__dataclass_fields__", {}).keys())
-            base_cfg_for_A = MarkerGeometryConfig(**{k: v for k, v in base_cfg_dict.items() if k in allowed})
-        except Exception:
-            base_cfg_for_A = None
-
-        # test dataset: 「正例の取りこぼし回避」を優先し、周辺白地制約を無効化
-        if str(di.source_dataset) == "test" and str(src_form) in ("A", "B"):
-            try:
-                base_cfg = base_cfg_for_A or MarkerGeometryConfig()
-                formA_geom_cfg = MarkerGeometryConfig(
-                    **{
-                        **asdict(base_cfg),
-                        "surround_min_mean_gray": 0.0,
-                        "surround_max_ink_ratio": 1.0,
-                    }
-                )
-            except Exception:
-                formA_geom_cfg = None
-
-        # target dataset: 実撮影では影・周辺減光で corner が暗くなりやすいので、
-        # A-geometry が厳しすぎて "検出はできているのに no_detection 扱い" になるケースがあるため、
-        # 取りこぼしを減らす方向で閾値を追加で緩める（recall優先）。
-        #
-        # 具体例（run_20260126_122133 の no_detection 代表例）:
-        # - marker_area_page_ratio_mean が 5e-5 を僅かに下回り `marker_too_small_for_page` になる
-        # - `marker_surrounding_not_blank` が ink_ratio の僅かな超過(0.05→0.07程度)で落ちる
-        #
-        # target は基本的に「実フォーム（A/B）の救済」が主目的のため、
-        # C->A 誤判定抑制の副作用で A を落とすより、まず検出できるようにする。
-        if formA_geom_cfg is None and str(di.source_dataset) == "target":
-            try:
-                base_cfg = base_cfg_for_A or MarkerGeometryConfig()
-                formA_geom_cfg = MarkerGeometryConfig(
-                    **{
-                        **asdict(base_cfg),
-                        # 影で corner 周りが暗くなる救済
-                        "surround_min_mean_gray": 150.0,
-                        # 机模様/枠線の写り込みで ring の ink_ratio が少し上がる救済
-                        "surround_max_ink_ratio": 0.08,
-                        # rectify 解像度/撮影距離によりマーカーが僅かに小さくなる救済
-                        "min_marker_area_page_ratio": 3.5e-5,
-                    }
-                )
-            except Exception:
-                formA_geom_cfg = None
-
-        return formA_geom_cfg
-
     def _decide_on_rectified(rectified_landscape_bgr: np.ndarray, *, relax_marker_search: bool = False) -> FormDecision:
         """rectified 画像上でフォーム判定を行う。
 
@@ -6807,6 +7076,14 @@ def process_one_case(
         """
 
         if not relax_marker_search:
+            if str(profile) == "fast":
+                return decide_form_fast(
+                    rectified_landscape_bgr,
+                    unknown_score_threshold=float(args.unknown_score_threshold),
+                    unknown_margin=float(args.unknown_margin),
+                    formA_geom_cfg=formA_geom_cfg_for_case,
+                    marker_preproc=str(getattr(args, "marker_preproc", "none") or "none"),
+                )
             return decide_form_by_rotations(
                 rectified_landscape_bgr,
                 max_workers=int(args.rotation_max_workers),
@@ -6852,6 +7129,7 @@ def process_one_case(
     item["predicted_angle_deg"] = "" if decision.angle_deg is None else float(decision.angle_deg)
 
     # form_unknown の場合のみ、polygon再推定フォールバックを試す
+    # fast profile では「時間短縮を優先」し、advanced fallback は行わない
     if (not decision.ok) or (decision.form not in ("A", "B")) or (decision.angle_deg is None):
         reason, _diag = extract_form_unknown_reason(asdict(decision))
         adv_cfg = ((PIPELINE_DEFAULTS.get("docaligner") or {}).get("advanced_fallback") or {})
@@ -6861,7 +7139,7 @@ def process_one_case(
         # C は「棄却が正しい」ため無駄な再探索をしない。
         allow_retry = bool(str(src_form) in ("A", "B") or str(di.source_dataset) == "target")
 
-        if allow_retry and adv_enable and adv_trigger and str(reason) == "no_detection":
+        if str(profile) != "fast" and allow_retry and adv_enable and adv_trigger and str(reason) == "no_detection":
             t_adv0 = time.perf_counter()
             poly_adv = detect_polygon_fallback_advanced(degraded_bgr)
             times.docaligner_s += time.perf_counter() - t_adv0
@@ -7040,29 +7318,34 @@ def process_one_case(
     _schedule_image("output_rotated_decision_visualization_image_path", out_rot, rot_vis)
 
     # 5) UVDoc unwarp（成形）（計測対象：推論のみ。画像保存は計測外）
-    t0 = time.perf_counter()
-    uvdoc: Optional[UVDocUnwrapper] = getattr(process_one_case, "_uvdoc", None)
-    if uvdoc is None:
-        item["stage"] = "uvdoc_failed"
-        item["ok"] = False
-        item["ok_warp"] = False
-        _finalize_images_for_stage(item["stage"])
-        item["case_total_s"] = float(times.degrade_s + times.docaligner_s + times.rectify_s + times.decide_s)
-        return item, times
+    # fast profile では原則スキップ（大幅高速化）
+    if str(profile) == "fast" or bool(getattr(args, "fast_skip_uvdoc", False)):
+        chosen_unwarped = chosen
+        item["uvdoc"] = {"ok": False, "skipped": True}
+    else:
+        t0 = time.perf_counter()
+        uvdoc: Optional[UVDocUnwrapper] = getattr(process_one_case, "_uvdoc", None)
+        if uvdoc is None:
+            item["stage"] = "uvdoc_failed"
+            item["ok"] = False
+            item["ok_warp"] = False
+            _finalize_images_for_stage(item["stage"])
+            item["case_total_s"] = float(times.degrade_s + times.docaligner_s + times.rectify_s + times.decide_s)
+            return item, times
 
-    try:
-        chosen_unwarped = uvdoc.unwarp_bgr(chosen)
-        item["uvdoc"] = {"ok": True}
-    except Exception as e:
-        item["uvdoc"] = {"ok": False, "error": str(e)}
-        item["stage"] = "uvdoc_failed"
-        item["ok"] = False
-        item["ok_warp"] = False
-        _finalize_images_for_stage(item["stage"])
-        item["case_total_s"] = float(times.degrade_s + times.docaligner_s + times.rectify_s + times.decide_s)
-        return item, times
+        try:
+            chosen_unwarped = uvdoc.unwarp_bgr(chosen)
+            item["uvdoc"] = {"ok": True}
+        except Exception as e:
+            item["uvdoc"] = {"ok": False, "error": str(e)}
+            item["stage"] = "uvdoc_failed"
+            item["ok"] = False
+            item["ok_warp"] = False
+            _finalize_images_for_stage(item["stage"])
+            item["case_total_s"] = float(times.degrade_s + times.docaligner_s + times.rectify_s + times.decide_s)
+            return item, times
 
-    times.uvdoc_s = time.perf_counter() - t0
+        times.uvdoc_s = time.perf_counter() - t0
     out_uvdoc = out_dirs["uvdoc"] / f"{case_id}_uvdoc.jpg"
     _schedule_image("output_uvdoc_unwarped_image_path", out_uvdoc, chosen_unwarped)
     try:
@@ -7073,20 +7356,38 @@ def process_one_case(
         pass
 
     # 6) 背景除算法（Background Division）（計測対象：補正のみ。画像保存は計測外）
-    t0 = time.perf_counter()
-    bgdiv_bgr, bgdiv_meta = apply_background_division(chosen_unwarped)
-    times.bgdiv_s = time.perf_counter() - t0
-    item["background_division"] = bgdiv_meta
-    out_bgdiv = out_dirs["bgdiv"] / f"{case_id}_bgdiv.jpg"
-    _schedule_image("output_background_division_image_path", out_bgdiv, bgdiv_bgr)
-    try:
-        hb, wb = bgdiv_bgr.shape[:2]
-        item["bgdiv_w"] = int(wb)
-        item["bgdiv_h"] = int(hb)
-    except Exception:
-        pass
+    # fast profile では原則スキップ（高速化）
+    if str(profile) == "fast" or bool(getattr(args, "fast_skip_bgdiv", False)):
+        bgdiv_bgr = chosen_unwarped
+        bgdiv_meta = {"applied": False, "skipped": True}
+        item["background_division"] = bgdiv_meta
+        item["output_background_division_image_path"] = ""
+        item["bgdiv_w"] = ""
+        item["bgdiv_h"] = ""
+    else:
+        t0 = time.perf_counter()
+        bgdiv_bgr, bgdiv_meta = apply_background_division(chosen_unwarped)
+        times.bgdiv_s = time.perf_counter() - t0
+        item["background_division"] = bgdiv_meta
+        out_bgdiv = out_dirs["bgdiv"] / f"{case_id}_bgdiv.jpg"
+        _schedule_image("output_background_division_image_path", out_bgdiv, bgdiv_bgr)
+        try:
+            hb, wb = bgdiv_bgr.shape[:2]
+            item["bgdiv_w"] = int(wb)
+            item["bgdiv_h"] = int(hb)
+        except Exception:
+            pass
 
+    # matching 入力は profile に応じて縮小
     chosen_for_match = bgdiv_bgr
+    if str(profile) == "fast":
+        try:
+            chosen_for_match, _s_match = resize_keep_aspect(
+                chosen_for_match,
+                int(getattr(args, "fast_match_input_max_side", 900) or 900),
+            )
+        except Exception:
+            pass
 
     # 7) XFeat matching（計測対象：照合のみ。画像保存は計測外）
     #   ユーザー要望: "絞り込みをやめる"。
@@ -7285,53 +7586,59 @@ def process_one_case(
     # ------------------------------------------------------------
     # 出力9: デモ画像（時間計測対象外）
     # ------------------------------------------------------------
-    try:
-        # decide の根拠（chosen座標系）
-        decision_markers: Optional[list[dict[str, Any]]] = None
-        decision_qrs: Optional[list[dict[str, Any]]] = None
-        if str(decision.form) == "A":
-            decision_markers = ((decision.detail or {}).get("A") or {}).get("markers") or None
-        elif str(decision.form) == "B":
-            # phase により B / B_fast どちらかに入る
-            dB = (decision.detail or {}).get("B")
-            dBf = (decision.detail or {}).get("B_fast")
-            decision_qrs = (dB or {}).get("qrs") or (dBf or {}).get("qrs") or None
+    if str(extra_outputs_mode) == "all":
+        try:
+            # decide の根拠（chosen座標系）
+            decision_markers: Optional[list[dict[str, Any]]] = None
+            decision_qrs: Optional[list[dict[str, Any]]] = None
+            if str(decision.form) == "A":
+                decision_markers = ((decision.detail or {}).get("A") or {}).get("markers") or None
+            elif str(decision.form) == "B":
+                # phase により B / B_fast どちらかに入る
+                dB = (decision.detail or {}).get("B")
+                dBf = (decision.detail or {}).get("B_fast")
+                decision_qrs = (dB or {}).get("qrs") or (dBf or {}).get("qrs") or None
 
-        demo9 = _generate_demo9_image(
-            degraded_bgr=degraded_bgr,
-            polygon_xy=poly,
-            polygon_margin_px=float(margin_px),
-            H_degraded_to_rectified_landscape=np.asarray(H_deg_to_rect_land, dtype=np.float64),
-            rectified_landscape_size_wh=(int(rectified.shape[1]), int(rectified.shape[0])),
-            decided_form=str(decision.form),
-            decided_angle_deg=float(decision.angle_deg),
-            decision_markers=decision_markers,
-            decision_qrs=decision_qrs,
-            aligned_bgr=warped_final,
-        )
+            demo9 = _generate_demo9_image(
+                degraded_bgr=degraded_bgr,
+                polygon_xy=poly,
+                polygon_margin_px=float(margin_px),
+                H_degraded_to_rectified_landscape=np.asarray(H_deg_to_rect_land, dtype=np.float64),
+                rectified_landscape_size_wh=(int(rectified.shape[1]), int(rectified.shape[0])),
+                decided_form=str(decision.form),
+                decided_angle_deg=float(decision.angle_deg),
+                decision_markers=decision_markers,
+                decision_qrs=decision_qrs,
+                aligned_bgr=warped_final,
+            )
 
-        out_demo = out_dirs.get("demo")
-        if out_demo is not None:
-            out_demo9 = Path(out_demo) / f"{case_id}_demo9.jpg"
-            write_image(out_demo9, demo9, jpeg_quality=jpeg_quality)
-            item["output_demo9_image_path"] = str(out_demo9)
-        else:
+            out_demo = out_dirs.get("demo")
+            if out_demo is not None:
+                out_demo9 = Path(out_demo) / f"{case_id}_demo9.jpg"
+                write_image(out_demo9, demo9, jpeg_quality=jpeg_quality)
+                item["output_demo9_image_path"] = str(out_demo9)
+            else:
+                item["output_demo9_image_path"] = ""
+        except Exception:
             item["output_demo9_image_path"] = ""
-    except Exception:
+    else:
         item["output_demo9_image_path"] = ""
 
     # 6_debug_matches（best template のマッチ可視化）
     # ユーザー要望: 本番ではない処理のため、時間計測から除外する。
-    try:
-        # best の mkpts（ループ中に保持したもの）で可視化する。
-        if best_mk0 is not None and best_mk1 is not None:
-            dbg = draw_inlier_matches(tpl_bgr, chosen_for_match, best_mk0, best_mk1, args.match_max_side)
-            out_dbg = out_dirs["debug_matches"] / f"{case_id}_matches.jpg"
-            # debug_matches は保存モードに関係なく必ず保存（ただし計測外）
-            write_image(out_dbg, dbg, jpeg_quality=jpeg_quality)
-            item["output_debug_matches_image_path"] = str(out_dbg)
-    except Exception:
-        pass
+    if str(extra_outputs_mode) == "all":
+        try:
+            # best の mkpts（ループ中に保持したもの）で可視化する。
+            if best_mk0 is not None and best_mk1 is not None:
+                dbg = draw_inlier_matches(tpl_bgr, chosen_for_match, best_mk0, best_mk1, args.match_max_side)
+                out_dbg = out_dirs["debug_matches"] / f"{case_id}_matches.jpg"
+                # debug_matches は保存モードに関係なく必ず保存（ただし計測外）
+                write_image(out_dbg, dbg, jpeg_quality=jpeg_quality)
+                item["output_debug_matches_image_path"] = str(out_dbg)
+        except Exception:
+            pass
+    else:
+        item["output_debug_matches_image_path"] = ""
 
     item["stage"] = "done"
     item["ok_warp"] = True
@@ -7380,439 +7687,55 @@ def process_one_observed_case(
     ground_truth_template_number: str,
     source_dataset: str = "test",
 ) -> tuple[dict[str, Any], StageTimes]:
-    """image/test のような「観測画像」を処理する。
+    """観測画像（degrade無し）を *process_one_case* と同じ経路で処理する薄いラッパー。
 
-    - 改悪生成（degrade）は行わない
-    - ファイル名から得た ground truth を item に入れる
-    - DocAligner → rectify → decide → XFeat → warp の通常処理を適用
+    NOTE:
+      - 現行の main() からは呼ばれていませんが、将来の利用/手動デバッグ用に残しています。
+      - 実装の二重化（process_one_observed_case 側だけ古くなる/壊れる）を避けるため、
+        DegradedCaseInput を作って process_one_case に委譲します。
     """
 
-    # v18.7 方針: 改悪生成以外でも「画像保存等の周辺処理」は時間計測に含めない。
-    # この関数は現状 main() からは呼ばれていないが、今後使われても整合するよう
-    # case_total_s は stage time の合計で計算する。
-    case_id = f"test_{src_path.stem}"
-    item: dict[str, Any] = {
-        "source_dataset": str(source_dataset),
-        "source_form": str(src_form),
-        "source_path": str(src_path),
-        "case": case_id,
-        "ok": False,
-        "ok_warp": False,
-        "stage": "start",
-        "degraded_variant_index": "",
-        # ground truth override
-        "ground_truth_form": str(ground_truth_form),
-        "ground_truth_template_path": str(ground_truth_template_path),
-        "ground_truth_template_number": str(ground_truth_template_number),
-    }
-    times = StageTimes()
-    times.degrade_s = 0.0
+    if src_bgr is None:
+        raise ValueError("src_bgr is None")
 
-    # ------------------------------------------------------------
-    # 画像保存モード（B-1）
-    # ------------------------------------------------------------
+    h0, w0 = src_bgr.shape[:2]
+    case_id = f"{str(source_dataset)}_{src_path.stem}" if src_path and src_path.stem else f"{str(source_dataset)}_observed"
 
-    save_mode = str(getattr(args, "save_images", "all"))
-    jpeg_quality = int((PIPELINE_DEFAULTS.get("save_images") or {}).get("jpeg_quality") or 95)
-    pending_images: list[tuple[str, Path, np.ndarray]] = []
-
-    def _schedule_image(field_name: str, path: Path, img: np.ndarray) -> None:
-        if save_mode == "all":
-            write_image(path, img, jpeg_quality=jpeg_quality)
-            item[field_name] = str(path)
-        elif save_mode == "fail":
-            pending_images.append((field_name, path, img))
-            item[field_name] = ""
-        else:
-            item[field_name] = ""
-
-    def _finalize_images_for_stage(stage: str) -> None:
-        if save_mode != "fail":
-            return
-        if str(stage) == "done":
-            return
-        for field_name, path, img in pending_images:
-            write_image(path, img, jpeg_quality=jpeg_quality)
-            item[field_name] = str(path)
-
-    try:
-        h0, w0 = src_bgr.shape[:2]
-        item["source_w"] = int(w0)
-        item["source_h"] = int(h0)
-    except Exception:
-        pass
-
-    # 1) degrade をスキップし、観測画像をそのまま degraded 扱いにする
-    degraded_bgr = src_bgr
-    item["stage"] = "degraded"
-    item["degrade"] = {"mode": "test_skip"}
-    try:
-        hd, wd = degraded_bgr.shape[:2]
-        item["degraded_w"] = int(wd)
-        item["degraded_h"] = int(hd)
-    except Exception:
-        pass
     out_degraded = out_dirs["degraded"] / f"{case_id}.jpg"
-    _schedule_image("output_degraded_image_path", out_degraded, degraded_bgr)
+    jpeg_quality = int((PIPELINE_DEFAULTS.get("save_images") or {}).get("jpeg_quality") or 95)
+    if str(getattr(args, "save_images", "all")) == "all":
+        # process_one_case は「事前に1_degradedが保存されている」想定のため、ここで合わせる
+        write_image(out_degraded, src_bgr, jpeg_quality=jpeg_quality)
 
-    # 2) DocAligner
-    t0 = time.perf_counter()
-    poly, doc_meta = detect_polygon_docaligner_multi(
+    di = DegradedCaseInput(
+        source_dataset=str(source_dataset),
+        source_form=str(src_form),
+        source_path=Path(src_path),
+        source_w=int(w0),
+        source_h=int(h0),
+        degraded_variant_index=0,
+        case_id=str(case_id),
+        degraded_bgr=src_bgr,
+        H_src_to_degraded=np.eye(3, dtype=np.float64),
+        degrade_meta={"mode": "observed_skip_degrade"},
+        output_degraded_image_path=Path(out_degraded),
+        ground_truth_form=str(ground_truth_form),
+        ground_truth_template_path=Path(ground_truth_template_path) if ground_truth_template_path else None,
+        ground_truth_template_number=str(ground_truth_template_number),
+    )
+
+    return process_one_case(
         logger=logger,
         args=args,
-        degraded_bgr=degraded_bgr,
-        formA_geom_cfg=make_formA_geom_cfg_for_case(source_dataset=str(source_dataset), source_form=str(src_form)),
+        model=model,
+        cb=cb,
+        matcher=matcher,
+        cached_matcher=cached_matcher,
+        templates_A=templates_A,
+        templates_B=templates_B,
+        degraded_input=di,
+        out_dirs=out_dirs,
     )
-    times.docaligner_s = time.perf_counter() - t0
-    if poly is None:
-        item["stage"] = "docaligner_failed"
-        item["docaligner_multi"] = doc_meta
-        _finalize_images_for_stage(item["stage"])
-        item["case_total_s"] = float(times.degrade_s + times.docaligner_s)
-        return item, times
-
-    item["stage"] = "docaligner_ok"
-    item["polygon"] = poly.astype(float).tolist()
-    item["docaligner_multi"] = doc_meta
-
-    # polygon margin
-    picked_margin_px = None
-    try:
-        if isinstance(doc_meta, dict) and isinstance(doc_meta.get("best"), dict):
-            picked_margin_px = float(doc_meta["best"].get("margin_px"))
-    except Exception:
-        picked_margin_px = None
-
-    if picked_margin_px is not None and math.isfinite(float(picked_margin_px)):
-        margin_px = float(picked_margin_px)
-        item["polygon_margin"] = {"mode": "picked_by_eval", "value": float(margin_px)}
-    elif float(getattr(args, "polygon_margin_px", 0.0)) > 0:
-        margin_px = float(args.polygon_margin_px)
-        item["polygon_margin"] = {"mode": "fixed_px", "value": margin_px}
-    else:
-        margin_px = polygon_margin_px_from_ratio(
-            poly,
-            ratio=float(args.polygon_margin_ratio),
-            min_px=float(args.polygon_margin_min_px),
-            max_px=float(args.polygon_margin_max_px),
-        )
-        item["polygon_margin"] = {
-            "mode": "ratio",
-            "ratio": float(args.polygon_margin_ratio),
-            "min_px": float(args.polygon_margin_min_px),
-            "max_px": float(args.polygon_margin_max_px),
-            "computed_px": float(margin_px),
-        }
-
-    poly_exp = expand_polygon(
-        poly,
-        margin_px=float(margin_px),
-        img_w=int(degraded_bgr.shape[1]),
-        img_h=int(degraded_bgr.shape[0]),
-    )
-    overlay = draw_polygon_overlay(degraded_bgr, poly_exp)
-    out_doc = out_dirs["doc"] / f"{case_id}_doc.jpg"
-    _schedule_image("output_doc_overlay_image_path", out_doc, overlay)
-
-    # 3) Rectify
-    t0 = time.perf_counter()
-    rectified, H_deg_to_rect = polygon_to_rectified(degraded_bgr, poly_exp, out_max_side=int(args.docaligner_max_side))
-    rectified, _ = enforce_landscape(rectified)
-    times.rectify_s = time.perf_counter() - t0
-    item["stage"] = "rectified"
-    item["H_degraded_to_rectified"] = H_deg_to_rect.astype(float).tolist()
-    out_rect = out_dirs["rect"] / f"{case_id}_rect.jpg"
-    _schedule_image("output_rectified_image_path", out_rect, rectified)
-    try:
-        hr, wr = rectified.shape[:2]
-        item["rectified_w"] = int(wr)
-        item["rectified_h"] = int(hr)
-    except Exception:
-        pass
-
-    # 4) decide
-    t0 = time.perf_counter()
-    decision = decide_form_by_rotations(
-        rectified,
-        max_workers=int(args.rotation_max_workers),
-        marker_preproc=str(args.marker_preproc),
-        unknown_score_threshold=float(args.unknown_score_threshold),
-        unknown_margin=float(args.unknown_margin),
-    )
-    times.decide_s = time.perf_counter() - t0
-    item["form_decision"] = asdict(decision)
-    item["predicted_form"] = str(decision.form or "")
-    item["predicted_angle_deg"] = "" if decision.angle_deg is None else float(decision.angle_deg)
-
-    if not decision.ok or decision.form not in ("A", "B") or decision.angle_deg is None:
-        item["stage"] = "form_unknown"
-        # 期待動作:
-        # - test/C は A/B として認識されない（form_unknown が成功扱い）
-        # - test/A,B は form_unknown になってはいけない
-        item["ok"] = bool(str(ground_truth_form) == "C")
-        item["ok_warp"] = False
-        _finalize_images_for_stage(item["stage"])
-        item["case_total_s"] = float(times.degrade_s + times.docaligner_s + times.rectify_s + times.decide_s)
-        return item, times
-
-    item["stage"] = "form_found"
-
-    # 正解フォーム（test では必ず定義される想定）
-    item["is_predicted_form_correct"] = bool(str(decision.form) == str(ground_truth_form))
-
-    chosen = rotate_image_bound(rectified, float(decision.angle_deg))
-    try:
-        hc, wc = chosen.shape[:2]
-        item["chosen_w"] = int(wc)
-        item["chosen_h"] = int(hc)
-    except Exception:
-        pass
-
-    # 判定根拠可視化
-    if decision.form == "A":
-        markers = ((decision.detail or {}).get("A") or {}).get("markers") or []
-        rot_vis = draw_formA_markers_overlay(chosen, markers)
-    else:
-        qrs = ((decision.detail or {}).get("B") or {}).get("qrs")
-        if not qrs:
-            wechat = getattr(score_formB, "_wechat", None)
-            if wechat is not None:
-                qrs = detect_qr_codes_wechat_multiscale(chosen, wechat)
-        rot_vis = draw_formB_qr_overlay(chosen, qrs)
-    out_rot = out_dirs["rot"] / f"{case_id}_rot.jpg"
-    _schedule_image("output_rotated_decision_visualization_image_path", out_rot, rot_vis)
-
-    # 5) UVDoc unwarp（成形）
-    t0 = time.perf_counter()
-    uvdoc: Optional[UVDocUnwrapper] = getattr(process_one_case, "_uvdoc", None)
-    if uvdoc is None:
-        item["stage"] = "uvdoc_failed"
-        _finalize_images_for_stage(item["stage"])
-        item["case_total_s"] = float(times.degrade_s + times.docaligner_s + times.rectify_s + times.decide_s)
-        return item, times
-    try:
-        chosen_unwarped = uvdoc.unwarp_bgr(chosen)
-        item["uvdoc"] = {"ok": True}
-    except Exception as e:
-        item["uvdoc"] = {"ok": False, "error": str(e)}
-        item["stage"] = "uvdoc_failed"
-        _finalize_images_for_stage(item["stage"])
-        item["case_total_s"] = float(times.degrade_s + times.docaligner_s + times.rectify_s + times.decide_s)
-        return item, times
-    times.uvdoc_s = time.perf_counter() - t0
-    out_uvdoc = out_dirs["uvdoc"] / f"{case_id}_uvdoc.jpg"
-    _schedule_image("output_uvdoc_unwarped_image_path", out_uvdoc, chosen_unwarped)
-    try:
-        hu, wu = chosen_unwarped.shape[:2]
-        item["uvdoc_w"] = int(wu)
-        item["uvdoc_h"] = int(hu)
-    except Exception:
-        pass
-
-    # 背景除算法（Background Division）
-    t0 = time.perf_counter()
-    bgdiv_bgr, bgdiv_meta = apply_background_division(chosen_unwarped)
-    times.bgdiv_s = time.perf_counter() - t0
-    item["background_division"] = bgdiv_meta
-    out_bgdiv = out_dirs["bgdiv"] / f"{case_id}_bgdiv.jpg"
-    _schedule_image("output_background_division_image_path", out_bgdiv, bgdiv_bgr)
-
-    try:
-        hb, wb = bgdiv_bgr.shape[:2]
-        item["bgdiv_w"] = int(wb)
-        item["bgdiv_h"] = int(hb)
-    except Exception:
-        pass
-
-    chosen_for_match = bgdiv_bgr
-
-    # 7) XFeat matching
-    t0 = time.perf_counter()
-    templates = templates_A if decision.form == "A" else templates_B
-    candidates = list(templates)
-    item["template_prefilter"] = {
-        "mode": "disabled",
-        "topn": 0,
-        "candidates": [c.template_path for c in candidates],
-        "total": len(templates),
-        "note": "test dataset; matched against all templates",
-    }
-
-    template_candidate_results: list[dict[str, Any]] = []
-
-    # rotate は複数フェーズ（A / A_morph / B_fast / B_robust）で使い回すため、
-    # 角度ごとに1回だけ生成してキャッシュする。
-    rotated_cache: dict[float, np.ndarray] = {}
-    skip_cache: dict[float, bool] = {}
-    for a in scan_angles:
-        aa = float(a)
-        rot = rotate_image_bound(rectified_bgr, aa)
-        rotated_cache[aa] = rot
-        try:
-            hh, ww = rot.shape[:2]
-            skip_cache[aa] = bool(hh > ww)
-        except Exception:
-            skip_cache[aa] = True
-    best: Optional[dict[str, Any]] = None
-
-    tgt_prepared_out1: Optional[dict[str, Any]] = None
-    tgt_prepared_invS: Optional[np.ndarray] = None
-    if cached_matcher is not None:
-        try:
-            tgt_prepared_out1, _s_tgt, tgt_prepared_invS = cached_matcher.prepare_target(chosen_for_match)
-        except Exception:
-            tgt_prepared_out1, tgt_prepared_invS = None, None
-
-    for ref in candidates:
-        tp = Path(ref.template_path)
-        if cached_matcher is not None:
-            if tgt_prepared_out1 is not None and tgt_prepared_invS is not None:
-                res, H_tpl_to_img, mk0, mk1 = cached_matcher.match_with_cached_ref_and_prepared_target(
-                    ref,
-                    out1=tgt_prepared_out1,
-                    invS_tgt=tgt_prepared_invS,
-                )
-            else:
-                res, H_tpl_to_img, mk0, mk1 = cached_matcher.match_with_cached_ref(ref, chosen_for_match)
-        else:
-            tpl_bgr = cv2.imread(str(tp))
-            if tpl_bgr is None:
-                continue
-            res, H_tpl_to_img, mk0, mk1 = matcher.match_and_estimate_h(tpl_bgr, chosen_for_match)
-
-        ok = bool(getattr(res, "ok", False)) and H_tpl_to_img is not None
-        cand = {
-            "template": str(tp),
-            "ok": ok,
-            "inliers": int(getattr(res, "inliers", 0)),
-            "matches": int(getattr(res, "matches", 0)),
-            "inlier_ratio": float(getattr(res, "inlier_ratio", 0.0)),
-            "reproj_rms": getattr(res, "reproj_rms", None),
-        }
-        if ok and getattr(res, "H_ref_to_tgt", None) is not None:
-            cand["H_ref_to_tgt"] = getattr(res, "H_ref_to_tgt")
-        template_candidate_results.append(cand)
-
-        if best is None:
-            best = cand
-            best_ref_obj = ref
-            best_tpl_bgr = tpl_bgr if cached_matcher is None else getattr(ref, "template_bgr", None)
-        else:
-            if int(cand.get("inliers", 0)) > int(best.get("inliers", 0)):
-                best = cand
-            elif int(cand.get("inliers", 0)) == int(best.get("inliers", 0)):
-                best_ref_obj = ref
-                best_tpl_bgr = tpl_bgr if cached_matcher is None else getattr(ref, "template_bgr", None)
-                if float(cand.get("inlier_ratio", 0.0)) > float(best.get("inlier_ratio", 0.0)):
-                    best = cand
-
-    times.match_s = time.perf_counter() - t0
-                    best_ref_obj = ref
-                    best_tpl_bgr = tpl_bgr if cached_matcher is None else getattr(ref, "template_bgr", None)
-    item["best_match"] = best
-    item["template_match_candidates"] = template_candidate_results
-
-    if best is None or not best.get("ok"):
-        item["stage"] = "xfeat_failed"
-        _finalize_images_for_stage(item["stage"])
-        item["case_total_s"] = float(
-            times.degrade_s
-            + times.docaligner_s
-            + times.rectify_s
-            + times.decide_s
-            + times.uvdoc_s
-            + times.bgdiv_s
-            + times.match_s
-        )
-        return item, times
-    tpl_path = Path(str(best["template"]))
-    tpl_bgr = best_tpl_bgr
-    if tpl_bgr is None and best_ref_obj is not None:
-        tpl_bgr = getattr(best_ref_obj, "template_bgr", None)
-    if tpl_bgr is None:
-        tpl_bgr = cv2.imread(str(tpl_path))
-    tpl_bgr = cv2.imread(str(tpl_path))
-    if tpl_bgr is None:
-        item["stage"] = "template_read_failed"
-        _finalize_images_for_stage(item["stage"])
-        item["case_total_s"] = float(
-            times.degrade_s
-            + times.docaligner_s
-            + times.rectify_s
-            + times.decide_s
-            + times.uvdoc_s
-            + times.bgdiv_s
-            + times.match_s
-        )
-        return item, times
-
-    # test: 正解テンプレは ground_truth_template_path
-    try:
-        item["is_predicted_best_template_correct"] = bool(tpl_path.name == Path(str(ground_truth_template_path)).name)
-    except Exception:
-        item["is_predicted_best_template_correct"] = False
-
-    try:
-        ht, wt = tpl_bgr.shape[:2]
-        item["best_template_w"] = int(wt)
-        item["best_template_h"] = int(ht)
-    except Exception:
-        pass
-
-    # 8) Homography inversion & warp
-    t0 = time.perf_counter()
-    H_tpl_to_img = np.asarray(best.get("H_ref_to_tgt"), dtype=np.float64)
-    ok_inv, H_img_to_tpl, inv_reason, h_cond, h_det = safe_invert_homography(
-        H_tpl_to_img,
-        inliers=int(best.get("inliers", 0)),
-        inlier_ratio=float(best.get("inlier_ratio", 0.0)),
-        min_inliers=int(args.min_inliers_for_warp),
-        min_inlier_ratio=float(args.min_inlier_ratio_for_warp),
-    tpl_path = Path(str(best["template"]))
-    tpl_bgr = best_tpl_bgr
-    if tpl_bgr is None and best_ref_obj is not None:
-        tpl_bgr = getattr(best_ref_obj, "template_bgr", None)
-    if tpl_bgr is None:
-        tpl_bgr = cv2.imread(str(tpl_path))
-    item["homography_inv"] = {"ok": bool(ok_inv), "reason": inv_reason, "cond": h_cond, "det": h_det}
-    if not ok_inv or H_img_to_tpl is None:
-        item["stage"] = "homography_unstable"
-        _finalize_images_for_stage(item["stage"])
-        item["case_total_s"] = float(
-            times.degrade_s
-            + times.docaligner_s
-            + times.rectify_s
-            + times.decide_s
-            + times.uvdoc_s
-            + times.bgdiv_s
-            + times.match_s
-            + times.warp_s
-        )
-        return item, times
-
-    warped_final = cv2.warpPerspective(chosen_for_match, H_img_to_tpl, (tpl_bgr.shape[1], tpl_bgr.shape[0]))
-    out_aligned = out_dirs["aligned"] / f"{case_id}_aligned.jpg"
-    # v18.7: aligned は成果物なので save-images に関係なく必ず保存し、保存時間も計測に含める。
-    write_image(out_aligned, warped_final, jpeg_quality=jpeg_quality)
-    item["output_aligned_image_path"] = str(out_aligned)
-    times.warp_s = time.perf_counter() - t0
-    item["ok_warp"] = True
-
-    # done
-    item["stage"] = "done"
-    item["ok"] = bool(item.get("is_predicted_form_correct")) and bool(item.get("is_predicted_best_template_correct"))
-    item["case_total_s"] = float(
-        times.degrade_s
-        + times.docaligner_s
-        + times.rectify_s
-        + times.decide_s
-        + times.uvdoc_s
-        + times.bgdiv_s
-        + times.match_s
-        + times.warp_s
-    )
-    _finalize_images_for_stage(item["stage"])
-    return item, times
 
 
 def main(argv=None) -> int:
@@ -7861,8 +7784,7 @@ def main(argv=None) -> int:
     matcher = XFeatMatcher(top_k=args.top_k, device=device, match_max_side=args.match_max_side)
     logger.info("[OK] XFeat loaded")
 
-    # v18.13: デフォルトは target-only。
-    # src-forms が空でも、target_limit が有効なら実行できる。
+    # デフォルトは synthetic/test/target を処理する（必要に応じて各limitで絞る）。
     src_forms = [s.strip() for s in str(args.src_forms).split(",") if s.strip()]
     src_forms = [s for s in src_forms if s in ("A", "B", "C")]
     test_limit = int(getattr(args, "test_limit", 0) or 0)
@@ -8060,7 +7982,7 @@ def main(argv=None) -> int:
                     degraded_inputs.append(di)
 
     # test dataset も先に改悪生成する（計測対象外）
-    # v18.13: default は target-only（test は skip）。
+    # NOTE(2026-01-27): デフォルトで test_limit=-1（all）を処理する。
     test_paths = list_test_images()
     test_limit = int(getattr(args, "test_limit", 0) or 0)
     if test_limit == 0:
