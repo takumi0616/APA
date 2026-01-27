@@ -2080,26 +2080,8 @@ def _offset_quad_by_normals(poly_xy: np.ndarray, margin_px: float) -> Optional[n
     return order_quad_tl_tr_br_bl(out)
 
 
-def expand_polygon(
-    polygon_xy: np.ndarray,
-    margin_px: float,
-    img_w: int,
-    img_h: int,
-    *,
-    clip_to_image: bool = True,
-) -> np.ndarray:
-    """polygon を margin_px だけ外側に広げる。
-
-    v17.18+（精度優先）:
-      - 従来は最後に np.clip で画像内へ押し込めていたが、
-        margin を大きくすると「clip により四角形が潰れる」→ rectify が破綻しやすい。
-      - rectify 用には *入力画像側を pad する* ことで、原則 clip を不要にする。
-
-    Args:
-      clip_to_image:
-        True : 従来通り画像内へ clamp（デバッグ描画など安全側）
-        False: clamp しない（pad 済みキャンバス上で rectify する用途）
-    """
+def expand_polygon(polygon_xy: np.ndarray, margin_px: float, img_w: int, img_h: int) -> np.ndarray:
+    """polygon を margin_px だけ外側に広げる（可能な範囲で）。"""
 
     poly = np.asarray(polygon_xy, dtype=np.float32).reshape(4, 2)
     if margin_px <= 0:
@@ -2124,9 +2106,8 @@ def expand_polygon(
                 pts.append(pt + (v / n) * float(margin_px))
         out = order_quad_tl_tr_br_bl(np.asarray(pts, dtype=np.float32))
 
-    if bool(clip_to_image):
-        out[:, 0] = np.clip(out[:, 0], 0, max(0, img_w - 1))
-        out[:, 1] = np.clip(out[:, 1], 0, max(0, img_h - 1))
+    out[:, 0] = np.clip(out[:, 0], 0, max(0, img_w - 1))
+    out[:, 1] = np.clip(out[:, 1], 0, max(0, img_h - 1))
     return out
 
 
@@ -2279,14 +2260,13 @@ def rectify_with_margin_and_optional_padding(
     poly = order_quad_tl_tr_br_bl(np.asarray(polygon_xy, dtype=np.float32).reshape(4, 2))
 
     # まず overlay 用（従来通り degraded 画像内で clamp）
-    poly_exp_overlay = expand_polygon(poly, float(margin_px), img_w=int(w), img_h=int(h), clip_to_image=True)
+    poly_exp_overlay = expand_polygon(poly, float(margin_px), img_w=int(w), img_h=int(h))
 
     # rectify 用は padding したキャンバス上で expand する
     padded, T_deg_to_pad, pad_meta = _apply_rectify_padding(image_bgr, required_margin_px=float(margin_px))
     Hp, Wp = padded.shape[:2]
     poly_pad = (poly + np.array([[float(T_deg_to_pad[0, 2]), float(T_deg_to_pad[1, 2])]], dtype=np.float32)).astype(np.float32)
-    # rectify 用は pad 済みのため、原則 clip しない（四角形が潰れるのを防ぐ）
-    poly_exp_pad = expand_polygon(poly_pad, float(margin_px), img_w=int(Wp), img_h=int(Hp), clip_to_image=False)
+    poly_exp_pad = expand_polygon(poly_pad, float(margin_px), img_w=int(Wp), img_h=int(Hp))
     rectified, H_pad_to_rect = polygon_to_rectified(padded, poly_exp_pad, out_max_side=int(out_max_side))
 
     # degraded -> rectified の変換へ落とし込む
@@ -2987,12 +2967,11 @@ def _recover_quad_from_edges(
         a1 = float(centers[i1])
 
         def _select_group(center_angle: float, tol: float = float(np.pi / 18.0)) -> np.ndarray:
-            # 角度は [0..pi)（向きの符号を潰した“方向”）なので、circular distance は
-            #   da = min(|a-c|, pi-|a-c|)
-            # が正しい。
-            da = np.abs(ang - float(center_angle))
-            da = np.minimum(da, float(np.pi) - da)
-            return segs[da < float(tol)]
+            da = np.abs(((ang - center_angle + np.pi) % np.pi) - np.pi / 2.0)
+            # 上式は微妙なので、単純に circular distance を使う
+            da = np.abs(((ang - center_angle + np.pi) % np.pi) - np.pi)
+            da = np.minimum(da, np.pi - da)
+            return segs[da < tol]
 
         g0 = _select_group(a0)
         g1 = _select_group(a1)
@@ -3124,7 +3103,6 @@ def normalize_polygon_to_quad_with_meta(
     if pts.shape[0] == 4:
         try:
             quad0 = order_quad_tl_tr_br_bl(pts)
-            min_pair = _min_pairwise_distance_xy(quad0)
             deg, deg_meta = _is_degenerate_quad_by_geometry(
                 quad0,
                 img_w=int(image_bgr.shape[1]) if image_bgr is not None else None,
@@ -3133,25 +3111,8 @@ def normalize_polygon_to_quad_with_meta(
             )
             meta["detail"]["direct_quad_check"] = deg_meta
             if not deg:
-                # v17.18 初期版では「常に」重複禁止グローバル探索で角を微修正していたが、
-                # これは非常に重く（4 corners x 10候補 => 最大1万組評価）、
-                # target 全件処理が事実上進まなくなる。
-                #
-                # 要件（最重要）: 2点が被った場合に必ず修復する
-                #  -> それは deg==True（duplicate_points）で検出され、下の修復経路に入る。
-                #
-                # したがって、deg==False（重複無し）の場合は「軽量な角スナップ」のみに留める。
-                quad0_r = quad0
-                if image_bgr is not None:
-                    try:
-                        g = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-                        quad0_r = _refine_quad_corners_by_shi_tomasi(image_gray=g, quad_xy=quad0_r)
-                        meta["detail"]["corner_refine"] = {"applied": True, "method": "shi_tomasi_local"}
-                    except Exception as e:
-                        meta["detail"]["corner_refine"] = {"applied": False, "error": str(e)}
-
                 meta.update({"ok": True, "method": "direct_order"})
-                return quad0_r, meta
+                return quad0, meta
             meta["issue"] = "duplicate_or_degenerate_quad"
         except Exception as e:
             meta["issue"] = f"direct_order_failed:{e}"
@@ -3161,16 +3122,8 @@ def normalize_polygon_to_quad_with_meta(
             quad_r, rec_meta = _recover_quad_from_edges(image_bgr)
             meta["detail"]["edge_recover"] = rec_meta
             if quad_r is not None:
-                # 修復経路では（重複を強制的に解消する必要があるので）
-                # グローバル重複禁止探索を実施する。
-                quad_r2, rmeta2 = _maybe_global_refine_quad(
-                    quad_xy=quad_r,
-                    image_bgr=image_bgr,
-                    reason=f"repair:{rec_meta.get('method', '')}",
-                )
-                meta["detail"]["global_corner_refine"] = rmeta2
                 meta.update({"ok": True, "method": f"repair:{rec_meta.get('method', '')}"})
-                return quad_r2, meta
+                return quad_r, meta
 
         # 画像が無い/復旧失敗 -> hull→minAreaRect（最低限四角形にはする）
         try:
@@ -3179,14 +3132,8 @@ def normalize_polygon_to_quad_with_meta(
                 rect = cv2.minAreaRect(hull.reshape(-1, 1, 2))
                 box = cv2.boxPoints(rect).astype(np.float32)
                 quad = order_quad_tl_tr_br_bl(box)
-                quad2, rmeta2 = _maybe_global_refine_quad(
-                    quad_xy=quad,
-                    image_bgr=image_bgr,
-                    reason="fallback_minAreaRect_from_hull",
-                )
-                meta["detail"]["global_corner_refine"] = rmeta2
                 meta.update({"ok": True, "method": "fallback_minAreaRect_from_hull"})
-                return quad2, meta
+                return quad, meta
         except Exception as e:
             meta["detail"]["minAreaRect_error"] = str(e)
 
@@ -3197,14 +3144,8 @@ def normalize_polygon_to_quad_with_meta(
         quad_r, rec_meta = _recover_quad_from_edges(image_bgr)
         meta["detail"]["edge_recover"] = rec_meta
         if quad_r is not None:
-            quad_r2, rmeta2 = _maybe_global_refine_quad(
-                quad_xy=quad_r,
-                image_bgr=image_bgr,
-                reason=f"repair:{rec_meta.get('method', '')}",
-            )
-            meta["detail"]["global_corner_refine"] = rmeta2
             meta.update({"ok": True, "method": f"repair:{rec_meta.get('method', '')}"})
-            return quad_r2, meta
+            return quad_r, meta
 
     # (C) 最後の手段: hull→minAreaRect
     try:
@@ -3219,14 +3160,8 @@ def normalize_polygon_to_quad_with_meta(
             meta["issue"] = "minAreaRect_box_not_4"
             return None, meta
         quad = order_quad_tl_tr_br_bl(box)
-        quad2, rmeta2 = _maybe_global_refine_quad(
-            quad_xy=quad,
-            image_bgr=image_bgr,
-            reason="minAreaRect",
-        )
-        meta["detail"]["global_corner_refine"] = rmeta2
         meta.update({"ok": True, "method": "minAreaRect"})
-        return quad2, meta
+        return quad, meta
     except Exception as e:
         meta["issue"] = f"minAreaRect_failed:{e}"
         return None, meta
@@ -3298,60 +3233,21 @@ def detect_polygon_fallback_opencv(image_bgr: np.ndarray) -> Optional[np.ndarray
     return None
 
 
-def _edge_distance_transform(edge_u8: np.ndarray) -> Optional[np.ndarray]:
-    """エッジ画像から距離変換（各画素→最近傍エッジ距離）を作る。
-
-    目的:
-      - edge support を高速に評価する（多数回呼ばれる箇所のボトルネック対策）
-      - 旧: 各サンプル点ごとに小窓 max を取る → Python ループ + np.max が重い
-      - 新: distanceTransform を 1 回作って、サンプル点では距離<=r の判定だけ行う
-    """
-
-    if edge_u8 is None:
-        return None
-    e = edge_u8
-    if e.ndim == 3:
-        e = cv2.cvtColor(e, cv2.COLOR_BGR2GRAY)
-    # 0/255 へ
-    try:
-        ebin = (e > 0).astype(np.uint8) * 255
-        inv = (255 - ebin).astype(np.uint8)
-        # distanceTransform は「非ゼロ画素までの距離」を返すので、inv を入れる
-        dt = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
-        return dt.astype(np.float32)
-    except Exception:
-        return None
-
-
 def _score_quad_by_edge_support(
     *,
     quad_xy: np.ndarray,
-    edge_u8: Optional[np.ndarray] = None,
-    edge_dist: Optional[np.ndarray] = None,
-    radius_px: float = 3.0,
+    edge_u8: np.ndarray,
 ) -> float:
-    """quad が画像中のエッジにどれだけ一致しているかを簡易スコア化する。
-
-    速度最適化:
-      - edge_dist（距離変換）を渡された場合はそれを優先して評価する。
-      - edge_u8 しか無い場合は距離変換を作って評価する（単発用途）。
-    """
+    """quad が画像中のエッジにどれだけ一致しているかを簡易スコア化する。"""
 
     quad = order_quad_tl_tr_br_bl(np.asarray(quad_xy, dtype=np.float32).reshape(4, 2))
+    h, w = edge_u8.shape[:2]
+    edge = edge_u8
+    if edge.ndim == 3:
+        edge = cv2.cvtColor(edge, cv2.COLOR_BGR2GRAY)
 
-    dt = edge_dist
-    if dt is None and edge_u8 is not None:
-        dt = _edge_distance_transform(edge_u8)
-    if dt is None:
-        return 0.0
-
-    # 速度最適化（重要）:
-    # Python ループで 1 サンプルずつ参照すると、
-    # グローバル角点修復（最大 10^4 通り）で致命的に遅くなる。
-    # ここでは各辺ごとにサンプル点をベクトル化し、まとめて dt を参照する。
-
-    h, w = dt.shape[:2]
-    r = float(max(0.5, radius_px))
+    # サンプリング点の周囲 r ピクセルにエッジがあればヒット扱い
+    r = 3
     hits = 0
     total = 0
 
@@ -3359,22 +3255,19 @@ def _score_quad_by_edge_support(
         p0 = quad[i]
         p1 = quad[(i + 1) % 4]
         seg_len = float(np.linalg.norm(p1 - p0))
-        n = int(max(30, min(220, seg_len / 8.0)))
-
-        ts = np.linspace(0.0, 1.0, n, dtype=np.float32)
-        xs = (p0[0] * (1.0 - ts) + p1[0] * ts).round().astype(np.int32)
-        ys = (p0[1] * (1.0 - ts) + p1[1] * ts).round().astype(np.int32)
-
-        inside = (xs >= 0) & (ys >= 0) & (xs < int(w)) & (ys < int(h))
-        if not bool(np.any(inside)):
-            continue
-
-        xs2 = xs[inside]
-        ys2 = ys[inside]
-        total += int(xs2.size)
-        # dt の参照はベクトル化
-        d = dt[ys2, xs2]
-        hits += int(np.count_nonzero(d <= float(r)))
+        n = int(max(30, min(180, seg_len / 8.0)))
+        for t in np.linspace(0.0, 1.0, n, dtype=np.float32):
+            x = int(round(float(p0[0] * (1.0 - t) + p1[0] * t)))
+            y = int(round(float(p0[1] * (1.0 - t) + p1[1] * t)))
+            if x < 0 or y < 0 or x >= w or y >= h:
+                continue
+            total += 1
+            x0 = max(0, x - r)
+            x1 = min(w, x + r + 1)
+            y0 = max(0, y - r)
+            y1 = min(h, y + r + 1)
+            if int(np.max(edge[y0:y1, x0:x1])) > 0:
+                hits += 1
 
     if total <= 0:
         return 0.0
@@ -3431,256 +3324,6 @@ def _refine_quad_corners_by_shi_tomasi(
             out[i] = pts[j]
 
     return order_quad_tl_tr_br_bl(out)
-
-
-def _corner_response_shi_tomasi(gray: np.ndarray, x: int, y: int, ksize: int = 7) -> float:
-    """Shi-Tomasi（min eigen value）の“強さ”を近傍で返す。"""
-
-    h, w = gray.shape[:2]
-    r = max(1, int(ksize) // 2)
-    x0 = max(0, int(x) - r)
-    y0 = max(0, int(y) - r)
-    x1 = min(w, int(x) + r + 1)
-    y1 = min(h, int(y) + r + 1)
-    roi = gray[y0:y1, x0:x1]
-    if roi.size < 9:
-        return 0.0
-    try:
-        # cornerMinEigenVal は float32 を想定
-        cm = cv2.cornerMinEigenVal(roi.astype(np.float32), blockSize=max(3, int(ksize)), ksize=3)
-        return float(np.max(cm)) if cm is not None else 0.0
-    except Exception:
-        return 0.0
-
-
-def _refine_quad_corners_by_shi_tomasi_global(
-    *,
-    image_gray: np.ndarray,
-    quad_xy: np.ndarray,
-    edge_u8: Optional[np.ndarray] = None,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    """quad の角を *重複禁止* でグローバル探索し、重複点（2点同一点）を強制的に分離する。
-
-    目的（ユーザー要望の最重要点）:
-      - DocAligner が 4点を返しても「2点がほぼ同一点」になるケースがある
-      - 単純な独立スナップ（角ごとに最寄り点へ移動）だと、同じ強コーナーへ再吸着して解決しない
-      - そこで、各コーナーの候補点集合から「4点が互いに十分離れた組合せ」を選ぶ
-
-    方針（時間無視・精度優先）:
-      - 各コーナー周辺ROIで goodFeaturesToTrack を取り、候補点を列挙
-      - 候補の組合せ（最大 10^4 程度）を全探索し、
-        edge-support / 角の強さ / 直角っぽさ / 重複ペナルティ を総合スコア化
-      - ベースquadより良ければ採用
-
-    戻り値:
-      (refined_quad, meta)
-    """
-
-    quad0 = order_quad_tl_tr_br_bl(np.asarray(quad_xy, dtype=np.float32).reshape(4, 2))
-    h, w = image_gray.shape[:2]
-    if edge_u8 is None:
-        try:
-            e = cv2.Canny(image_gray, 40, 140)
-            e = cv2.dilate(e, np.ones((3, 3), np.uint8), iterations=1)
-        except Exception:
-            e = None
-    else:
-        e = edge_u8
-
-    # 速度最重要: 全探索ループ内で distanceTransform を毎回作ると壊滅的に遅い。
-    # ここで 1 回だけ作り回す。
-    edge_dist = None
-    if e is not None:
-        edge_dist = _edge_distance_transform(e)
-
-    dup_thr = _default_duplicate_threshold_px(pts_xy=quad0, image_bgr=None)
-
-    # ROIサイズ（画像サイズ比）
-    # ここが大きすぎると候補点が増えすぎ、全探索が爆発して
-    # かえって「完走しない」原因になる。
-    win = int(max(18, min(140, min(h, w) * 0.06)))
-    # 10^4 通り（10^4=10*10*10*10）でも重いので、まずは候補数を少し絞る。
-    # 重複点の分離が目的なので、resp 上位だけで十分なケースが多い。
-    max_cands = 6
-
-    candidates_per_corner: list[list[np.ndarray]] = []
-    candidates_meta: list[list[dict[str, Any]]] = []
-
-    for i in range(4):
-        cx, cy = float(quad0[i][0]), float(quad0[i][1])
-        x0 = int(max(0, round(cx - win)))
-        y0 = int(max(0, round(cy - win)))
-        x1 = int(min(w, round(cx + win)))
-        y1 = int(min(h, round(cy + win)))
-        roi = image_gray[y0:y1, x0:x1]
-        pts: Optional[np.ndarray]
-        try:
-            pts = cv2.goodFeaturesToTrack(
-                roi,
-                maxCorners=60,
-                qualityLevel=0.01,
-                minDistance=max(6, int(win * 0.10)),
-                blockSize=7,
-            )
-        except Exception:
-            pts = None
-
-        cand_pts: list[np.ndarray] = [np.array([cx, cy], dtype=np.float32)]
-        cand_info: list[dict[str, Any]] = [
-            {
-                "src": "orig",
-                "resp": _corner_response_shi_tomasi(image_gray, int(round(cx)), int(round(cy))),
-            }
-        ]
-
-        if pts is not None and len(pts) > 0:
-            pts2 = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
-            # ROI座標->画像座標
-            pts2[:, 0] += float(x0)
-            pts2[:, 1] += float(y0)
-
-            # 近すぎる重複を除去
-            used: list[np.ndarray] = []
-            for p in pts2:
-                if any(float(np.linalg.norm(p - u)) < 2.0 for u in used):
-                    continue
-                used.append(p)
-                resp = _corner_response_shi_tomasi(image_gray, int(round(p[0])), int(round(p[1])))
-                cand_pts.append(p.astype(np.float32))
-                cand_info.append({"src": "gftt", "resp": float(resp)})
-
-        # 候補を resp 降順に並べ、上位だけ残す
-        order = sorted(range(len(cand_pts)), key=lambda k: float(cand_info[k].get("resp", 0.0)), reverse=True)
-        cand_pts = [cand_pts[k] for k in order][:max_cands]
-        cand_info = [cand_info[k] for k in order][:max_cands]
-        candidates_per_corner.append(cand_pts)
-        candidates_meta.append(cand_info)
-
-    def _orthogonality_score(q: np.ndarray) -> float:
-        # 各頂点の内角が 90deg に近いほど高得点
-        q = order_quad_tl_tr_br_bl(q)
-        score = 0.0
-        for i in range(4):
-            p = q[i]
-            p0 = q[i - 1]
-            p1 = q[(i + 1) % 4]
-            v0 = p0 - p
-            v1 = p1 - p
-            n0 = float(np.linalg.norm(v0))
-            n1 = float(np.linalg.norm(v1))
-            if n0 < 1e-6 or n1 < 1e-6:
-                continue
-            c = float(np.dot(v0, v1) / (n0 * n1))
-            c = float(max(-1.0, min(1.0, c)))
-            ang = float(abs(math.degrees(math.acos(c)) - 90.0))
-            score += max(0.0, 1.0 - (ang / 45.0))
-        return score / 4.0
-
-    base_support = 0.0
-    if edge_dist is not None:
-        try:
-            base_support = _score_quad_by_edge_support(quad_xy=quad0, edge_dist=edge_dist)
-        except Exception:
-            base_support = 0.0
-
-    base_ortho = _orthogonality_score(quad0)
-    base_min_pair = _min_pairwise_distance_xy(quad0)
-    base_score = (base_support * 10.0) + (base_ortho * 2.0) + (1.0 if base_min_pair >= dup_thr else -3.0)
-
-    best = None
-    best_score = float(base_score)
-
-    # 全探索（最大 10^4 程度）
-    # NOTE:
-    # numpy.ndarray は list.index で比較できない（== が配列になり ValueError）ため、
-    # ここは *インデックス* で回す。
-    c0, c1, c2, c3 = candidates_per_corner
-    m0, m1, m2, m3 = candidates_meta
-    for i0, p0 in enumerate(c0):
-        for i1, p1 in enumerate(c1):
-            for i2, p2 in enumerate(c2):
-                for i3, p3 in enumerate(c3):
-                    q = np.stack([p0, p1, p2, p3], axis=0).astype(np.float32)
-                    q = order_quad_tl_tr_br_bl(q)
-
-                    # clamp（ROI由来なので多少はみ出す）
-                    q = _clamp_poly_to_image(q, img_w=int(w), img_h=int(h))
-
-                    # 重複チェック（必須）
-                    min_pair = _min_pairwise_distance_xy(q)
-                    if min_pair < float(dup_thr):
-                        continue
-
-                    ok, _qmeta = _is_valid_quad(q, img_w=int(w), img_h=int(h))
-                    if not ok:
-                        continue
-
-                    support = 0.0
-                    if edge_dist is not None:
-                        try:
-                            support = _score_quad_by_edge_support(quad_xy=q, edge_dist=edge_dist)
-                        except Exception:
-                            support = 0.0
-
-                    ortho = _orthogonality_score(q)
-                    # 角強さ（resp）の合計
-                    resp_sum = (
-                        float(m0[i0].get("resp", 0.0))
-                        + float(m1[i1].get("resp", 0.0))
-                        + float(m2[i2].get("resp", 0.0))
-                        + float(m3[i3].get("resp", 0.0))
-                    )
-
-                    score = (support * 10.0) + (ortho * 2.0) + (min_pair / max(1.0, float(dup_thr))) * 0.5 + math.log1p(max(0.0, resp_sum)) * 0.15
-
-                    if score > best_score + 1e-6:
-                        best_score = float(score)
-                        best = {
-                            "quad": q,
-                            "support": float(support),
-                            "ortho": float(ortho),
-                            "min_pair": float(min_pair),
-                            "resp_sum": float(resp_sum),
-                            "score": float(score),
-                        }
-
-    if best is None:
-        return quad0, {
-            "applied": False,
-            "reason": "no_better_combination",
-            "base": {"support": float(base_support), "ortho": float(base_ortho), "min_pair": float(base_min_pair), "score": float(base_score)},
-            "dup_thr": float(dup_thr),
-        }
-
-    return best["quad"], {
-        "applied": True,
-        "best": best,
-        "base": {"support": float(base_support), "ortho": float(base_ortho), "min_pair": float(base_min_pair), "score": float(base_score)},
-        "dup_thr": float(dup_thr),
-    }
-
-
-def _maybe_global_refine_quad(
-    *,
-    quad_xy: np.ndarray,
-    image_bgr: Optional[np.ndarray],
-    reason: str,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    """normalize_polygon_to_quad_with_meta 内から呼ぶ安全ラッパー。"""
-
-    if image_bgr is None:
-        return order_quad_tl_tr_br_bl(quad_xy), {"applied": False, "reason": "no_image", "context": str(reason)}
-    try:
-        g = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    except Exception:
-        return order_quad_tl_tr_br_bl(quad_xy), {"applied": False, "reason": "gray_convert_failed", "context": str(reason)}
-    try:
-        q2, rmeta = _refine_quad_corners_by_shi_tomasi_global(image_gray=g, quad_xy=quad_xy)
-        rmeta = dict(rmeta)
-        rmeta["context"] = str(reason)
-        return q2, rmeta
-    except Exception as e:
-        return order_quad_tl_tr_br_bl(quad_xy), {"applied": False, "reason": f"exception:{e}", "context": str(reason)}
 
 
 def detect_polygon_fallback_advanced(image_bgr: np.ndarray) -> Optional[np.ndarray]:
@@ -4077,71 +3720,6 @@ def _quick_eval_form_scores_for_candidate(
     return decision, float(decision.score)
 
 
-def _quick_eval_candidate_light(
-    rectified_landscape_bgr: np.ndarray,
-    *,
-    marker_preproc: str,
-    formA_geom_cfg: Optional[MarkerGeometryConfig],
-    try_B_fast: bool = True,
-) -> tuple[dict[str, Any], float]:
-    """DocAligner候補選抜用の *軽量* 評価。
-
-    背景:
-      detect_polygon_docaligner_multi() の候補評価で decide_form_by_rotations() を
-      そのまま呼ぶと、WeChat QR の robust multi-scale まで回りやすく、
-      target 41枚のような実運用で「DocAlignerだけで数分/枚」になり得る。
-
-    方針（精度優先だが、実用上完走する速度も確保）:
-      - 角度は 0/180 のみ（rectified は横長化済み）
-      - まず A（マーカー）だけを評価（QRより軽い）
-      - A が無い場合のみ B_fast を 1 回だけ試す（robust は候補選抜では回さない）
-
-    戻り値:
-      (detail, score)
-      detail は最終の process_one_case の decision とは別物（候補選抜の診断用）。
-    """
-
-    img = rectified_landscape_bgr
-    # 0/180 を直列で評価（ThreadPoolの起動コストを避ける）
-    best_score = 0.0
-    best_detail: dict[str, Any] = {"phase": "none"}
-
-    # ---- A (marker) ----
-    for ang in (0.0, 180.0):
-        rot = rotate_image_bound(img, float(ang))
-        okA, scoreA, detA = score_formA(rot, marker_preproc=str(marker_preproc), geom_cfg=formA_geom_cfg)
-        if okA and float(scoreA) > float(best_score):
-            best_score = float(scoreA)
-            best_detail = {"phase": "A", "angle_deg": float(ang), "A": detA}
-
-    if best_detail.get("phase") == "A":
-        return best_detail, float(best_score)
-
-    # ---- B_fast (QR) ----
-    if try_B_fast:
-        # 候補選抜では「robust multi-scale」は回さない。
-        # fast 側も scale/variant を絞って 1 回の try にする。
-        cfg = PIPELINE_DEFAULTS.get("qr", {}).get("wechat", {})
-        fast_cfg = cfg.get("fast", {}) if isinstance(cfg, dict) else {}
-        backup = dict(fast_cfg) if isinstance(fast_cfg, dict) else {}
-        if isinstance(fast_cfg, dict):
-            try:
-                fast_cfg["variants"] = ["gray"]
-                fast_cfg["scales"] = [1.0]
-                for ang in (0.0, 180.0):
-                    rot = rotate_image_bound(img, float(ang))
-                    okB, scoreB, detB = score_formB_fast(rot)
-                    if okB and float(scoreB) > float(best_score):
-                        best_score = float(scoreB)
-                        best_detail = {"phase": "B_fast", "angle_deg": float(ang), "B_fast": detB}
-            finally:
-                # restore
-                fast_cfg.clear()
-                fast_cfg.update(backup)
-
-    return best_detail, float(best_score)
-
-
 def make_formA_geom_cfg_for_case(*, source_dataset: str, source_form: str) -> Optional[MarkerGeometryConfig]:
     """dataset に応じてフォームAの幾何制約（誤検出抑制）を調整した cfg を返す。
 
@@ -4382,17 +3960,6 @@ def detect_polygon_docaligner_multi(
     best: Optional[dict[str, Any]] = None
     evals: list[dict[str, Any]] = []
 
-    # tie-break 用の edge support は「degraded 画像で 1 回だけ」作って使い回す
-    edge_u8 = None
-    edge_dist = None
-    try:
-        edge_u8 = cv2.Canny(cv2.cvtColor(degraded_bgr, cv2.COLOR_BGR2GRAY), 40, 140)
-        edge_u8 = cv2.dilate(edge_u8, np.ones((3, 3), np.uint8), iterations=1)
-        edge_dist = _edge_distance_transform(edge_u8)
-    except Exception:
-        edge_u8 = None
-        edge_dist = None
-
     for c in candidates:
         poly = np.asarray(c["poly"], dtype=np.float32)
         margin_list = _margin_px_candidates_for_eval(args=args, poly_xy=poly)
@@ -4405,19 +3972,19 @@ def detect_polygon_docaligner_multi(
                     out_max_side=int(args.docaligner_max_side),
                 )
                 rect, _ = enforce_landscape(rect)
-                # v17.19+: 候補選抜では「軽量評価」を使い、robust QR やスレッド並列を避ける。
-                # 最終の process_one_case では従来通り decide_form_by_rotations を実行する。
-                eval_detail, score = _quick_eval_candidate_light(
+                decision, score = _quick_eval_form_scores_for_candidate(
                     rect,
+                    rotation_max_workers=int(args.rotation_max_workers),
                     marker_preproc=str(args.marker_preproc),
+                    unknown_score_threshold=float(args.unknown_score_threshold),
+                    unknown_margin=float(args.unknown_margin),
                     formA_geom_cfg=formA_geom_cfg,
-                    try_B_fast=True,
                 )
                 rec = {
                     "setting": c["setting"],
                     "quality": c["quality"],
                     "margin_px": float(margin_px),
-                    "decision": eval_detail,
+                    "decision": asdict(decision),
                     "score": float(score),
                     "rectify": rect_meta,
                 }
@@ -4438,9 +4005,9 @@ def detect_polygon_docaligner_multi(
                             cur_area = float(((c.get("quality") or {}).get("area_ratio") or 0.0))
                             best_area = float(((best.get("quality") or {}).get("area_ratio") or 0.0))
                             # edge support
-                            cur_support = 0.0
-                            if edge_dist is not None:
-                                cur_support = _score_quad_by_edge_support(quad_xy=poly_exp, edge_dist=edge_dist)
+                            edge = cv2.Canny(cv2.cvtColor(degraded_bgr, cv2.COLOR_BGR2GRAY), 40, 140)
+                            edge = cv2.dilate(edge, np.ones((3, 3), np.uint8), iterations=1)
+                            cur_support = _score_quad_by_edge_support(quad_xy=poly_exp, edge_u8=edge)
                             best_support = float(best.get("edge_support") or 0.0)
 
                             # まず支持率を優先

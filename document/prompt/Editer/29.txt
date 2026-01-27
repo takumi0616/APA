@@ -1,0 +1,167 @@
+# タスク（プロンプト）を行う前に必ず以下の資料を読んでください
+
+この資料は環境がどう構築されたかを記しておりコマンド実行などの際は必ず参考にしてください
+@/git_installation_guide.md
+@/miniconda_installation_guide.md
+
+タスクを行った際は、タスク成功後に、行ったことをマークダウン記法でまとめたものを@/APA\document\report の中にファイルを作成してください
+ファイル名のルール：番号_年月日_行ったことを日本語.md（例：1_20260106_環境構築）
+番号は@/APA\document\report の中を精査して確認してください
+これまでのreportも読み込んでからタスクを行ってください
+---
+# プロンプト
+
+@/APA\paper_pipeline_v18.py 
+現在、上記のプログラムのDocAligner部分を改善しているのですが、今の処理では相当な時間がかかってしまいます
+今の精度を維持しつつ、並行処理化やいらない部分を削って、精度と速度を向上させてほしいです
+プログラムを改善してください
+
+```
+# paper_pipeline_v18.py 高速化案（処理/判定ロジックを極力変えない）
+
+対象: `paper_pipeline_v18.py`
+
+現状ログ（例: `run_20260127_105549`）から、支配的なのは以下。
+
+- **2_doc (DocAligner + multi候補評価)**
+  - 成功ケースでも 20〜60秒級
+  - no_detection で advanced fallback が入るケースは 100〜150秒級
+- **4_decide (フォーム判定)**
+  - 成功ケースは 0.4〜1秒程度
+  - no_detection ケースは 20〜60秒級（fallbackで何度も decide を回すため）
+
+この2つを「できるだけ精度/処理を変えずに」速くする案を、**副作用が少ない順（=低リスク優先）**で整理します。
+
+---
+
+## 0. 大前提（最も効くが運用で切替可能なもの）
+
+### 0-1) `--save-images none` / `fail` を基本にする
+
+I/Oは簡単にボトルネックになります。速度計測・大量処理では `none` 推奨。
+ただしご要望が「処理は変えない」なので、これはコード変更なしでの提案です。
+
+---
+
+## 1) 4_decide（フォーム判定）の高速化（低リスク）
+
+### 1-1) 回転画像をキャッシュして再利用（rotateの重複を削る）
+
+`decide_form_by_rotations()` は、
+
+- A探索
+- B_fast探索
+- B_robust探索
+
+で **同じ角度（0/180）の回転画像を何回も作っています**。
+
+現状 `rotate_image_bound()` は 0/180 を最適化しているので致命的ではないですが、
+**画像コピーは毎回発生**し、さらに `h>w` チェック等の周辺処理も毎回走ります。
+
+改善案:
+
+- 関数冒頭で `rotated[angle] = rotate_image_bound(rectified_bgr, angle)` を1回だけ作って辞書に保持
+- 以後は全て `rotated[angle]` を渡す
+
+期待効果:
+
+- decide の **純粋な無駄が減る**（特に no_detection で decide が何度も呼ばれるケースで効く）
+
+出力影響:
+
+- 同じ回転画像を使い回すだけなので **判定結果/スコア/出力物は変わりません**。
+
+---
+
+### 1-2) `ThreadPoolExecutor` の生成回数を減らす（スレッド起動コスト削減）
+
+現状は A / B_fast / B_robust の各フェーズで `ThreadPoolExecutor` を作っています。
+角度が2個しかないため、スレッド生成コストの割合が無視できない可能性があります。
+
+改善案（挙動維持寄り）:
+
+- 「角度2枚だけ」を前提に、
+  - `max_workers=2` で **executorを1つ作り回し**、フェーズごとに `submit` だけ差し替える
+  - あるいは並列をやめて逐次評価（順序は固定化）
+
+出力影響:
+
+- 同じ処理をするなら、結果は原理的に同一。
+- ただし **同点時のtie-breakが実装依存（先に終わった方が勝つ等）**になっている箇所があると、微小差が出る可能性があります。
+  - このコードでは best は score比較で選ぶため、基本は安全です。
+
+---
+
+### 1-3) QRの fast→robust の「前処理生成」を共有
+
+fast と robust は別関数呼び出しなので、
+gray/clahe/adaptive などの前処理を2回作っています。
+
+改善案:
+
+- `detect_qr_codes_wechat_multiscale` を「前処理済みvariantsを渡せる形」にする
+- あるいは decide 側で `prep_variants = _preprocess_variants_for_qr(rotated_img, ...)` を作り、fast/robustで使い回す
+
+出力影響:
+
+- 同じ variants を同じ順で使うなら、検出結果は一致。
+
+---
+
+## 2) 2_doc（DocAligner multi）の高速化（低リスク）
+
+### 2-1) candidate eval の tie-break で毎回 Canny を作らない（エッジ画像を1回だけ生成）
+
+`detect_polygon_docaligner_multi()` の候補比較（同点タイブレーク）で、
+
+```py
+edge = cv2.Canny(cv2.cvtColor(degraded_bgr, cv2.COLOR_BGR2GRAY), 40, 140)
+edge = cv2.dilate(edge, ...)
+cur_support = _score_quad_by_edge_support(..., edge)
+```
+
+を **同点発生のたびに作っています**。
+
+改善案:
+
+- `edge_u8` を関数内で lazy に1回だけ生成して再利用
+  - `edge_u8 = None` で始め、tie-breakが必要になった瞬間だけ作る
+
+出力影響:
+
+- エッジ画像が同一なので **候補の選ばれ方も同一**（=結果不変）。
+
+---
+
+### 2-2) multi候補評価内の decide を軽くする（= 1章の改善がそのまま効く）
+
+DocAligner multi は候補ごとに `rectify → decide_form_by_rotations` を回してスコアで選びます。
+つまり decide の改善（回転キャッシュ・executor削減）を入れると、
+**2_doc にも直撃で効きます**。
+
+---
+
+### 2-3) `normalize_polygon_to_quad_with_meta` の二重実行をやめる（診断の作り方を変える）
+
+現状:
+
+- `_run_docaligner_once()` 内で `normalize_polygon_to_quad_with_meta(... image_bgr=padded)` を実行
+- その後 `detect_polygon_docaligner_multi()` でも診断用にもう一度 `normalize_polygon_to_quad_with_meta(poly, image_bgr=degraded_bgr)` を呼んでいる
+
+改善案（結果を変えない範囲で）:
+
+- `_run_docaligner_once` が返す際に meta（修復したかどうか等）を返して、multi側では再計算しない
+  - もしくは multi側の「診断のための再計算」を DEBUG の時だけにする
+
+出力影響:
+
+- polygon自体の出力を変えずに、**診断情報の出し方だけ変える**なら結果は不変。
+- ただし meta の中身（ログ/summary.jsonのdetail）は変わり得ます。
+
+```
+
+上記の改善をpaper_pipeline_v18.py に行って処理速度向上を行ってください
+
+上記の改善を順番に確実に行ってください
+プログラムをすべて改善できたのちに実行して結果確認、エラーが出る場合は試行錯誤して適宜改善してください
+全ての改善が無事に終了したときに、プログラムファイルの先頭のコメントアウトを更新、さらにレポートの作成を行ってください
