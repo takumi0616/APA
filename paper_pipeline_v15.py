@@ -51,6 +51,11 @@
    - `.png/.jpg/.jpeg` を列挙
    - **改悪生成を行わず**、そのまま本処理へ投入します（現場画像の想定）
 
+4) hard_target（改悪なし）: `APA/image/hard_target/`
+   - `.png/.jpg/.jpeg` を列挙
+   - 命名規則は `target` と同じ（固定しない）
+   - **改悪生成を行わず**、そのまま本処理へ投入します（難例の現場画像の想定）
+
 処理フロー（1 case = 1 枚の入力から生成した 1 枚の改悪画像）:
 
 ※ v15.7: 改悪生成（degrade）は **最初に全ケース分をまとめて生成**し、以降の本処理へ投入する。
@@ -134,6 +139,13 @@
 - JPEG 保存は可能なら python-turbojpeg（libjpeg-turbo）を優先する（失敗時は `cv2.imwrite` にフォールバック）
 - 日本語ラベル描画は Pillow を使用（OpenCV putText は日本語非対応のため）。
   - `APA_FONT_PATH` を設定すると任意フォントを優先可能
+
+更新履歴（抜粋）
+----------------
+
+- v15.9（2026-01-28）
+  - hard_target データセット（`image/hard_target`）を追加
+  - run.log のサマリをデータセット別（synthetic/test/target/hard_target）に詳細化（処理時間/成功率など）
 
 """
 
@@ -4120,6 +4132,22 @@ def list_target_images() -> list[Path]:
     return sorted(paths)
 
 
+def list_hard_target_images() -> list[Path]:
+    """image/hard_target 配下の画像を列挙する。
+
+    - image/target と同様に **改悪なし** で投入する想定
+    - 命名規則は固定しない（現場で増えうるため）
+    """
+
+    base = Path(__file__).resolve().parent / "image" / "hard_target"
+    if not base.exists():
+        return []
+
+    exts = {".png", ".jpg", ".jpeg"}
+    paths = [p for p in base.iterdir() if p.is_file() and p.suffix.lower() in exts]
+    return sorted(paths)
+
+
 def parse_test_filename(p: Path) -> Optional[tuple[str, str]]:
     """test 画像ファイル名から (form, template_number) を推定する。
 
@@ -4557,33 +4585,91 @@ def summarize_results(logger: logging.Logger, summary: list[dict[str, Any]], sta
     logger.info("  false_positive_as_A                : %d (%.1f%%)", c_fp_as_A, _safe_div(c_fp_as_A * 100.0, len(c_items)))
     logger.info("  false_positive_as_B                : %d (%.1f%%)", c_fp_as_B, _safe_div(c_fp_as_B * 100.0, len(c_items)))
 
-    # test データセット（image/test）精度
-    if "test" in by_dataset:
-        test_items = by_dataset["test"]
-        test_a = [it for it in test_items if str(it.get("source_form") or "") == "A"]
-        test_b = [it for it in test_items if str(it.get("source_form") or "") == "B"]
-        test_c = [it for it in test_items if str(it.get("source_form") or "") == "C"]
+    # --------------------------------------------------------
+    # データセット別のサマリ（ユーザー要望: run.log をより詳しく）
+    # --------------------------------------------------------
 
-        logger.info("[STATS] test dataset (image/test)")
-        logger.info("  total                             : %d", len(test_items))
-        logger.info("  A cases                            : %d", len(test_a))
-        logger.info(
-            "  A template_accuracy                 : %d (%.1f%%)",
-            _count_true(test_a, "is_predicted_best_template_correct"),
-            _safe_div(_count_true(test_a, "is_predicted_best_template_correct") * 100.0, len(test_a)),
-        )
-        logger.info("  B cases                            : %d", len(test_b))
-        logger.info(
-            "  B template_accuracy                 : %d (%.1f%%)",
-            _count_true(test_b, "is_predicted_best_template_correct"),
-            _safe_div(_count_true(test_b, "is_predicted_best_template_correct") * 100.0, len(test_b)),
-        )
-        logger.info("  C cases                            : %d", len(test_c))
-        logger.info(
-            "  C reject_success(stage=form_unknown): %d (%.1f%%)",
-            sum(1 for it in test_c if str(it.get("stage")) == "form_unknown"),
-            _safe_div(sum(1 for it in test_c if str(it.get("stage")) == "form_unknown") * 100.0, len(test_c)),
-        )
+    def _dataset_stage_sums(items: list[dict[str, Any]]) -> dict[str, float]:
+        sums = {"degrade_s": 0.0, "docaligner_s": 0.0, "rectify_s": 0.0, "decide_s": 0.0, "uvdoc_s": 0.0, "bgdiv_s": 0.0, "match_s": 0.0, "warp_s": 0.0}
+        for it in items:
+            st = it.get("stage_times")
+            if not isinstance(st, dict):
+                continue
+            for k in list(sums.keys()):
+                try:
+                    sums[k] += float(st.get(k, 0.0) or 0.0)
+                except Exception:
+                    continue
+        return sums
+
+    def _dataset_stage_counts(items: list[dict[str, Any]]) -> dict[str, int]:
+        c: dict[str, int] = {}
+        for it in items:
+            stg = str(it.get("stage") or "")
+            c[stg] = int(c.get(stg, 0)) + 1
+        return c
+
+    def _dataset_total_times(items: list[dict[str, Any]]) -> list[float]:
+        out: list[float] = []
+        for it in items:
+            try:
+                out.append(float(it.get("case_total_s", 0.0) or 0.0))
+            except Exception:
+                continue
+        return out
+
+    def _dataset_inliers(items: list[dict[str, Any]]) -> list[int]:
+        xs: list[int] = []
+        for it in items:
+            if not bool(it.get("ok_warp")):
+                continue
+            try:
+                bm = it.get("best_match") or {}
+                xs.append(int(bm.get("inliers", 0) or 0))
+            except Exception:
+                continue
+        return xs
+
+    def _summarize_dataset(ds: str, items: list[dict[str, Any]]) -> None:
+        if not items:
+            return
+        n = len(items)
+        ok_exp = sum(1 for it in items if bool(it.get("ok")))
+        ok_w = sum(1 for it in items if bool(it.get("ok_warp")))
+        stage_cnt = _dataset_stage_counts(items)
+        sums = _dataset_stage_sums(items)
+        t_tot = _dataset_total_times(items)
+        inl = _dataset_inliers(items)
+
+        logger.info("[STATS] dataset=%s", ds)
+        logger.info("  total                             : %d", n)
+        logger.info("  ok_expected_behavior(user_KPI)     : %d (%.1f%%)", ok_exp, _safe_div(ok_exp * 100.0, n))
+        logger.info("  ok_warp(done_aligned_generated)    : %d (%.1f%%)", ok_w, _safe_div(ok_w * 100.0, n))
+        logger.info("  per-case total mean/median (s)     : %.3f / %.3f", _mean(t_tot), _median(t_tot))
+        logger.info("  stage time mean per case (s):")
+        for k, v in sums.items():
+            logger.info("    %-12s : %.3f", k, float(v) / float(n))
+        logger.info("  stage counts:")
+        for k, v in sorted(stage_cnt.items(), key=lambda x: (-x[1], x[0])):
+            logger.info("    %-20s : %d", k, v)
+        if inl:
+            inl_f = [float(x) for x in inl]
+            logger.info("  best_inliers mean/median (done)    : %.1f / %.1f", _mean(inl_f), _median(inl_f))
+
+        # GT があるデータセットでは精度も出す（A/B/C）
+        if ds in ("synthetic", "test"):
+            a = [it for it in items if str(it.get("source_form") or "") == "A"]
+            b = [it for it in items if str(it.get("source_form") or "") == "B"]
+            c = [it for it in items if str(it.get("source_form") or "") == "C"]
+            logger.info("  accuracy (GT-known):")
+            logger.info("    A template_accuracy              : %d (%.1f%%)", _count_true(a, "is_predicted_best_template_correct"), _safe_div(_count_true(a, "is_predicted_best_template_correct") * 100.0, len(a)))
+            logger.info("    B template_accuracy              : %d (%.1f%%)", _count_true(b, "is_predicted_best_template_correct"), _safe_div(_count_true(b, "is_predicted_best_template_correct") * 100.0, len(b)))
+            logger.info("    C reject_success(stage=form_unknown): %d (%.1f%%)", sum(1 for it in c if str(it.get("stage")) == "form_unknown"), _safe_div(sum(1 for it in c if str(it.get("stage")) == "form_unknown") * 100.0, len(c)))
+
+    # 代表データセット順で出力（存在するものだけ）
+    for ds in ["synthetic", "test", "target", "hard_target"]:
+        if ds in by_dataset:
+            _summarize_dataset(ds, by_dataset[ds])
 
     # ステージ別の合計時間
     logger.info("[STATS] stage time totals (s) (same as SUMMARY)")
@@ -5312,7 +5398,7 @@ def process_one_case(
     # 期待動作としての成功条件:
     # - A/B: フォーム正解 AND テンプレ正解 AND warp 完了
     # - C  : "done" に到達したら誤検出（本来は棄却されるべき）
-    if str(di.source_dataset) == "target":
+    if str(di.source_dataset) in ("target", "hard_target"):
         # target は GT を持たないため、warp 完了を成功とみなす
         item["ok"] = True
     elif src_form in ("A", "B"):
@@ -6050,6 +6136,48 @@ def main(argv=None) -> int:
                 degraded_bgr=src_bgr,
                 H_src_to_degraded=np.eye(3, dtype=np.float64),
                 degrade_meta={"mode": "target_skip_degrade"},
+                output_degraded_image_path=Path(out_degraded),
+            )
+        )
+
+    # hard_target dataset（改悪なし）
+    hard_target_paths = list_hard_target_images()
+    if hard_target_paths:
+        logger.info("[HARD_TARGET] hard_target dataset (image/hard_target): %d images", len(hard_target_paths))
+
+    for i, hp in enumerate(hard_target_paths):
+        src_bgr = cv2.imread(str(hp))
+        if src_bgr is None:
+            logger.warning("failed to read hard_target image: %s", hp)
+            continue
+
+        try:
+            h0, w0 = src_bgr.shape[:2]
+        except Exception:
+            continue
+
+        case_id = f"hard_target_{hp.stem}_{i:03d}" if hp.stem else f"hard_target_{i:03d}"
+        out_degraded = out_dirs["degraded"] / f"{case_id}.jpg"
+
+        if str(getattr(args, "save_images", "all")) == "all":
+            write_image(
+                out_degraded,
+                src_bgr,
+                jpeg_quality=int((PIPELINE_DEFAULTS.get("save_images") or {}).get("jpeg_quality") or 95),
+            )
+
+        degraded_inputs.append(
+            DegradedCaseInput(
+                source_dataset="hard_target",
+                source_form="hard_target",
+                source_path=Path(hp),
+                source_w=int(w0),
+                source_h=int(h0),
+                degraded_variant_index=0,
+                case_id=case_id,
+                degraded_bgr=src_bgr,
+                H_src_to_degraded=np.eye(3, dtype=np.float64),
+                degrade_meta={"mode": "hard_target_skip_degrade"},
                 output_degraded_image_path=Path(out_degraded),
             )
         )

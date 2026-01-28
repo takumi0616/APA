@@ -34,8 +34,8 @@
 
 本スクリプトは **複数の入力ソース**をまとめて処理します。
 
-v18.??+ のデフォルトは **synthetic（A/B/C） + test + target** を処理します。
-（処理対象を絞りたい場合は `--src-forms` / `--test-limit` / `--target-limit` で調整します）
+v18.??+ のデフォルトは **synthetic（A/B/C） + test + target + hard_target** を処理します。
+（処理対象を絞りたい場合は `--src-forms` / `--test-limit` / `--target-limit` / `--hard-target-limit` で調整します）
 
 1) synthetic（改悪あり）: `APA/image/{A,B,C}/`
    - デフォルトは `1.jpg`〜`6.jpg` を対象（`PIPELINE_DEFAULTS["template_numbers"]`）
@@ -53,6 +53,11 @@ v18.??+ のデフォルトは **synthetic（A/B/C） + test + target** を処理
 3) target（改悪なし）: `APA/image/target/`
    - `.png/.jpg/.jpeg` を列挙
    - **改悪生成を行わず**、そのまま本処理へ投入します（現場画像の想定）
+
+4) hard_target（改悪なし）: `APA/image/hard_target/`
+   - `.png/.jpg/.jpeg` を列挙
+   - 命名規則は `target` と同じ（固定しない）
+   - **改悪生成を行わず**、そのまま本処理へ投入します（難例の現場画像の想定）
 
 処理フロー（1 case = 1 枚の入力から生成した 1 枚の改悪画像）:
 
@@ -140,6 +145,10 @@ v18.??+ のデフォルトは **synthetic（A/B/C） + test + target** を処理
 
 更新履歴（抜粋）
 ----------------
+
+- v18.17（2026-01-28）
+  - hard_target データセット（`image/hard_target`）を追加
+  - run.log のサマリをデータセット別（synthetic/test/target/hard_target）に詳細化（処理時間/成功率など）
 
 - v18.16（2026-01-26）
   - target（現場撮影）の no_detection（フォームA取りこぼし）対策:
@@ -961,6 +970,7 @@ PIPELINE_DEFAULTS: dict[str, Any] = {
     #   - >0: 先頭N枚だけ処理
     #   - <0: 全件処理
     "target_limit": -1,  # デバッグ用：image/target の先頭N枚だけ処理（0=skip, <0=all）
+    "hard_target_limit": -1,  # デバッグ用：image/hard_target の先頭N枚だけ処理（0=skip, <0=all）
     "test_limit": -1,  # デバッグ用：image/test の先頭N枚だけ処理（0=skip, <0=all）
     "template_numbers": [1, 2, 3, 4, 5, 6],  # テンプレ/入力画像の対象番号（例: 1.jpg〜6.jpg）
 
@@ -4035,8 +4045,8 @@ def make_formA_geom_cfg_for_case(*, source_dataset: str, source_form: str) -> Op
         except Exception:
             return None
 
-    # target: 影・机模様・枠線の写り込みで取りこぼしやすいので recall 優先で緩める
-    if ds == "target":
+    # target/hard_target: 影・机模様・枠線の写り込みで取りこぼしやすいので recall 優先で緩める
+    if ds in ("target", "hard_target"):
         try:
             base_cfg = base_cfg_for_A or MarkerGeometryConfig()
             return MarkerGeometryConfig(
@@ -5873,9 +5883,11 @@ def build_csv_row(
     # - synthetic(A/B): フォーム/テンプレ/warp が正しいこと
     # - synthetic(C): form_unknown で棄却されること
     # - test: 既存と同様（ファイル名から GT を解釈）
-    # - target: 改悪なしで投入し、warp まで到達すること（GT は未定義）
+    # - target/hard_target: 改悪なしで投入し、warp まで到達すること（GT は未定義）
     if source_dataset == "target":
         expected_behavior_label = "target_should_be_processed_without_degrade_and_reach_warp"
+    elif source_dataset == "hard_target":
+        expected_behavior_label = "hard_target_should_be_processed_without_degrade_and_reach_warp"
     elif src_form == "C":
         expected_behavior_label = "C_should_be_rejected_as_form_unknown"
     elif src_form in ("A", "B"):
@@ -6092,6 +6104,22 @@ def list_target_images() -> list[Path]:
     """
 
     base = Path(__file__).resolve().parent / "image" / "target"
+    if not base.exists():
+        return []
+
+    exts = {".png", ".jpg", ".jpeg"}
+    paths = [p for p in base.iterdir() if p.is_file() and p.suffix.lower() in exts]
+    return sorted(paths)
+
+
+def list_hard_target_images() -> list[Path]:
+    """image/hard_target 配下の画像を列挙する。
+
+    - image/target と同様に **改悪なし** で投入する想定
+    - 命名規則は固定しない（現場で増えうるため）
+    """
+
+    base = Path(__file__).resolve().parent / "image" / "hard_target"
     if not base.exists():
         return []
 
@@ -6390,6 +6418,13 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="デバッグ用：image/target の処理件数（0=skip, N>0=先頭N枚, N<0=全て）",
     )
 
+    p.add_argument(
+        "--hard-target-limit",
+        type=int,
+        default=int(PIPELINE_DEFAULTS.get("hard_target_limit") or 0),
+        help="デバッグ用：image/hard_target の処理件数（0=skip, N>0=先頭N枚, N<0=全て）",
+    )
+
     return p.parse_args(argv)
 
 
@@ -6555,11 +6590,89 @@ def summarize_results(logger: logging.Logger, summary: list[dict[str, Any]], sta
         else:
             by_src["other"].append(s)
 
-    # dataset(test/synthetic) 別にも集計
+    # dataset(synthetic/test/target/hard_target) 別にも集計
     by_dataset: dict[str, list[dict[str, Any]]] = {}
     for s in summary:
         ds = str(s.get("source_dataset") or "synthetic")
         by_dataset.setdefault(ds, []).append(s)
+
+    def _summarize_dataset(ds: str, items: list[dict[str, Any]]) -> None:
+        total_ds = len(items)
+        if total_ds <= 0:
+            return
+
+        ok_warp_ds = sum(1 for it in items if bool(it.get("ok_warp")))
+        ok_expected_ds = sum(1 for it in items if bool(it.get("ok")))
+
+        # stage counts
+        sc: dict[str, int] = {}
+        for it in items:
+            stg = str(it.get("stage") or "")
+            sc[stg] = int(sc.get(stg, 0)) + 1
+
+        # per-case times
+        t_total = [float(it.get("case_total_s", 0.0) or 0.0) for it in items]
+
+        def _stage_list(key: str) -> list[float]:
+            xs: list[float] = []
+            for it in items:
+                st = it.get("stage_times")
+                if not isinstance(st, dict):
+                    continue
+                try:
+                    xs.append(float(st.get(key, 0.0) or 0.0))
+                except Exception:
+                    continue
+            return xs
+
+        # A/B/C の評価（GTがあるケースのみ）
+        a_items = [it for it in items if str(it.get("source_form") or "") == "A"]
+        b_items = [it for it in items if str(it.get("source_form") or "") == "B"]
+        c_items = [it for it in items if str(it.get("source_form") or "") == "C"]
+
+        def _count_true(xs: list[dict[str, Any]], key: str) -> int:
+            return sum(1 for it in xs if bool(it.get(key)))
+
+        logger.info("[STATS] dataset=%s", str(ds))
+        logger.info("  total_cases                       : %d", total_ds)
+        logger.info("  ok_warp(done_aligned_generated)    : %d (%.1f%%)", ok_warp_ds, _safe_div(ok_warp_ds * 100.0, total_ds))
+        logger.info("  ok_expected_behavior(user_KPI)     : %d (%.1f%%)", ok_expected_ds, _safe_div(ok_expected_ds * 100.0, total_ds))
+        logger.info("  per-case total time (s)            : mean=%.3f median=%.3f", _mean(t_total), _median(t_total))
+        logger.info(
+            "  stage mean per case (s)            : doc=%.3f rectify=%.3f decide=%.3f uvdoc=%.3f bgdiv=%.3f match=%.3f warp=%.3f",
+            _mean(_stage_list("docaligner_s")),
+            _mean(_stage_list("rectify_s")),
+            _mean(_stage_list("decide_s")),
+            _mean(_stage_list("uvdoc_s")),
+            _mean(_stage_list("bgdiv_s")),
+            _mean(_stage_list("match_s")),
+            _mean(_stage_list("warp_s")),
+        )
+
+        # GT がある A/B の精度（target/hard_target は空になる）
+        if a_items:
+            logger.info(
+                "  A template_accuracy                 : %d (%.1f%%)",
+                _count_true(a_items, "is_predicted_best_template_correct"),
+                _safe_div(_count_true(a_items, "is_predicted_best_template_correct") * 100.0, len(a_items)),
+            )
+        if b_items:
+            logger.info(
+                "  B template_accuracy                 : %d (%.1f%%)",
+                _count_true(b_items, "is_predicted_best_template_correct"),
+                _safe_div(_count_true(b_items, "is_predicted_best_template_correct") * 100.0, len(b_items)),
+            )
+        if c_items:
+            logger.info(
+                "  C reject_success(stage=form_unknown): %d (%.1f%%)",
+                sum(1 for it in c_items if str(it.get("stage")) == "form_unknown"),
+                _safe_div(sum(1 for it in c_items if str(it.get("stage")) == "form_unknown") * 100.0, len(c_items)),
+            )
+
+        # stage counts は多いので上位だけ
+        top = sorted(sc.items(), key=lambda x: (-x[1], x[0]))[:10]
+        top_s = ", ".join([f"{k}:{v}" for k, v in top])
+        logger.info("  stage_counts(top10)                 : %s", top_s)
 
     # A/B 正解数（フォーム正解・テンプレ正解）
     def _count_true(items: list[dict[str, Any]], key: str) -> int:
@@ -6634,6 +6747,12 @@ def summarize_results(logger: logging.Logger, summary: list[dict[str, Any]], sta
             _safe_div(sum(1 for it in test_c if str(it.get("stage")) == "form_unknown") * 100.0, len(test_c)),
         )
 
+    # データセット別（synthetic/test/target/hard_target）の集計
+    logger.info("[STATS] by dataset")
+    for ds in ["synthetic", "test", "target", "hard_target"]:
+        if ds in by_dataset:
+            _summarize_dataset(ds, by_dataset[ds])
+
     # ステージ別の合計時間
     logger.info("[STATS] stage time totals (s) (same as SUMMARY)")
     for k, v in stage_times.items():
@@ -6658,6 +6777,7 @@ def print_config(args: argparse.Namespace) -> None:
     print(f"  limit              : {args.limit}")
     print(f"  test-limit         : {getattr(args, 'test_limit', 0)}")
     print(f"  target-limit       : {getattr(args, 'target_limit', 0)}")
+    print(f"  hard-target-limit  : {getattr(args, 'hard_target_limit', 0)}")
     print(f"  degrade-n           : {args.degrade_n}")
     print("  rotation-scan       : fixed [0deg, 180deg] (no step scan)")
     print(f"  rotation-max-workers: {args.rotation_max_workers}")
@@ -7137,7 +7257,7 @@ def process_one_case(
         adv_trigger = bool(adv_cfg.get("trigger_on_form_unknown_no_detection", True))
 
         # C は「棄却が正しい」ため無駄な再探索をしない。
-        allow_retry = bool(str(src_form) in ("A", "B") or str(di.source_dataset) == "target")
+        allow_retry = bool(str(src_form) in ("A", "B") or str(di.source_dataset) in ("target", "hard_target"))
 
         if str(profile) != "fast" and allow_retry and adv_enable and adv_trigger and str(reason) == "no_detection":
             t_adv0 = time.perf_counter()
@@ -7155,8 +7275,8 @@ def process_one_case(
                 # margin を複数試して、判定スコアが最大のものを採用
                 best_fb: Optional[dict[str, Any]] = None
                 margin_list = _margin_px_candidates_for_eval(args=args, poly_xy=poly_adv)
-                # target は端欠けが多いので、少し大きい margin も追加
-                if str(di.source_dataset) == "target":
+                # target/hard_target は端欠けが多いので、少し大きい margin も追加
+                if str(di.source_dataset) in ("target", "hard_target"):
                     try:
                         extra = polygon_margin_px_from_ratio(poly_adv, ratio=0.16, min_px=float(args.polygon_margin_min_px), max_px=float(args.polygon_margin_max_px))
                         margin_list = margin_list + [float(extra)]
@@ -7645,8 +7765,8 @@ def process_one_case(
     # 期待動作としての成功条件:
     # - A/B: フォーム正解 AND テンプレ正解 AND warp 完了
     # - C  : "done" に到達したら誤検出（本来は棄却されるべき）
-    if str(di.source_dataset) == "target":
-        # target は GT を持たないため、warp 完了を成功とみなす
+    if str(di.source_dataset) in ("target", "hard_target"):
+        # target/hard_target は GT を持たないため、warp 完了を成功とみなす
         item["ok"] = True
     elif src_form in ("A", "B"):
         item["ok"] = bool(item.get("is_predicted_form_correct")) and bool(item.get("is_predicted_best_template_correct"))
@@ -7789,11 +7909,15 @@ def main(argv=None) -> int:
     src_forms = [s for s in src_forms if s in ("A", "B", "C")]
     test_limit = int(getattr(args, "test_limit", 0) or 0)
     target_limit = int(getattr(args, "target_limit", 0) or 0)
+    hard_target_limit = int(getattr(args, "hard_target_limit", 0) or 0)
     will_process_synthetic = bool(src_forms)
     will_process_test = (test_limit != 0)
     will_process_target = (target_limit != 0)
-    if not (will_process_synthetic or will_process_test or will_process_target):
-        logger.error("Nothing to process. Set --target-limit (-1/all or N>0) and/or --src-forms and/or --test-limit.")
+    will_process_hard_target = (hard_target_limit != 0)
+    if not (will_process_synthetic or will_process_test or will_process_target or will_process_hard_target):
+        logger.error(
+            "Nothing to process. Set --target-limit/--hard-target-limit (-1/all or N>0) and/or --src-forms and/or --test-limit."
+        )
         return 1
 
     # WeChat QR detector を初期化（フォームBは WeChat のみ）
@@ -7802,8 +7926,8 @@ def main(argv=None) -> int:
     wechat = init_wechat_qr_detector(str(getattr(args, "wechat_model_dir", "")), logger=logger, pool_size=wechat_pool_size)
     # 引数経由でスレッドに流すと取り回しが悪いので、score_formB に属性としてぶら下げる
     setattr(score_formB, "_wechat", wechat)
-    # target/test は中身が A/B 混在し得るため、target/test を処理する場合も WeChat は必須とする。
-    if ("B" in src_forms) or will_process_test or will_process_target:
+    # target/test/hard_target は中身が A/B 混在し得るため、処理する場合は WeChat は必須とする。
+    if ("B" in src_forms) or will_process_test or will_process_target or will_process_hard_target:
         if wechat is None:
             logger.error(
                 "WeChat QR detector is not available, but this run may include Form B detection (target/test or src-forms includes B). "
@@ -8072,6 +8196,56 @@ def main(argv=None) -> int:
                 degraded_bgr=src_bgr,
                 H_src_to_degraded=np.eye(3, dtype=np.float64),
                 degrade_meta={"mode": "target_skip_degrade"},
+                output_degraded_image_path=Path(out_degraded),
+            )
+        )
+
+    # hard_target dataset は「改悪なし」で投入する（難例・現場撮影）
+    hard_target_paths = list_hard_target_images()
+    hard_target_limit = int(getattr(args, "hard_target_limit", 0) or 0)
+    if hard_target_limit == 0:
+        hard_target_paths = []
+        logger.info("[HARD_TARGET] hard_target dataset (image/hard_target): skipped (use --hard-target-limit -1 to process all)")
+    elif hard_target_limit > 0:
+        hard_target_paths = hard_target_paths[: int(hard_target_limit)]
+        logger.info("[HARD_TARGET] hard_target dataset (image/hard_target): %d images (limited)", len(hard_target_paths))
+    else:
+        logger.info("[HARD_TARGET] hard_target dataset (image/hard_target): %d images (all)", len(hard_target_paths))
+
+    for i, hp in enumerate(hard_target_paths):
+        src_bgr = cv2.imread(str(hp))
+        if src_bgr is None:
+            logger.warning("failed to read hard_target image: %s", hp)
+            continue
+
+        try:
+            h0, w0 = src_bgr.shape[:2]
+        except Exception:
+            continue
+
+        case_id = f"hard_target_{hp.stem}_{i:03d}" if hp.stem else f"hard_target_{i:03d}"
+        out_degraded = out_dirs["degraded"] / f"{case_id}.jpg"
+
+        # save-images=all の場合のみ、ここで保存しておく（改悪フェーズ扱いで計測対象外）
+        if str(getattr(args, "save_images", "all")) == "all":
+            write_image(
+                out_degraded,
+                src_bgr,
+                jpeg_quality=int((PIPELINE_DEFAULTS.get("save_images") or {}).get("jpeg_quality") or 95),
+            )
+
+        degraded_inputs.append(
+            DegradedCaseInput(
+                source_dataset="hard_target",
+                source_form="hard_target",
+                source_path=Path(hp),
+                source_w=int(w0),
+                source_h=int(h0),
+                degraded_variant_index=0,
+                case_id=case_id,
+                degraded_bgr=src_bgr,
+                H_src_to_degraded=np.eye(3, dtype=np.float64),
+                degrade_meta={"mode": "hard_target_skip_degrade"},
                 output_degraded_image_path=Path(out_degraded),
             )
         )
