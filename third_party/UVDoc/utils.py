@@ -43,10 +43,64 @@ def bilinear_unwarping(warped_img, point_positions, img_size):
         point_positions:    torch.Tensor of shape Bx2xGhxGw (dtype float)
         img_size:           tuple of int [w, h]
     """
+    # NOTE(paper_pipeline_v18改善):
+    # F.grid_sample の padding_mode デフォルトは 'zeros' のため、
+    # 予測グリッドが画像外を参照すると外側が黒(0)で埋まり、
+    # 「用紙の白い余白が削れた/黒ずんだ」ように見えることがある。
+    # 端の欠けを抑制するため、border（端値延長）を使用する。
     upsampled_grid = F.interpolate(
         point_positions, size=(img_size[1], img_size[0]), mode="bilinear", align_corners=True
     )
-    unwarped_img = F.grid_sample(warped_img, upsampled_grid.transpose(1, 2).transpose(2, 3), align_corners=True)
+
+    # ------------------------------------------------------------------
+    # paper_pipeline_v18 改善（ユーザーFB: 余白/端文字が切れる）
+    # ------------------------------------------------------------------
+    # UVDoc が出力する grid は、端で「内側に寄る」ことがあり、結果として
+    # 出力画像が用紙ギリギリ（端の文字が欠ける）になりやすい。
+    # そこで、予測 grid の x/y をそれぞれ min/max で線形に再スケールし、
+    # 画像全域が入力全域（正規化座標 [-1, 1]）を使うように正規化する。
+    #
+    # - これにより、端が内側に寄っていても「端が届く」方向に補正され、
+    #   端の情報が欠けにくくなる。
+    # - 副作用として、補正が強いケースでは歪みが増える可能性がある。
+    #
+    # grid_sample 形式 (B,H,W,2)
+    grid = upsampled_grid.transpose(1, 2).transpose(2, 3)
+
+    try:
+        # x/y を別々に正規化（バッチごと）
+        gx = grid[..., 0]
+        gy = grid[..., 1]
+        eps = 1e-6
+
+        gx_min = gx.amin(dim=(1, 2), keepdim=True)
+        gx_max = gx.amax(dim=(1, 2), keepdim=True)
+        gy_min = gy.amin(dim=(1, 2), keepdim=True)
+        gy_max = gy.amax(dim=(1, 2), keepdim=True)
+
+        gx_span = (gx_max - gx_min).clamp_min(eps)
+        gy_span = (gy_max - gy_min).clamp_min(eps)
+
+        gx_center = (gx_max + gx_min) * 0.5
+        gy_center = (gy_max + gy_min) * 0.5
+
+        # min/max を -1/+1 に合わせる（中心保持 + スケール）
+        gx = (gx - gx_center) * (2.0 / gx_span)
+        gy = (gy - gy_center) * (2.0 / gy_span)
+
+        grid = torch.stack([gx, gy], dim=-1)
+        # 数値誤差のはみ出しはクランプ
+        grid = grid.clamp(-1.0, 1.0)
+    except Exception:
+        # 正規化で落ちても unwarp 自体は継続（安全側）
+        pass
+
+    unwarped_img = F.grid_sample(
+        warped_img,
+        grid,
+        align_corners=True,
+        padding_mode="border",
+    )
 
     return unwarped_img
 
